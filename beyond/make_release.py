@@ -150,6 +150,8 @@ def release(out, exe, version):
         cp(os.path.join(ROOT, f), os.path.join(rc, f))
     cp(os.path.join(ROOT, 'beyond', 'beyond_setup.py'), os.path.join(rc, 'beyond_setup.py'))
     for f in ('beyond_patches.json', 'romfs_beyond.manifest'):
+        if f == 'beyond_patches.json' and not os.path.isfile(os.path.join(ROOT, 'beyond', f)):
+            continue   # no game-code patches yet: setup compiles the code as translated (as linux/make_appimage.sh)
         cp(os.path.join(ROOT, 'beyond', f), os.path.join(rc, 'beyond', f))
     for f in ('cpu.h', 'cpu_helpers.c'):
         cp(os.path.join(ROOT, 'runtime', f), os.path.join(rc, 'runtime', f))
@@ -245,7 +247,8 @@ def source(out):
         if os.path.isfile(os.path.join(ROOT, rel)):
             cp(os.path.join(ROOT, rel), os.path.join(out, rel))
     for f in ('beyond_setup.py', 'make_release.py', 'make_patches.py', 'make_manifest.py', 'beyond_patches.json', 'romfs_beyond.manifest', 'DESIGN.md'):
-        cp(os.path.join(ROOT, 'beyond', f), os.path.join(out, 'beyond', f))
+        if os.path.isfile(os.path.join(ROOT, 'beyond', f)):   # beyond_patches.json and DESIGN.md aren't in this fork yet
+            cp(os.path.join(ROOT, 'beyond', f), os.path.join(out, 'beyond', f))
     im = os.path.join(ROOT, 'third_party', 'imgui-1.92.5')
     for f in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'imgui.h', 'imconfig.h', 'imgui_internal.h',
               'imstb_rectpack.h', 'imstb_textedit.h', 'imstb_truetype.h', 'LICENSE.txt'):
