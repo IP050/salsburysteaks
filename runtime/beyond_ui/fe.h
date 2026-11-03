@@ -5,7 +5,7 @@
 // this fork's GitHub repository (owner/name): the Play screen's updates and its bug report page. Set it to where you
 // publish the fork; until then update checks find nothing (SWR_UPDATE_REPO overrides it at run time)
 #ifndef MP4_REPO
-#define MP4_REPO "linuxopt/mp4-recomp"
+#define MP4_REPO "PlagueDrRiess/salsburysteaks"
 #endif
 #include <vector>
 #include <map>

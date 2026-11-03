@@ -241,7 +241,13 @@ static void setup_screen(ImVec2 a, ImVec2 b) {
         if (row_button("##base", "...or an extracted game folder (exefs and romfs)", shown(g_base, false, "CHOOSE").c_str())) {
             std::string p = pick_folder(g_hwnd, "Choose your extracted Metroid Prime 4 Beyond folder"); if (!p.empty()) { g_base = p; set("setup_base", p); } }
         help_text("Dump the game from your own Switch: the cartridge as .xci or the eShop version as .nsp (DBI, nxdumptool). Files are decrypted with the keys "
-                  "of your own Switch (prod.keys from Lockpick_RCM, in ~/.switch or where Ryujinx or yuzu keep them). Or extract the game with its update "
+                  "of your own Switch (prod.keys from Lockpick_RCM, in "
+#ifdef _WIN32
+                  "%USERPROFILE%\\.switch or %APPDATA%\\Ryujinx\\system"
+#else
+                  "~/.switch"
+#endif
+                  " or where Ryujinx or yuzu keep them). Or extract the game with its update "
                   "applied and choose the folder: it can hold exefs and romfs folders, or the files directly (main, main.npdm, Worlds, UI, Kernel.pak ...).");
         if (row_button("##updf", "Update file (.nsp)", shown(g_update, true, "OPTIONAL").c_str())) {
             std::string p = pick_file(g_hwnd, "Choose the update file (.nsp)", L"Switch update", spec); g_update = p; set("setup_update", p); }

@@ -75,12 +75,13 @@ README = """METROID PRIME 4 RECOMP - Metroid Prime 4 Beyond recompiled for PC
 This is not the game. It turns YOUR OWN copy of Metroid Prime 4 Beyond (version 2.1.0) into a native Windows game:
 setup compiles it on your PC. No Nintendo files, keys or firmware are included.
 
-1. Dump Metroid Prime 4 Beyond and its 2.1.0 update from your own Switch and extract them, with the update applied, into a
-   folder with "exefs" and "romfs" inside (an emulator's "Extract RomFS" / "Extract ExeFS" with the update installed
-   gives this too). This program does not dump or decrypt anything itself.
-2. Start "Metroid Prime 4 Beyond.exe". The first time it asks for that folder (and, if you extracted the update separately,
-   the update folder), checks every file against the 2.1.0 file list and compiles the game with the bundled GCC.
-   That takes a few minutes and about 7 GB of space next to the EXE (less when your game files are on the same drive).
+1. Dump Metroid Prime 4 Beyond and its 2.1.0 update from your own Switch: the game as .xci or .nsp and the update as
+   .nsp, plus your Switch's prod.keys (Lockpick_RCM) in %USERPROFILE%\\.switch or %APPDATA%\\Ryujinx\\system. Or extract
+   them, with the update applied, into a folder with "exefs" and "romfs" inside (an emulator's "Extract RomFS" /
+   "Extract ExeFS" gives this too). This program does not dump anything itself.
+2. Start "Metroid Prime 4 Beyond.exe". The first time it asks for the game file or folder and the update, checks every
+   file against the 2.1.0 file list and compiles the game with the bundled GCC. That takes a few minutes and about
+   30 GB of space next to the EXE: the game data, saves, settings and shader cache all stay in this folder.
 3. Then it opens to the Play screen. Settings, controller set-up, mods and save backups are all there.
    In the game, F1 (or the Home / Guide button) opens the menu; most settings change right away.
 

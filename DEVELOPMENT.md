@@ -192,7 +192,13 @@ from source into the runtime instead (static, no system library needed); it has 
 
 ### Windows
 
-The Windows build (`build.bat`) is renamed for this project, but has not been built or tested in this fork.
+`windows\get_tools.ps1` fetches the pinned toolchain into the folders `build.bat` expects (`gcc\Library\`, `python\`,
+`third_party\glslang\`, `redist\`), checking each download's SHA-256. Then, with `GLSLANG` pointing at
+`third_party\glslang\bin\glslang.exe`, `build.bat` builds `bin\runtime_win64_win32.exe` and `build.bat release X.Y.Z`
+packs `release\X.Y.Z\Metroid Prime 4 Beyond\` and its zip. The runtime compiles cleanly and reaches the Play / setup
+screen; the game itself has had less play time on Windows than on Linux. Pushing a `vX.Y.Z` tag runs
+`.github/workflows/release.yml`, which does the same on a GitHub Windows runner and publishes the release.
+`MP4_REPO` in `runtime/beyond_ui/fe.h` names the repository the Play screen takes updates and bug reports from.
 
 ## Credits
 

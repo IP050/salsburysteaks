@@ -1,5 +1,7 @@
 gcc/
 python/
+_dl/
+third_party/glslang/
 bin/
 games/
 *_build/
