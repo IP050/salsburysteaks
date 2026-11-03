@@ -197,7 +197,7 @@ static Rec recommend() {
                     res_text(r.res, true, r.asp.c_str()).c_str(), r.fps == "1" ? "60 FPS" : (r.fps + " FPS").c_str(), r.asp.c_str(), r.af.c_str(),
                     r.sharp != "0" ? ", light sharpening" : "", r.renderer == "vulkan_native" ? "Native Vulkan (smoothest at high frame rates)" : "OpenGL");
     if (g_hw.ram_gb && g_hw.ram_gb < 8) r.note = fmt("This PC has %d GB of memory; the game needs about 4 GB, so 8 GB is recommended. Close other programs before playing.", g_hw.ram_gb);
-#ifndef SWR_RELEASE   // the public release has no DLSS
+#ifdef SWR_HAVE_DLSS   // the public release has no DLSS
     else if (g_hw.rtx) r.note = "Optional: Graphics > Native Vulkan + NVIDIA DLAA gives the cleanest edges on RTX cards (experimental renderer).";
 #endif
     return r;
@@ -472,7 +472,7 @@ static void page_graphics() {
     section("RESOLUTION"); resolution_rows(false);
     section("UPSCALING"); draw_opt("upscaler"); if (get("upscaler") == "fsr") draw_opt("fsr_sharpness");
     section("RENDERER"); draw_opt("renderer", get("renderer") == "vulkan_native" ? "EXPERIMENTAL" : nullptr);
-#ifndef SWR_RELEASE   // the public release's renderer has no DLSS
+#ifdef SWR_HAVE_DLSS   // the public release's renderer has no DLSS
     if (get("renderer") != "vulkan" && file_exists(join(P.exedir, "nvngx_dlss.dll"))) {   // OpenGL and Native Vulkan
         bool v = getb("dlss"); if (row_bool("##dlss", "NVIDIA DLAA anti-aliasing", &v)) set("dlss", v ? "1" : "0");
         help_text("RTX cards. Uses nvngx_dlss.dll from the game folder (not part of this release). Applies at the next start.");
@@ -921,6 +921,7 @@ extern "C" int fe_run(void* hwnd) {
     IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; io.LogFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad; io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;   /* keep the window's cursor: the game's own pointer (cursor_win32.c) */
     load_fonts(io); apply_style(1.0f);
     ImGui_ImplWin32_Init(g_hwnd); ImGui_ImplDX11_Init(g_dev, g_ctx);
     pads_init();

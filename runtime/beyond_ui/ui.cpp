@@ -507,7 +507,7 @@ static std::vector<Opt> build_options() {
     B("game_dynamic_resolution", "Graphics", "Graphics", "Game's own dynamic resolution", LIVE_YES, "0", "Let the game lower its own resolution like on the console.");
     B("hdr", "Graphics", "Graphics", "HDR output (experimental)", LIVE_RESTART, "0", "Native Vulkan only, with \"Use HDR\" on in Windows display settings.");
     I("hdr_paper_white", "Graphics", "Graphics", "HDR paper white (nits)", LIVE_RESTART, "200", 80, 500, 10, "");
-#ifndef SWR_RELEASE
+#ifdef SWR_HAVE_DLSS
     B("dlss", "Graphics", "Graphics", "NVIDIA DLAA", LIVE_RESTART, "0", "OpenGL or Native Vulkan, RTX cards, nvngx_dlss.dll next to the game.", false);
 #endif
     // Gameplay

@@ -289,8 +289,8 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"shadows")) g_opt_shadows=atoi(v);
     else if(!strcmp(k,"profile")) g_opt_prof=atoi(v);
     else if(!strcmp(k,"low_priority_shader_compiler")) g_opt_cmp_low=atoi(v);
-#if !defined(_WIN32) && !defined(__ANDROID__)
-    else if(!strcmp(k,"shader_threads")){ extern int g_opt_shader_threads; g_opt_shader_threads=atoi(v); if(g_opt_shader_threads<0) g_opt_shader_threads=0; if(g_opt_shader_threads>8) g_opt_shader_threads=8; }   /* backend_x11.c */
+#if !defined(__ANDROID__)
+    else if(!strcmp(k,"shader_threads")){ extern int g_opt_shader_threads; g_opt_shader_threads=atoi(v); if(g_opt_shader_threads<0) g_opt_shader_threads=0; if(g_opt_shader_threads>8) g_opt_shader_threads=8; }   /* backend_x11.c, backend_win32.c */
 #endif
     else if(!strcmp(k,"dynamic_resolution")) g_opt_resdyn=atoi(v);
     else if(!strcmp(k,"dynamic_resolution_min")){ g_opt_resmin=(float)atof(v); if(g_opt_resmin<0.25f) g_opt_resmin=0.25f; if(g_opt_resmin>1) g_opt_resmin=1; }
@@ -353,7 +353,7 @@ static const IniOpt INI_GRAPHICS[]={
   {"prebuild_shaders","1","1 = build every shader before the game draws with it: the shaders it ships in romfs/system/shd, and the ones\n;   it unpacks into GPU memory (Metroid Prime 4 at boot), compiled in the background and kept ready. 0 = at first use"},
   {"shadows","1","0 = disable shadow maps (more FPS)"},
   {"renderer","opengl","opengl, or vulkan = the game still renders with OpenGL but Vulkan puts the frames on screen\n;   (falls back to OpenGL output if the GPU driver can't share images between the two; restart required),\n;   or vulkan_native = EXPERIMENTAL native Vulkan renderer from ScarletNX (GPL-3.0; falls back to OpenGL if it can't start)"},
-#ifndef SWR_RELEASE   /* the public release: no DLSS (GPL) and no frame generation in that build */
+#ifdef SWR_HAVE_DLSS   /* the public release: no DLSS (GPL); build.bat dlss makes a personal build with it */
   {"dlss","0","1 = NVIDIA DLAA anti-aliasing (renderer=opengl or vulkan_native, RTX GPU, nvngx_dlss.dll in the game folder):\n;   DLSS at the internal resolution with the game's own motion vectors; the HUD is untouched. 0 = off"},
 #endif
   {NULL,NULL,NULL}};
@@ -372,7 +372,7 @@ static const IniOpt INI_PERF[]={
 #endif
   {"memory_gb","0","Memory the game sees: 0 = automatic (3.2 GB like the console, more for games that need it,\n;   e.g. Tears of the Kingdom), 4 = console (3.2 GB), 6 or 8 = extended (like yuzu's extended memory layout)"},
   {"low_priority_shader_compiler","1","1 = compile shaders at low priority (less stutter on weak CPUs)"},
-  {"shader_threads","0","Linux: threads that compile new shaders at the same time, 0 = automatic (a quarter of the CPU\n;   threads, 2 to 8), 1 = one like older versions (restart)"},
+  {"shader_threads","0","threads that compile new shaders at the same time, 0 = automatic (a quarter of the CPU\n;   threads, 2 to 8), 1 = one like older versions (restart)"},
   {"fast_forward","0","1 = Tab (or both stick clicks, L3+R3) toggles fast forward: the game clock runs faster, e.g. to\n;   shorten elevator and train rides (their animations follow the clock). Turn it off again before playing"},
   {"fast_forward_speed","3","Fast forward speed, 2-8 times"},
   {"sleep_waits","1","1 = threads waiting on the OpenGL thread sleep instead of spinning (frees CPU on 2-4 core\n;   PCs and laptops); 0 = spin like older versions"},

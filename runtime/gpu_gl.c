@@ -101,7 +101,7 @@ static GLuint link2(GLuint a, GLuint b, GLuint c3){
 extern int snxvk_dlss_mode;
 static char* dlg_vs_xfb(char* src){
   static const char* decl="out gl_PerVertex { invariant vec4 gl_Position;";
-#ifdef SWR_RELEASE
+#ifndef SWR_HAVE_DLSS
   return src;
 #endif
   if(snxvk_dlss_mode<=0 || !src) return src;
@@ -421,17 +421,20 @@ static u32 ur2_alloc(u32 n){
 /* Big uploads (the 173-363 MB lighting volumes a new area streams in, seven at once): unpacked straight into a mapped
    pixel buffer and uploaded from there. From client memory the GL queue copied the whole texture into its ring (43 ms of
    the 72 for 173 MB, on the GPU thread the game waits for) and the driver copied it again on the GL thread (25 ms); from a
-   buffer the driver only queues a GPU copy. Two buffers, each reused once the GPU is done with its last upload, freed
+   buffer the driver only queues a GPU copy. Six buffers (BP_N), each reused once the GPU is done with its last upload, freed
    after 20 s unused (up to 2 x 368 MB of mapped memory otherwise). SWR_NO_BIG_PBO=1: off */
 #define BP_MIN (16ull<<20)
-static struct { GLuint b; u8* p; u64 cap, last; GLsync f; } g_bp[2]; static int g_bp_on, g_bp_next;
+/* six buffers, not two: a new area streams five or six volumes in a row, and with two each upload waited 190-400 ms
+   for the GPU to finish the one two before it (MEASURED 2026-11-03, RTX 4060 Ti: "buffer-wait" in the texture upload log) */
+#define BP_N 6
+static struct { GLuint b; u8* p; u64 cap, last; GLsync f; } g_bp[BP_N]; static int g_bp_on, g_bp_next;
 static void bp_free(int k){ if(g_bp[k].f){ p_u2ds(g_bp[k].f); g_bp[k].f=0; } if(g_bp[k].b) glDeleteBuffers(1,&g_bp[k].b); g_bp[k].b=0; g_bp[k].p=NULL; g_bp[k].cap=0; }
 static u8* bp_get(u64 n, int* slot){
   if(!g_bp_on){ g_bp_on=-1; if(g_gles || getenv("SWR_NO_BIG_PBO")) return NULL;
     if(!u2_procs()) return NULL;
     g_bp_on=1; }
   if(g_bp_on<0 || n>(1ull<<30)) return NULL;
-  int k=g_bp_next; g_bp_next^=1;
+  int k=g_bp_next; g_bp_next=(g_bp_next+1)%BP_N;
   if(g_bp[k].f){ p_u2cws(g_bp[k].f,GL_SYNC_FLUSH_COMMANDS_BIT,2000000000ull); p_u2ds(g_bp[k].f); g_bp[k].f=0; }
   if(g_bp[k].cap<n){ bp_free(k); u64 cap=(n+(16ull<<20)-1)&~((16ull<<20)-1); const GLbitfield fl=GL_MAP_WRITE_BIT|GL_MAP_PERSISTENT_BIT|GL_MAP_COHERENT_BIT;
     glGenBuffers(1,&g_bp[k].b); glBindBuffer(GL_PIXEL_UNPACK_BUFFER,g_bp[k].b); p_u2bs(GL_PIXEL_UNPACK_BUFFER,(GLsizeiptr)cap,NULL,fl);
@@ -440,7 +443,7 @@ static u8* bp_get(u64 n, int* slot){
     g_bp[k].cap=cap; static int said; if(said<4){ said++; LOG("gpu: big textures upload through a %llu MB mapped buffer\n",(unsigned long long)(cap>>20)); } }
   g_bp[k].last=plat_ns(); *slot=k; return g_bp[k].p; }
 static void bp_done(int k){ g_bp[k].f=p_u2fs(GL_SYNC_GPU_COMMANDS_COMPLETE,0); }
-static void bp_trim(void){ if(g_bp_on<=0) return; u64 now=plat_ns(); for(int k=0;k<2;k++) if(g_bp[k].b && now-g_bp[k].last>20000000000ull) bp_free(k); }
+static void bp_trim(void){ if(g_bp_on<=0) return; u64 now=plat_ns(); for(int k=0;k<BP_N;k++) if(g_bp[k].b && now-g_bp[k].last>20000000000ull) bp_free(k); }
 /* a big non-contiguous level read from guest memory in 1 MB pieces over the texture threads (12 ms for 173 MB on one) */
 extern volatile int g_cs_any; void cs_mem_need(u64 a, u64 n);
 typedef struct { u8* dst; u64 gva, size; } GrJob;
@@ -452,7 +455,7 @@ static u64 g_upl_t0;
 static u64 st_tchk_ns, st_tupl_ns, st_tb_lookup, st_tb_samp, st_tb_rest, st_tb_bind, st_tb_crop, st_tb_lay, st_tb_vol, st_tb_pre;   /* texture time split: change-check hashing, uploads */
 static void tex_upload_(Tex* t);
 static void tex_upload(Tex* t){ u64 t0=plat_ns(); tex_upload_(t); st_tupl_ns+=plat_ns()-t0; }
-static void tex_upload_(Tex* t){ if(!g_upl_t0) g_upl_t0=plat_ns(); st_tex_up+=t->size; u64 upload_start=plat_ns(), upload_read_ns=0, upload_unpack_ns=0, upload_decode_ns=0, upload_driver_ns=0, upload_stage;
+static void tex_upload_(Tex* t){ if(!g_upl_t0) g_upl_t0=plat_ns(); st_tex_up+=t->size; u64 upload_start=plat_ns(), upload_read_ns=0, upload_unpack_ns=0, upload_decode_ns=0, upload_driver_ns=0, upload_wait_ns=0, upload_scan_ns=0, upload_stage;
   if(tex_zero_height_fix(t)) return;
   t->agen++; aj_forget(t); int a_async=0;
   /* ASTC arrays: the leading levels over 32x32 of every layer decode in the background as well (Prime 4 streams
@@ -481,14 +484,18 @@ static void tex_upload_(Tex* t){ if(!g_upl_t0) g_upl_t0=plat_ns(); st_tex_up+=t-
       u32 lw=t->w>>l, lh=t->h>>l, ld=depth3d>>l; if(!lw) lw=1; if(!lh) lh=1; if(!ld) ld=1;
       u32 tw=(lw+f->bw-1)/f->bw, th=(lh+f->bh-1)/f->bh; u32 rowb=tw*f->bpp; u32 lbh;
       u64 lsz= t->bl? bl_level_size(t->w,t->h,depth3d,f,t->bh,t->bd,l,&lbh) : (u64)t->pitch*th;
-      u64 lin_size=(u64)rowb*th*ld; int bps=-1; u8* lin= lin_size>=BP_MIN && !f->astc && !f->dec? bp_get(lin_size,&bps) : NULL; if(!lin) lin=upload_buffer(&upload_linear,lin_size);
+      u64 lin_size=(u64)rowb*th*ld; int bps=-1; upload_stage=plat_ns();
+      u8* lin= lin_size>=BP_MIN && !f->astc && !f->dec? bp_get(lin_size,&bps) : NULL; if(!lin) lin=upload_buffer(&upload_linear,lin_size);
+      upload_wait_ns+=plat_ns()-upload_stage;   /* bp_get waits for the GPU to finish with the buffer's last upload */
       /* unpack straight from guest memory when the range is contiguous (it almost always is): this used to
          copy the whole level into a scratch buffer first, about a third of all upload time */
       u8* direct= g_upload_direct? gmem_ptr(t->gva+off,lsz) : NULL;
       u8* src= direct? direct : upload_buffer(&upload_source,lsz);
       if(!lin || !src){ lin_rel(lin,bps); if(!direct) upload_release(&upload_source,src); static int said; if(said<4){ said++; LOG("gpu: out of memory uploading texture %ux%ux%u (%llu MB): skipped\n",t->w,t->h,t->d,(unsigned long long)(lsz>>20)); } off+= t->bl? lsz : (u64)t->pitch*th; continue; }
       upload_stage=plat_ns(); if(!direct){ if(lsz>=BP_MIN) gmem_read_par(t->gva+off,src,lsz); else gmem_read(t->gva+off,src,lsz); } upload_read_ns+=plat_ns()-upload_stage;
+      upload_stage=plat_ns();
       if(t->target==GL_TEXTURE_3D && t->zero3d){ for(u64 k=0;k<lsz;k++) if(src[k]){ t->zero3d=0; break; }
+        upload_scan_ns+=plat_ns()-upload_stage;
         if(!t->zero3d && was_zero3d){ static int said; if(said<16){ said++; LOG("gpu: 3D texture %ux%ux%u at %llx got its data in memory (frame %u)\n",t->w,t->h,t->d,(unsigned long long)t->gva,g_frame); } } }
       upload_stage=plat_ns();
       if(t->bl){ u32 lbd=t->bd; while(lbd>0 && ld<=(1u<<(lbd-1))) lbd--;   /* 3D: block depth (LUTs) */
@@ -544,7 +551,7 @@ static void tex_upload_(Tex* t){ if(!g_upl_t0) g_upl_t0=plat_ns(); st_tex_up+=t-
   t->abase=a_async; if((t->target==GL_TEXTURE_2D || a_arr) && f->astc && t->levels>1) glTexParameteri(t->target,GL_TEXTURE_BASE_LEVEL,a_async);   /* async levels come later (aj_drain) */
   u64 upload_total=plat_ns()-upload_start;
   tex_stage_totals[0]+=upload_total; tex_stage_totals[1]+=upload_read_ns; tex_stage_totals[2]+=upload_unpack_ns; tex_stage_totals[3]+=upload_decode_ns; tex_stage_totals[4]+=upload_driver_ns;
-  if(upload_total>10000000ull) LOG("texture upload: %ux%ux%u levels=%u format=%x astc=%u decode=%u bytes=%llu total=%.2f read=%.2f unpack=%.2f decode=%.2f driver=%.2f ms\n",t->w,t->h,t->d,t->levels,t->fkey,f->astc,f->dec,(unsigned long long)t->size,upload_total/1e6,upload_read_ns/1e6,upload_unpack_ns/1e6,upload_decode_ns/1e6,upload_driver_ns/1e6);
+  if(upload_total>10000000ull) LOG("texture upload: %ux%ux%u levels=%u format=%x astc=%u decode=%u bytes=%llu total=%.2f read=%.2f unpack=%.2f decode=%.2f driver=%.2f buffer-wait=%.2f zero-scan=%.2f ms\n",t->w,t->h,t->d,t->levels,t->fkey,f->astc,f->dec,(unsigned long long)t->size,upload_total/1e6,upload_read_ns/1e6,upload_unpack_ns/1e6,upload_decode_ns/1e6,upload_driver_ns/1e6,upload_wait_ns/1e6,upload_scan_ns/1e6);
 
 }
 static u32 g_tex_bud_frame; static i64 g_tex_bud; static u64 st_tex_chk;
@@ -1079,7 +1086,8 @@ static GLuint sampler_get(const u32* tsc){
 extern int g_glsl_version;
 struct WJob;
 typedef struct Sh { u64 hash; u32 key2; int stage; GLuint gl; ShaderInfo si; struct Sh* next; int failed; char* src;
-  GLuint sp; GLint uloc; int sps; struct WJob* sj; u32 clen; u64 qh; float lu[4]; int lu_ok; u64 skey; int xfb; struct WJob* sj_up; } Sh;   /* sp: this shader's own separable program */
+  GLuint sp; GLint uloc; int sps; struct WJob* sj; u32 clen; u64 qh; float lu[4]; int lu_ok; u64 skey; int xfb; struct WJob* sj_up;
+  GLuint pp; u64 pkey; u64 pt0; } Sh;   /* sp: this shader's own separable program; pp: one the driver is still compiling (sps 4) */
 static Sh* shh[1024];
 /* per-address cache. shader_hash walks the whole program (~50us per stage per draw on big shaders),
    within a submit a quick hash of the same range is enough */
@@ -1291,6 +1299,7 @@ static u64 prog_key(Sh* vs, Sh* fs){ return src_key(vs)*0x9E3779B97F4A7C15ull ^ 
 
 static u64 sh_key(Sh* s){ return src_key(s)*0x9E3779B97F4A7C15ull ^ 0x5E9A0000ull; }
 static int g_par=-1;
+static u32 g_par_built; static u64 g_par_max;   /* separable programs the driver built in the background (sh_sep_ready sps 4) */
 
 static void pcache_init(void){
   if(g_pcache<0){ g_pcache= p_glProgramBinary && p_glGetProgramBinary && p_glProgramParameteri; if(g_pcache){ plat_mkdir("shader_cache");
@@ -1354,7 +1363,11 @@ extern int backend_gl_worker_current(void);
 
 int g_gl_workers=1;   /* compile threads the backend made contexts for (backend_x11.c: [Performance] shader_threads) */
 static volatile int g_workers_up, g_workers_done;
+/* each compile thread's current step and finished jobs, logged with the FPS line: on Windows they were seen to
+   start and never finish a job (1 wait for a job, 2 binary load, 3 compile, 4 link, 5 status, 6 finish) */
+static volatile int g_wph[8], g_wid_next; static volatile u32 g_wjobs[8];
 static void shader_worker(void* arg){ plat_diag_role("shader-worker");
+  int wi=__atomic_fetch_add(&g_wid_next,1,__ATOMIC_ACQ_REL)&7;
   (void)arg; int ok=backend_gl_worker_current();
   if(ok) __atomic_add_fetch(&g_workers_up,1,__ATOMIC_ACQ_REL);
   __atomic_add_fetch(&g_workers_done,1,__ATOMIC_ACQ_REL);
@@ -1362,24 +1375,28 @@ static void shader_worker(void* arg){ plat_diag_role("shader-worker");
   __atomic_store_n(&g_worker,1,__ATOMIC_RELEASE);
   { extern int g_opt_cmp_low; if(g_opt_cmp_low) plat_thread_low_priority(); }   /* only use the CPU the game isn't using */
   for(;;){
+    g_wph[wi]=1;
     WJob* j=wr_pop(&wq_hi); int lo=0; if(!j){ j=wr_pop(&wq_lo); lo=1; }
     if(!j){ plat_sleep_ns(1000000); continue; }
     { int z=0; if(!__atomic_compare_exchange_n(&j->run,&z,1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){ __atomic_store_n(&j->state,3,__ATOMIC_RELEASE); continue; } }   /* a draw took it */
     u64 tc0=plat_ns();
-    if(j->try_bin){GLuint p=binary_load(j->bin_path,j->sep);if(p){glFinish();j->prog=p;__atomic_store_n(&j->state,1,__ATOMIC_RELEASE);continue;}}
+    g_wph[wi]=2;
+    if(j->try_bin){GLuint p=binary_load(j->bin_path,j->sep);if(p){g_wph[wi]=6;glFinish();j->prog=p;g_wjobs[wi]++;__atomic_store_n(&j->state,1,__ATOMIC_RELEASE);continue;}}
+    g_wph[wi]=3;
     GLuint a=glCreateShader(j->sep? j->stype : GL_VERTEX_SHADER), b= j->sep? 0 : glCreateShader(GL_FRAGMENT_SHADER);
     const char* s1=j->vs; const char* s2=j->fs; glShaderSource(a,1,&s1,NULL); glCompileShader(a); if(b){ glShaderSource(b,1,&s2,NULL); glCompileShader(b); }
     GLuint p=glCreateProgram(); glAttachShader(p,a); if(b) glAttachShader(p,b);
     if(j->sep) p_glProgramParameteri(p,0x8258 /* GL_PROGRAM_SEPARABLE */,GL_TRUE);
     if(g_pcache>0) p_glProgramParameteri(p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
-    glLinkProgram(p); GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
+    g_wph[wi]=4;
+    glLinkProgram(p); GLint ok=0; g_wph[wi]=5; glGetProgramiv(p,GL_LINK_STATUS,&ok);
     if(!ok){ GLint c=1; char e[1024]; e[0]=0; glGetShaderiv(a,GL_COMPILE_STATUS,&c); if(!c){ glGetShaderInfoLog(a,sizeof e,NULL,e); snprintf(j->log,sizeof j->log,"%s: %s",j->sep? (j->stype==GL_VERTEX_SHADER? "VS" : "FS") : "VS",e); }
       else if(b && (glGetShaderiv(b,GL_COMPILE_STATUS,&c),!c)){ glGetShaderInfoLog(b,sizeof e,NULL,e); snprintf(j->log,sizeof j->log,"FS: %s",e); } else glGetProgramInfoLog(p,sizeof j->log,NULL,j->log);
       glDeleteProgram(p); p=0; }
     else binary_save(p,j->key,j->sep);
     glDeleteShader(a); if(b) glDeleteShader(b);   /* flagged for deletion, freed together with the program */
     if(p && !j->keep){ glDeleteProgram(p); p=0; }
-    glFinish();
+    g_wph[wi]=6; glFinish(); g_wjobs[wi]++;
     { u64 dt=plat_ns()-tc0; __atomic_add_fetch(&g_cmp_ns,dt,__ATOMIC_RELAXED); __atomic_add_fetch(&g_cmp_n,1,__ATOMIC_RELAXED); if(dt>g_cmp_max) g_cmp_max=dt; }
     j->prog=p; __atomic_store_n(&j->state, ok? 1 : 2, __ATOMIC_RELEASE);
     if(lo) plat_sleep_ns(2000000);   /* background work yields to the game */
@@ -1394,8 +1411,10 @@ static int g_sync_draws;
 typedef void (APIENTRY*PFN_UPS_)(GLuint,GLbitfield,GLuint); typedef void (APIENTRY*PFN_BPP_)(GLuint); typedef void (APIENTRY*PFN_GPP_)(GLsizei,GLuint*);
 static PFN_UPS_ p_ups; static PFN_BPP_ p_bpp;
 static const char* mp_why_unseen(u64 h, int stage); static int mp_claim(u64 key, Sh* s); static u64 g_mp_last_claim; static int mp_seen(u64 h, int stage); static u64 fb_get(u64 h, int stage, u32 key2); static u32 g_fb_used;
+static int g_nv_win;   /* NVIDIA on Windows: no compile threads, no glMaxShaderCompilerThreads (gpu_thread) */
 static void worker_start(void){
   g_sync_draws= getenv("SWR_SYNC_SHADERS")!=NULL;
+  if(g_nv_win || getenv("SWR_NO_WORKERS")){ g_worker=-1; return; }   /* NVIDIA on Windows (see gpu_thread), or a test */
   int started=0; for(int i=0;i<g_gl_workers;i++) if(!plat_thread(shader_worker,NULL,8u<<20)) started++;
   if(!started){ g_worker=-1; return; }
   u64 t0=plat_ns(); while(__atomic_load_n(&g_workers_done,__ATOMIC_ACQUIRE)<started && plat_ns()-t0<2000000000ull) plat_sleep_ns(1000000);
@@ -1413,8 +1432,15 @@ static void prog_u4(GLuint p, GLint loc, int which, const float* v){ if(loc==ULO
 static void sh_uloc(Sh* s){u64 start=plat_ns(); s->uloc= s->sp? ULOC_LAZY : -1;shader_uniform_ns+=plat_ns()-start; }
 
 static int sh_sep_ready(Sh* s){
-  if(s->sps>=2){ if(s->sj_up){ int st=__atomic_load_n(&s->sj_up->state,__ATOMIC_ACQUIRE);   /* drawn with the pre-built stand-in: swap in the real one once built */
+  if(s->sps==2 || s->sps==3){ if(s->sj_up){   /* not 4: still compiling (below). As >=2 it counted as done with no program: 1 million draws skipped in a session */ int st=__atomic_load_n(&s->sj_up->state,__ATOMIC_ACQUIRE);   /* drawn with the pre-built stand-in: swap in the real one once built */
       if(st){ struct WJob* j=s->sj_up; s->sj_up=NULL; if(st==1 && j->prog){ s->sp=j->prog; s->lu_ok=0; sh_uloc(s); pack_add_sh(j->key,s); } free(j); } }
+    return 1; }
+  if(s->sps==4){ /* the driver is compiling it (GL_KHR_parallel_shader_compile): drawn once it is done */
+    GLint done=0; glGetProgramiv(s->pp,0x91B1 /* GL_COMPLETION_STATUS_KHR */,&done); if(!done) return 0;
+    GLint ok=0; glGetProgramiv(s->pp,GL_LINK_STATUS,&ok); GLuint p=s->pp; s->pp=0;
+    if(!ok){ char e[1024]; e[0]=0; glGetProgramInfoLog(p,sizeof e,NULL,e); WARN("shader %016llx (stage %d) failed to compile: %s\n",(unsigned long long)s->hash,s->stage,e); glDeleteProgram(p); s->sp=0; s->sps=3; return 1; }
+    binary_save(p,s->pkey,1); s->sp=p; s->sps=2; sh_uloc(s); pack_add_sh(s->pkey,s);
+    { u64 dt=plat_ns()-s->pt0; __atomic_add_fetch(&g_cmp_ns,dt,__ATOMIC_RELAXED); __atomic_add_fetch(&g_cmp_n,1,__ATOMIC_RELAXED); g_par_built++; if(dt>g_par_max) g_par_max=dt; }
     return 1; }
   if(s->sps==1){ int st=__atomic_load_n(&s->sj->state,__ATOMIC_ACQUIRE); if(!st) return 0;
     struct WJob* j=s->sj; s->sj=NULL;
@@ -1448,6 +1474,12 @@ static int sh_sep_ready(Sh* s){
         free(u); warm_stage_put(fk,fp,ful); } } }
   struct WJob* j=calloc(1,sizeof *j); j->vs=s->src; j->key=key; j->keep=1; j->sep=1; j->stype= s->stage==ST_VS? GL_VERTEX_SHADER : s->stage==ST_GS? GL_GEOMETRY_SHADER : GL_FRAGMENT_SHADER;
   if(g_worker==1 && !g_sync_draws && wr_push(&wq_hi,j)){ s->sj=j; s->sps=1; return 0; }
+  if(g_par>0 && !g_sync_draws){ /* no compile thread but the driver compiles in parallel (NVIDIA on Windows): start it and
+       draw once it is done (sps 4 above) instead of waiting here, 100-500 ms each (140 of them, 66 s, in a 3.5 min run) */
+    GLuint a=glCreateShader(j->stype); const char* s1=s->src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
+    GLuint p=glCreateProgram(); glAttachShader(p,a); p_glProgramParameteri(p,0x8258,GL_TRUE); if(g_pcache>0) p_glProgramParameteri(p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
+    glLinkProgram(p); glDeleteShader(a);   /* flagged: freed together with the program */
+    s->pp=p; s->pkey=key; s->pt0=plat_ns(); s->sps=4; free(j); return 0; }
   /* no compile thread, do it inline */
   u64 inline_start=plat_ns();
   GLuint a=glCreateShader(j->stype); const char* s1=s->src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
@@ -2300,7 +2332,7 @@ static struct {
   u64 stable, stable_z, chosen, chosen_z; int streak, missing, done, reset, evals, evaluated;
   Tex *need, *need_z;    /* DLSS runs before the draw that first reads the scene target */
 } g_dlg;
-#ifdef SWR_RELEASE   /* the public release has no DLSS (NVIDIA's licence question is open): off whatever the .ini says */
+#ifndef SWR_HAVE_DLSS   /* the public release has no DLSS (NVIDIA's licence question is open): off whatever the .ini says */
 static int dlg_on(void){ return 0; }
 #else
 static int dlg_on(void){ return snxvk_dlss_mode>0 && !g_gles && !dlgl_failed(); }
@@ -2694,7 +2726,7 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len){
   e->write_gen=g_gw_gen;
   e->cpu=cpu; e->epoch=g_submit_epoch; e->chk_epoch=g_submit_epoch; return e->id; }
 /* ============================================================ F5 frame trace */
-static int g_tr_arm, g_tr_on, g_tr_n, g_tr_img; static FILE* g_tr;
+static int g_tr_arm, g_tr_on, g_tr_n, g_tr_img; static FILE* g_tr; static char g_tr_dir[64]="captures/traces";
 static Tex* g_tr_tex[2048]; static int g_tr_ntex;
 static u64 g_tr_sh[1024]; static int g_tr_nsh;
 static GLuint g_tr_fb, g_tr_tx;
@@ -2728,16 +2760,16 @@ static void tr_thumb(Tex* t, char* out){ state_dirty();
   glBindFramebuffer(GL_READ_FRAMEBUFFER,g_tr_fb); glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT,1); glReadPixels(0,0,TRW,TRH,GL_RGBA,GL_UNSIGNED_BYTE,px);
   glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); if(sc) glEnable(GL_SCISSOR_TEST); if(sr) glEnable(GL_FRAMEBUFFER_SRGB);
   u64 h=fast_hash(px,sizeof px,0); if(h==t->tr_last){ strcpy(out,"(no change)"); return; }
-  t->tr_last=h; char p[128]; snprintf(p,sizeof p,"captures/traces/d%04d.ppm",g_tr_n); tr_save(p,px,TRW,TRH); g_tr_img++; snprintf(out,32,"d%04d.ppm",g_tr_n); }
+  t->tr_last=h; char p[128]; snprintf(p,sizeof p,"%s/d%04d.ppm",g_tr_dir,g_tr_n); tr_save(p,px,TRW,TRH); g_tr_img++; snprintf(out,32,"d%04d.ppm",g_tr_n); }
 
 static int tr_tex_id(Tex* t){ if(!t) return -1; for(int i=0;i<g_tr_ntex;i++) if(g_tr_tex[i]==t) return i; if(g_tr_ntex<2048){ g_tr_tex[g_tr_ntex]=t; return g_tr_ntex++; } return -1; }
 
 static void tr_shader(u64 addr, Sh* sh, int stage){
   if(!sh) return; for(int i=0;i<g_tr_nsh;i++) if(g_tr_sh[i]==sh->hash) return; if(g_tr_nsh>=1024) return; g_tr_sh[g_tr_nsh++]=sh->hash;
   u8* b=malloc(0x8000); gmem_read(addr,b,0x8000); char p[128];
-  snprintf(p,sizeof p,"captures/traces/sh_%016llx_%s.bin",(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); }
+  snprintf(p,sizeof p,"%s/sh_%016llx_%s.bin",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); }
   ShaderInfo si; memset(&si,0,sizeof si); si.attr_int_mask=sh->si.attr_int_mask; si.attr_sint_mask=sh->si.attr_sint_mask; char* g=shader_to_glsl(b,0x8000,stage,&si);
-  if(g){ snprintf(p,sizeof p,"captures/traces/sh_%016llx_%s.glsl",(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); f=fopen(p,"wb"); if(f){ fputs(g,f); fclose(f); } free(g); }
+  if(g){ snprintf(p,sizeof p,"%s/sh_%016llx_%s.glsl",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); f=fopen(p,"wb"); if(f){ fputs(g,f); fclose(f); } free(g); }
   free(b);
   trace_note("  shader %016llx %s: %d untranslated%s%s, failed=%d\n",(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs",sh->si.unsupported,sh->si.unsupported?" first: ":"",sh->si.first_unsupported,sh->failed); }
 
@@ -2800,11 +2832,13 @@ static void trace_frame(void){
       if(!ok && t->target==GL_TEXTURE_2D && (u64)w*h<=(1u<<20)){ u8* px=malloc((size_t)w*h*4);
         if(px){ glBindTexture(GL_TEXTURE_2D,t->id); glPixelStorei(GL_PACK_ALIGNMENT,1); glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
           for(u32 y=0;y<oh;y++) for(u32 x=0;x<ow;x++) memcpy(o+((size_t)y*ow+x)*4,px+((size_t)y*st*w+x*st)*4,4); free(px); ok=1; } }
-      if(ok){ char p[160]; snprintf(p,sizeof p,"captures/traces/tex%03d_%llx_%ux%u_f%x%s.ppm",i,(unsigned long long)t->gva,t->w,t->h,t->fkey,t->is_rt?"_rt":""); tr_save(p,o,ow,oh); }
+      if(ok){ char p[160]; snprintf(p,sizeof p,"%s/tex%03d_%llx_%ux%u_f%x%s.ppm",g_tr_dir,i,(unsigned long long)t->gva,t->w,t->h,t->fkey,t->is_rt?"_rt":""); tr_save(p,o,ow,oh); }
       free(o); }
-    fclose(g_tr); g_tr=NULL; g_tr_on=0; LOG("trace: frame saved in captures/traces (%d draws, %d images)\n",g_tr_n,g_tr_img); fflush(NULL); }
+    fclose(g_tr); g_tr=NULL; g_tr_on=0; LOG("trace: frame saved in %s (%d draws, %d images)\n",g_tr_dir,g_tr_n,g_tr_img); fflush(NULL); }
   { static int envf=-2; if(envf==-2){ const char* e=getenv("SWR_TRACE"); envf= e? atoi(e) : -1; } if(envf>=0 && (int)g_frame==envf) g_tr_arm=1; }
-  if(g_tr_arm){ g_tr_arm=0; plat_mkdir("captures"); plat_mkdir("captures/traces"); g_tr=fopen("captures/traces/trace.txt","w");
+  if(g_tr_arm){ g_tr_arm=0; plat_mkdir("captures"); plat_mkdir("captures/traces");
+    /* each F5 in its own folder (captures/traces/001, 002, ...): one trace.txt was overwritten by the next F5 */
+    { static int nt; char q[96]; do snprintf(g_tr_dir,sizeof g_tr_dir,"captures/traces/%03d",++nt), snprintf(q,sizeof q,"%s/trace.txt",g_tr_dir); while(nt<999 && (g_tr=fopen(q,"rb"))!=NULL && !fclose(g_tr)); plat_mkdir(g_tr_dir); g_tr=fopen(q,"w"); }
     g_tr_on= g_tr!=NULL; g_tr_n=0; g_tr_img=0; g_tr_ntex=0; g_tr_nsh=0;
     for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) t->tr_last=0;
     LOG("trace: recording the next frame...\n"); }
@@ -4047,9 +4081,20 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
     { extern int g_vs_layer_ext; g_vs_layer_ext= g_gles? 0 : (vl&1)? 1 : (vl&2)? 2 : (vl&4)? 3 : 0;
       LOG("gpu: render target layer from the vertex shader: %s\n",g_vs_layer_ext==1? "ARB_shader_viewport_layer_array" : g_vs_layer_ext==2? "AMD_vertex_shader_layer" : g_vs_layer_ext==3? "NV_viewport_array2" : "not available (drawn to layer 0)"); }
     if(!g_gles) LOG("ASTC textures: %s\n",g_has_astc && !getenv("SWR_ASTC_CPU")? "decoded by the GPU (fast, with mipmaps)" : "decoded on the CPU");
-    if(getenv("SWR_SYNC_SHADERS")) g_par=0;
-    if(g_par){ typedef void (APIENTRY*MSCT)(GLuint); MSCT f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsKHR"); if(!f) f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsARB"); if(f) f(0xFFFFFFFFu); }
-    LOG("shaders: parallel compilation %s\n",g_par? "enabled (no stutter: anything still compiling is drawn as soon as it is ready)" : "not available in this driver"); }
+    int had_par=g_par; if(getenv("SWR_SYNC_SHADERS")) g_par=0;
+    /* NVIDIA on Windows (driver 617, RTX 4060 Ti, MEASURED 2026-11-03): glMaxShaderCompilerThreads from any context left
+       SwapBuffers blocked for good after the third frame, and our compile threads (shared contexts) got stuck in
+       glGetProgramiv(GL_LINK_STATUS) after a job or two, so their jobs never finished (with draws not waiting: nothing
+       drawn at all). Its own parallel compile with the default thread count works: 60 FPS, every draw drawn. So there
+       the driver compiles and we start no compile threads (the pre-build from GPU memory needs them and is off).
+       SWR_NV_WORKERS=1: compile threads and the thread count call as elsewhere */
+#ifdef _WIN32
+    { const char* ven=(const char*)glGetString(GL_VENDOR); g_nv_win= ven && strstr(ven,"NVIDIA") && !getenv("SWR_NV_WORKERS"); }
+#endif
+    if(g_par && !g_nv_win){ typedef void (APIENTRY*MSCT)(GLuint); MSCT f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsKHR"); if(!f) f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsARB"); if(f) f(0xFFFFFFFFu); }
+    if(g_nv_win) LOG("shaders: NVIDIA on Windows: the driver compiles new shaders itself, no compile threads of ours\n");
+    LOG("shaders: parallel compilation %s\n",g_par? "enabled (no stutter: anything still compiling is drawn as soon as it is ready)"
+        : had_par? "off: wait_for_shaders=1 makes each draw wait for its new shader (the driver has it)" : "not available in this driver"); }
   { GLint v[6]={0}; glGetIntegerv(0x8B4D,&v[0]); glGetIntegerv(0x8872,&v[1]); glGetIntegerv(0x8A2F,&v[2]); glGetIntegerv(0x8A2B,&v[3]); glGetIntegerv(0x8A2D,&v[4]); glGetIntegerv(0x826E,&v[5]);
     LOG("OpenGL limits: textures %d (per stage %d), UBO %d (VS %d, FS %d), uniform locations %d\n",v[0],v[1],v[2],v[3],v[4],v[5]);
     GLint sb[4]={0}; glGetIntegerv(0x90DD,&sb[0]); glGetIntegerv(0x90D6,&sb[1]); glGetIntegerv(0x90DA,&sb[2]); glGetIntegerv(0x90D7,&sb[3]);   /* bindings, VS, FS, GS blocks */
@@ -4095,7 +4140,10 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
         static u64 last_frames_pf;
         { static u64 last_t, last_cpu, last_frames; u64 cpu_now=plat_thread_cpu_ns(),dt=now-last_t; if(last_t && dt){
             LOG("performance: %.1f FPS, GPU thread CPU busy %d%% (host rendering-thread CPU time; not hardware GPU utilization)\n",
-              (double)(g_frame-last_frames)*1e9/(double)dt,(int)((cpu_now-last_cpu)*100/dt)); }
+              (double)(g_frame-last_frames)*1e9/(double)dt,(int)((cpu_now-last_cpu)*100/dt));
+            if(g_par_built){ static u32 said; if(g_par_built!=said){ said=g_par_built; LOG("shaders: %u built by the driver in the background so far (longest %.0f ms, drawn when ready)\n",g_par_built,g_par_max/1e6); } }
+            if(g_workers_up){ char wb[160]; int o=0; for(int i=0;i<g_wid_next && i<8;i++) o+=snprintf(wb+o,sizeof wb-o," #%d step %d jobs %u",i,g_wph[i],g_wjobs[i]);
+              LOG("shaders: compile threads:%s\n",wb); } }
           last_t=now; last_cpu=cpu_now; last_frames=g_frame; }
           { /* performance.txt: compact summary for diagnosing on someone else's PC */
             static u64 l_now, l_pcpu, l_gcpu, l_cn, l_cns, l_fr2, l_skip, l_dr2; FILE* rf=g_rf; u64 t_start=g_rf_t0; if(!rf){ rf=g_rf=fopen("performance.txt","w"); t_start=g_rf_t0=now; if(rf){ extern int plat_ncpu(void);

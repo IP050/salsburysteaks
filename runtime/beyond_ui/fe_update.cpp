@@ -151,6 +151,10 @@ static DWORD WINAPI check_thread(void*) {
     return 0;
 }
 void update_check_async() {
+#ifdef SWR_PERSONAL_DLSS   // the releases are the public EXE without DLSS: installing one would take DLSS out of this build
+    set_error("this is a personal DLSS build: update it by rebuilding with build.bat dlss");
+    return;
+#endif
     ulock(); if (g_us.stage == UP_CHECKING || g_us.stage == UP_DOWNLOADING) { uunlock(); return; } g_us = UpdateState(); g_us.stage = UP_CHECKING; g_us.installed = installed_version(); uunlock();
     CloseHandle(CreateThread(nullptr, 0, check_thread, nullptr, 0, nullptr));
 }

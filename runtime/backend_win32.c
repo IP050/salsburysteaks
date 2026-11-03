@@ -11,7 +11,11 @@
 #include <windows.h>
 #include <mmsystem.h>  /* timeBeginPeriod (windows.h leaves it out with WIN32_LEAN_AND_MEAN) */
 
-static HWND g_hwnd; static HDC g_hdc; static HGLRC g_ctx, g_wctx;
+static HWND g_hwnd; static HDC g_hdc, g_wdc[8]; static HGLRC g_ctx, g_wctx[8]; static int g_nwctx; static volatile int g_wnext;
+/* shader compile threads (gpu_gl.c worker_start): NVIDIA's Windows driver has no GL_KHR_parallel_shader_compile and
+   compiles GLSL on the thread that asks, so each thread gets its own context sharing the game's, as on Linux
+   (backend_x11.c). One context left new areas compiling hundreds of shaders at their first draw. [Performance] shader_threads */
+int g_opt_shader_threads;
 static HWND g_glwnd; static int g_want_vk;   /* renderer=vulkan: GL renders on the hidden g_glwnd, Vulkan presents on g_hwnd */
 static volatile int g_ww=1280, g_wh=720; static u64 keys_held,keys_tapped;static int test_tap_sample; static int g_fullscreen=0, g_want_fs=1;
 static WINDOWPLACEMENT g_wp={sizeof(WINDOWPLACEMENT)};
@@ -279,7 +283,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
       if(down && (bit&mouse_aim_button())){ RECT c; GetClientRect(h,&c); MapWindowPoints(h,NULL,(POINT*)&c,2); ClipCursor(&c); }   /* aiming: the cursor stays in */
       else if(!down && (bit&mouse_aim_button())) ClipCursor(NULL);
       return (m==WM_XBUTTONDOWN||m==WM_XBUTTONUP)? TRUE : 0; }
-  case WM_SETCURSOR: if(LOWORD(l)==HTCLIENT && ov_is_open()){ SetCursor(LoadCursor(NULL,IDC_ARROW)); return TRUE; }
+  case WM_SETCURSOR: if(LOWORD(l)==HTCLIENT && ov_is_open()){ extern HCURSOR cursor_game(void); SetCursor(cursor_game()); return TRUE; }
     { extern int g_opt_mouse_aim; if(g_opt_mouse_aim && LOWORD(l)==HTCLIENT){ SetCursor(NULL); return TRUE; } }   /* free aim: no cursor over the game */
     if(g_fullscreen && LOWORD(l)==HTCLIENT){ SetCursor(NULL); return TRUE; } break;
   }
@@ -297,7 +301,8 @@ static void set_pixel_format(HDC dc){
 extern int fe_run(void* hwnd);   /* beyond_ui/fe.cpp: its own message loop; 0 = play, 1 = quit */
 static void win_thread(void* arg){
   HINSTANCE hi=GetModuleHandle(NULL);
-  WNDCLASSA wc={0}; wc.style=CS_OWNDC; wc.lpfnWndProc=wndproc; wc.hInstance=hi; wc.hCursor=LoadCursor(NULL,IDC_ARROW);
+  extern HCURSOR cursor_game(void);   /* cursor_win32.c: the game's own pointer, on the Play screen and in the F1 menu */
+  WNDCLASSA wc={0}; wc.style=CS_OWNDC; wc.lpfnWndProc=wndproc; wc.hInstance=hi; wc.hCursor=cursor_game();
   wc.hIcon=LoadIcon(hi,MAKEINTRESOURCE(1)); if(!wc.hIcon) wc.hIcon=LoadIcon(NULL,IDI_APPLICATION);
   wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH); wc.lpszClassName="MetroidPrime4RecompWnd";
   RegisterClassA(&wc);
@@ -331,6 +336,13 @@ static void win_thread(void* arg){
     RegisterClassA(&gc); g_glwnd=CreateWindowA("MetroidPrime4RecompGL","Metroid Prime 4 Beyond GL",WS_POPUP,0,0,64,64,NULL,NULL,hi,NULL); }
   g_hdc=GetDC(g_glwnd? g_glwnd : g_hwnd);
   { extern int g_snxvk_want; if(!g_snxvk_want) set_pixel_format(g_hdc); }   /* native Vulkan: no GL pixel format on its window (set later if it falls back) */
+  { /* each shader compile thread binds its context to a hidden window of its own: bound to the game's window, NVIDIA's
+       driver deadlocked them with SwapBuffers on it (compile threads stuck in glGetProgramiv(GL_LINK_STATUS) after a
+       job or two, the GL thread stuck in SwapBuffers when draws didn't wait for shaders). Made here so this thread's
+       message loop serves them */
+    WNDCLASSA wc2={0}; wc2.style=CS_OWNDC; wc2.lpfnWndProc=DefWindowProcA; wc2.hInstance=hi; wc2.lpszClassName="MetroidPrime4RecompGLW"; RegisterClassA(&wc2);
+    for(int i=0;i<8;i++){ HWND w=CreateWindowA("MetroidPrime4RecompGLW","",WS_POPUP,0,0,1,1,NULL,NULL,hi,NULL); if(!w) break;
+      g_wdc[i]=GetDC(w); set_pixel_format(g_wdc[i]); } }
   if(g_want_fs) set_fullscreen(1);
   ShowWindow(g_hwnd,SW_SHOW);
   { RAWINPUTDEVICE d={1,2,0,g_hwnd}; if(!RegisterRawInputDevices(&d,1,sizeof d)) LOG("input: raw mouse input unavailable: no mouse free aim\n"); }   /* generic desktop mouse */
@@ -399,9 +411,14 @@ int backend_gl_create(void){
   CCA cca=(CCA)wglGetProcAddress("wglCreateContextAttribsARB");
   static const int vers[4][2]={{4,6},{4,5},{4,4},{4,3}};
   for(int i=0;i<4 && !g_ctx && cca;i++){ int ca[]={0x2091,vers[i][0],0x2092,vers[i][1],0x9126,0x00000001,0x2094,getenv("SWR_GL_DRIVER_DEBUG")?1:0,0}; g_ctx=cca(g_hdc,NULL,ca);
-    if(g_ctx) g_wctx=cca(g_hdc,g_ctx,ca); }   /* second shared context for the shader compile thread */
+    if(g_ctx){ SYSTEM_INFO si; GetSystemInfo(&si); int nc=(int)si.dwNumberOfProcessors;
+      int want=g_opt_shader_threads>0? g_opt_shader_threads : nc/4;
+      if(want<2 && g_opt_shader_threads<=0) want=2; if(want>8) want=8;
+      for(g_nwctx=0;g_nwctx<want;g_nwctx++){ g_wctx[g_nwctx]=cca(g_hdc,g_ctx,ca); if(!g_wctx[g_nwctx]) break; }
+      { extern int g_gl_workers; g_gl_workers= g_nwctx? g_nwctx : 1; } } }
   wglMakeCurrent(NULL,NULL); wglDeleteContext(tmp);
-  if(!g_ctx){ fatal("Your graphics card does not support OpenGL 4.3.\nPlease update your GPU driver."); return 0; }
+  if(!g_ctx){ /* also what a second copy of the game, or one started right after a crashed one, gets from the driver */
+    fatal("The graphics driver would not create an OpenGL 4.3 context (Windows error %lu).\nIf the game is already running, close it first; otherwise restart the PC or update the GPU driver.",(unsigned long)GetLastError()); return 0; }
   wglMakeCurrent(g_hdc,g_ctx);
   if(g_glwnd && !vkp_init()){
     /* Vulkan unavailable: give the real window the same pixel format and render to it with GL as usual */
@@ -423,7 +440,7 @@ void* backend_gl_proc(const char* n){
 void backend_gl_vsync(int on){ SWI si=(SWI)wglGetProcAddress("wglSwapIntervalEXT"); if(si) si(on?1:0); }   /* GL thread */
 void backend_gl_swap(void){ if(vkp.on) vkp_swap(); else SwapBuffers(g_hdc); }
 
-int backend_gl_worker_current(void){ return g_wctx && wglMakeCurrent(g_hdc,g_wctx); }
+int backend_gl_worker_current(void){ int i=__atomic_fetch_add(&g_wnext,1,__ATOMIC_ACQ_REL); return i<g_nwctx && wglMakeCurrent(g_wdc[i]? g_wdc[i] : g_hdc,g_wctx[i]); }
 
 void backend_window_size(int* w, int* h){ *w=g_ww; *h=g_wh; }
 

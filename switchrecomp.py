@@ -287,12 +287,14 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     spvc = None
     # SWR_RELEASE=1 (the public Metroid Prime 4 Beyond release): no frame generation, and the renderer without DLSS
     release = bool(os.environ.get('SWR_RELEASE'))
+    # SWR_WITH_DLSS=1 (build.bat dlss): the release build plus NVIDIA DLAA, for the player's own PC only (GPL: never share it)
+    with_dlss = not release or bool(os.environ.get('SWR_WITH_DLSS'))
     if gl and backend in ('win32', 'x11') and not release:
         spvc = os.path.join(RT, 'spvc', 'win' if target_win else 'lin', 'libspvc.a')
         if os.path.isfile(spvc): srcs += [os.path.join(RT, 'lsfg.c'), os.path.join(RT, 'lsfg_spvc.cpp')]
         else: spvc = None
     if gl and not spvc: srcs += [os.path.join(RT, 'lsfg_stub.c')]
-    if target_win and backend == 'win32': srcs += [os.path.join(RT, 'rec_win32.c')]   # F7 recorder, Media Foundation
+    if target_win and backend == 'win32': srcs += [os.path.join(RT, 'rec_win32.c'), os.path.join(RT, 'cursor_win32.c')]   # F7 recorder (Media Foundation), the game's mouse pointer
     if target_win and backend == 'win32' and os.path.isfile(os.path.join(RT, 'app.rc')):   # the EXE's icon (runtime/app.ico)
         wr = os.path.join(os.path.dirname(cc) if os.path.dirname(cc) else '', 'windres.exe')
         if not os.path.isfile(wr): wr = shutil.which('windres') or ''
@@ -316,7 +318,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if overlay: srcs += [os.path.join(RT, 'beyond_ui', f) for f in ('ui.cpp', 'ov.cpp') + (('fe.cpp', 'fe_sys_linux.cpp') if lx_frontend else ('stub_fe.c',))] + [os.path.join(RT, 'imgui', 'src', f) for f in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'imgui_impl_opengl3.cpp')]
     elif gl and not frontend: srcs += [os.path.join(RT, 'beyond_ui', 'stub.c')]
     # renderer=vulkan_native: ScarletNX's GPU front end + Vulkan renderer (GPL-3.0), prebuilt by work-profiler/build_snxvk.py
-    snxvk = os.path.join(RT, 'snxvk', 'libsnxvk_new_nodlss.a' if release else 'libsnxvk_new.a')   # ScarletNX main b5f4f14 (work-profiler/build_snxvk2.py)
+    snxvk = os.path.join(RT, 'snxvk', 'libsnxvk_new.a' if with_dlss else 'libsnxvk_new_nodlss.a')   # ScarletNX main b5f4f14 (work-profiler/build_snxvk2.py)
     if os.environ.get('SWR_SNXVK_LIB'): snxvk = os.path.join(RT, 'snxvk', os.environ['SWR_SNXVK_LIB'])   # e.g. libsnxvk_new.a (re-vendor tests)
     snxvk = snxvk if os.path.isfile(snxvk) and target_win and backend == 'win32' and not os.environ.get('SWR_NO_SNXVK') else None
     cmd = [cc, '-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'vp9', 'include'), '-I', os.path.join(RT, 'snxvk', 'deps', 'Vulkan-Headers-1.4.365', 'include')] + srcs + ['-o', out]
@@ -329,6 +331,8 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     elif not h264: cmd += ['-DSWR_NO_H264']
     if vp9: cmd += ['-DSWR_HAVE_VP9']
     if release: cmd += ['-DSWR_RELEASE']
+    if with_dlss: cmd += ['-DSWR_HAVE_DLSS']
+    if release and with_dlss: cmd += ['-DSWR_PERSONAL_DLSS']   # no in-place updates: they would bring back the public EXE
     if os.environ.get('SWR_RUNTIME_DEFS'): cmd += os.environ['SWR_RUNTIME_DEFS'].split()   # e.g. -DSWR_NO_SKIPCUT for a test build
     if snxvk: cmd += ['-DSWR_HAVE_SNXVK', snxvk]
     if frontend: cmd += ['-DSWR_HAVE_FRONTEND', '-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS', '-I', os.path.join(RT, 'imgui'), imgui]
