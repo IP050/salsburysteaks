@@ -88,7 +88,9 @@ setup compiles it on your PC. No Nintendo files, keys or firmware are included.
 Controllers: Xbox controllers work as they are; SDL2.dll (included) adds Switch Pro, Joy-Con, DualShock 4, DualSense
 and 8BitDo over USB or Bluetooth. Keyboard: arrows = D-pad, WASD = stick, X/Z/C/V = A/B/X/Y, Enter = +, Backspace = -.
 
-Built on the recompiled runtime by yozander2009-stack, with Claude by Anthropic (AI pair programmer).
+Source: a Windows build of linuxopt/mp4-recomp (https://github.com/linuxopt/mp4-recomp, commit 31ff5d5), which forks
+Metroid Dread Recomp by yozander2009-stack and contributors; the game work is theirs. Windows port by PlagueDrRiess
+(https://github.com/PlagueDrRiess/salsburysteaks) with Claude Opus 5.5 by Anthropic as AI pair programmer.
 Credits: SwitchRecomp by MZ Labs (recompiler and runtime); ScarletNX (native Vulkan renderer); Krydar, Nova77, xSeRosiSx (button-icon mods, downloaded on request; art: Xelu's FREE Controller Prompts); program icon: Metroid icon created by Smashicons - Flaticon (https://www.flaticon.com/free-icons/metroid); Dear ImGui; SDL2; zlib; libvpx; OpenH264; GCC / MinGW-w64; Python. Licences are in the licenses folder; the EXE is
 GPL-3.0 (it contains the ScarletNX renderer) and its source is published with this release.
 Metroid Prime 4 Beyond is (c) Nintendo. This project is not affiliated with or endorsed by Nintendo.

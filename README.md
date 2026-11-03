@@ -111,13 +111,32 @@ GitHub release.
 
 ## Credits
 
+### Source
+
+This repository is a Windows build of **[linuxopt/mp4-recomp](https://github.com/linuxopt/mp4-recomp)**, taken at
+commit [`31ff5d5`](https://github.com/linuxopt/mp4-recomp/commit/31ff5d561df3058c0b45a09fa0d4553fdc4a7795)
+(release `v2026.11.02`) with its full history. All the game work (the Prime 4 bring-up, rendering, shader, audio and
+video fixes, the setup and Play screens) is theirs. linuxopt/mp4-recomp is in turn a fork of
+[Metroid Dread Recomp](https://github.com/DaniSald/Metroid-Dread-Recomp) by yozander2009-stack and contributors.
+
+### Windows port
+
+The Windows build, packaging and releases in this repository were made by **PlagueDrRiess** with **Claude**
+(Claude Opus 5.5, by [Anthropic](https://www.anthropic.com)) as AI pair programmer, who co-authored these commits:
+
+- the release packager fix that let `build.bat release` finish (`beyond/make_release.py`),
+- `windows/get_tools.ps1` (the pinned, checksum-verified toolchain) and the GitHub Actions release workflow,
+- this Windows README, the Windows text in the setup screen and the release's `README.txt`, and pointing the Play
+  screen's updates and bug reports at this repository.
+
+### Everyone else
+
 - **yozander2009-stack** and contributors: the recompiled runtime and launcher this port is built from
-- **linuxopt**: the Metroid Prime 4 fork and its fixes
+- **linuxopt**: the Metroid Prime 4 fork and its fixes (made with Claude as AI pair programmer too)
 - **MZ Labs**: SwitchRecomp (Apache-2.0); "SwitchRecomp by MZ Labs" and NOTICE.txt must be kept
 - **ScarletNX**: the native Vulkan renderer (GPL-3.0)
 - **AMD**: FidelityFX Super Resolution 1 (MIT)
 - **Dear ImGui** (MIT), libvpx and OpenH264 (BSD), SDL2 and zlib (zlib licence), GCC / MinGW-w64, Python
-- **Claude** (Anthropic): AI pair programmer
 - Program icon: [Metroid icon created by Smashicons - Flaticon](https://www.flaticon.com/free-icons/metroid)
 
 ## Licences
