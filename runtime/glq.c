@@ -280,10 +280,15 @@ static void gl_thread(void* arg){ plat_diag_role("GL-driver"); (void)arg; trace_
       void* executed=(void*)hd->ex;u64 operation_start=0;int upload_info[8]={0};int image_upload=0;
       if(trace_driver){if(hd->ex==q_sync_ex)executed=(void*)(*(QSync**)hd->data)->ex;if(executed==trace_upload_2d||executed==trace_compressed_2d){memcpy(upload_info,hd->data,sizeof upload_info);image_upload=1;}operation_start=plat_ns();}
       { extern void gs_stall_mark(int); if(hd->ex!=e_swap) gs_stall_mark(1); u64 x0=plat_ns(); hd->ex(hd->data); u64 dx=plat_ns()-x0; gs_stall_mark(0);
-        if(dx>20000000ull){ static int said; if(said<60){ said++; const char* nm="?"; void* fx=(void*)hd->ex;
+        /* the first 60 over 20 ms, and every one over 100 ms (up to 2000): with only the first 60, a session's later
+           stalls (the ones a player reports) had nothing logged */
+        if(dx>20000000ull){ static int said, big; if(said<60 || (dx>100000000ull && big<2000)){ if(said<60) said++; else big++; const char* nm="?"; void* fx=(void*)hd->ex;
             if(fx==(void*)q_sync_ex){ nm="sync"; QSync* qs=*(QSync**)hd->data; fx=(void*)qs->ex; }
             for(const GlqEnt* e=g_glq_tab;e->name;e++) if(e->execute==fx){ nm=e->name; break; }
-            LOG("glq: %s took %.1f ms on the GL thread (fn +%lld)\n",nm,dx/1e6,(long long)((char*)fx-(char*)(void*)glq_start)); } } }
+            LOG("glq: %s took %.1f ms on the GL thread (fn +%lld)\n",nm,dx/1e6,(long long)((char*)fx-(char*)(void*)glq_start));
+            if(!strcmp(nm,"glCompressedTexSubImage3D")){   /* which upload: A_glCompressedTexSubImage3D of glq_gen.c */
+              typedef struct { GLenum target; GLint level, x, y, z; GLsizei w, h, d; GLenum format; GLsizei size; const void* data; } A_cts3;
+              const A_cts3* a=(const A_cts3*)hd->data; LOG("glq:   target %x level %d at z %d, %dx%dx%d, format %x, %d bytes\n",a->target,a->level,a->z,a->w,a->h,a->d,a->format,a->size); } } } }
       if(trace_driver){u64 elapsed=plat_ns()-operation_start;static u32 logged;if(elapsed>10000000ull&&executed!=(void*)e_swap&&logged++<256){const char*name=hd->ex==e_swap?"SwapBuffers":"queue/custom";for(const GlqEnt*entry=g_glq_tab;entry->name;entry++)if(entry->execute==executed){name=entry->name;break;}LOG("glq driver: %s %.2f ms, queued bytes=%llu begin_ns=%llu end_ns=%llu\n",name,elapsed/1e6,(unsigned long long)(__atomic_load_n(&g_qh,__ATOMIC_ACQUIRE)-t),(unsigned long long)operation_start,(unsigned long long)(operation_start+elapsed));if(image_upload)LOG("glq upload detail: level=%d %dx%d format=%x %s=%x\n",upload_info[1],upload_info[4],upload_info[5],upload_info[6],executed==trace_compressed_2d?"bytes":"type",upload_info[7]);}}
       if(hd->big) free(hd->data);
       t+=sz; __atomic_store_n(&g_qt,t,__ATOMIC_RELEASE);
@@ -347,6 +352,21 @@ static void e_pun(void* x){ AUN* a=x; static const char* const nm[2]={"swr_vp","
   for(int n=0;n<16384;n++,h=(h+1)&16383){ ULoc* c=&g_uloc[h]; if(c->p==a->p){ e=c; break; } if(!c->p){ c->p=a->p; c->loc[0]=c->loc[1]=-3; e=c; break; } }
   GLint loc= e? e->loc[a->which] : -3; if(loc==-3){ loc=gul(a->p,nm[a->which]); if(e) e->loc[a->which]=loc; }
   if(loc>=0) pu(a->p,loc,1,a->v); }
+/* At boot, after the cached programs' binaries are handed to the driver: look up both uniforms of each one now. NVIDIA
+   finishes loading binaries on its own threads, and the first lookup of a program waited its turn there: 136 lookups of
+   200-400 ms in a 1-hour session (28 s), each a frozen frame the first time something was drawn (map, doors, the desert).
+   Done here, that wait is part of starting the game instead */
+static void e_uprime(void* x){ int n=*(int*)x; const GLuint* p=(const GLuint*)((char*)x+8); static const char* const nm[2]={"swr_vp","swr_at"};
+  T_gul gul=r_glGetUniformLocation; if(!gul) gul=(T_gul)backend_gl_proc("glGetUniformLocation"); if(!gul) return;
+  extern u64 plat_ns(void); u64 t0=plat_ns();
+  for(int i=0;i<n;i++){ ULoc* e=NULL; u32 h=(p[i]*2654435761u)&16383;
+    for(int k=0;k<16384;k++,h=(h+1)&16383){ ULoc* c=&g_uloc[h]; if(c->p==p[i]){ e=c; break; } if(!c->p){ c->p=p[i]; c->loc[0]=c->loc[1]=-3; e=c; break; } }
+    if(!e) break; for(int w=0;w<2;w++) if(e->loc[w]==-3) e->loc[w]=gul(p[i],nm[w]); }
+  LOG("shaders: %d cached programs made ready at boot in %.0f ms (no wait at their first draw)\n",n,(plat_ns()-t0)/1e6); }
+void glq_uloc_prime(const GLuint* progs, int n){
+  if(n<=0) return;
+  if(!g_active || t_glq_direct){ char* b=malloc(8+(size_t)n*sizeof(GLuint)); *(int*)b=n; memcpy(b+8,progs,(size_t)n*sizeof(GLuint)); e_uprime(b); free(b); return; }
+  char* b=glq_alloc(8+(size_t)n*sizeof(GLuint),0,e_uprime); *(int*)b=n; memcpy(b+8,progs,(size_t)n*sizeof(GLuint)); glq_commit(); }
 void glq_prog_uniform_named(GLuint prog, int which, const float* v){
   if(!g_active || t_glq_direct){ AUN a={prog,which,{v[0],v[1],v[2],v[3]}}; e_pun(&a); return; }
   AUN* a=glq_alloc(sizeof *a,0,e_pun); a->p=prog; a->which=which; memcpy(a->v,v,sizeof a->v); glq_commit(); }

@@ -1311,13 +1311,16 @@ static int supported(u64 w, int op) {
                    (sr >= 0x25 && sr <= 0x27) || sr == 0x38 || sr == 0x39 || sr == 0x3a || sr == 0x3b || sr == 0x3c ||
                    (sr >= 0x50 && sr <= 0x53);
         }
-        /* Attribute addresses use the same byte offsets as ALD/AST. The optional range predicate is not modeled. */
-        case O_AL2P: return B(w, 44, 3) == 7;
+        /* Attribute addresses use the same byte offsets as ALD/AST. The optional range predicate (bits 44-46) is
+           written true: the addresses Metroid Prime 4 makes are always in range. */
+        case O_AL2P: return 1;
         /* ALD and AST: a patch's attributes (bit 31) are its tessellation levels and 30 vectors from 0x20. Which stage
-           has which is stage_has's. ALD.O (bit 32) reads a control program's per-vertex outputs. */
+           has which is stage_has's. ALD.O (bit 32) reads a control program's per-vertex outputs. An indexed ALD
+           (an address register) reads a vertex program's generic inputs (stage_has). */
         case O_ALD: {
             u32 addr = B(w, 20, 10), count = B(w, 47, 2) + 1;
-            if (B(w, 8, 8) != 255 || B(w, 0, 8) + count > 255) return 0;
+            if (B(w, 8, 8) != 255) return !B(w, 31, 1) && !B(w, 32, 1) && B(w, 0, 8) + count <= 255;
+            if (B(w, 0, 8) + count > 255) return 0;
             if (B(w, 31, 1)) return addr + count * 4 <= 0x200;
             return (addr >= 0x70 && addr + count * 4 <= 0x280) ||
                    ((addr == 0x60 || addr == 0x2f4 || addr == 0x2f8 || addr == 0x2fc) && count == 1) ||
@@ -1488,7 +1491,7 @@ static int supported(u64 w, int op) {
             u32 addr = B(w, 30, 8) * 4;
             return ((addr >= 0x80 && addr < 0x280) || (addr >= 0x70 && addr < 0x80) || addr == 0x60 || addr == 0x64 ||
                     addr == 0x2e0 || addr == 0x2e4 || addr == 0x3fc) &&
-                   !B(w, 38, 1);
+                   (!B(w, 38, 1) || B(w, 8, 8) != 255); /* IPA.IDX: the address register picks a generic input */
         }
         case O_PSETP: return B(w, 24, 2) < 3 && B(w, 45, 2) < 3;
         case O_PSET: return B(w, 24, 2) < 3 && B(w, 45, 2) < 3;
@@ -1618,6 +1621,7 @@ static int stage_has(u64 w, int op, int stage) {
     u32 addr = B(w, 20, 10);
     if (op == O_ALD) {
         if (stage == ST_FS || stage == ST_CS) return 0;
+        if (B(w, 8, 8) != 255) return stage == ST_VS;
         if (B(w, 31, 1)) return stage == ST_TCS || stage == ST_TES;
         if (stage == ST_TCS && B(w, 32, 1) && addr < 0x70) return 0;
         if (addr == 0x2f8 || addr == 0x2fc) return stage == ST_VS;
@@ -2243,7 +2247,13 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             op->id != O_MEMBAR && op->id != O_CCTL && op->id != O_CCTLL && op->id != O_IDE && op->id != O_BPT &&
             op->id != O_PEXIT)
             used[d] = 1;
-        if (op->id == O_ALD || op->id == O_AST) {
+        if (op->id == O_ALD && a != 255) { /* indexed: any of the 16 generic inputs (as the GL translator) */
+            u32 width = B(insn[i], 47, 2) + 1;
+            used[a] = 1;
+            for (u32 k = 0; k < width; k++)
+                if (d + k < 255) used[d + k] = 1;
+            for (u32 k = 0; k < 16; k++) inputs_used[k] = 1;
+        } else if (op->id == O_ALD || op->id == O_AST) {
             u32 addr = B(insn[i], 20, 10), width = B(insn[i], 47, 2) + 1, vertex = B(insn[i], 39, 8);
             int input = op->id == O_ALD && !(stage == ST_TCS && B(insn[i], 32, 1));
             if (op->id == O_AST && a != 255) indexed_store = 1;
@@ -2937,7 +2947,14 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
         if (op->id == O_IPA) {
             if (B(insn[i], 51, 1)) needs_glsl = 1;
             u32 addr = B(insn[i], 30, 8) * 4;
-            if (addr == 0x64) {
+            if (B(insn[i], 38, 1)) { /* IPA.IDX: every generic input the program header declares */
+                if (B(insn[i], 8, 8) < 255) used[B(insn[i], 8, 8)] = 1;
+                for (u32 input = 0; input < 32; input++)
+                    if ((sph[6 + input / 4] >> ((input % 4) * 8)) & 0xff) {
+                        inputs_used[input] = 1;
+                        if (ipa_interpolation(sph, input) == 2) needs_fragcoord = 1;
+                    }
+            } else if (addr == 0x64) {
                 layer_input_used = 1;
             } else if (addr == 0x3fc) {
                 needs_frontface = 1;
@@ -3905,6 +3922,36 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                         : sr == 0x1d && stage != ST_FS ? spv_emit_constant_u32(&c->emit, c->u32_type, 0x00ff0000u)
                                                        : c->zero;
             reg_write(c, d, value);
+        } else if (op == O_ALD && a != 255) {
+            /* indexed (a vertex program, stage_has): the register plus the offset picks one of the 16 generic
+               inputs' components, unknown addresses read 0. All values are made before any register is written,
+               as the address register can be a destination. */
+            u32 width = B(w, 47, 2) + 1, values[4], parts[16][4];
+            u32 base = spv_emit_iadd_u32(&c->emit, c->u32_type, reg_read(c, a),
+                                         spv_emit_constant_u32(&c->emit, c->u32_type, B(w, 20, 10)));
+            for (u32 index = 0; index < 16; index++) {
+                u32 vector = spv_emit_load(&c->emit, input_vec_type[index], inputs[index]);
+                for (u32 q = 0; q < 4; q++) {
+                    u32 value = spv_emit_vec4_extract(&c->emit, input_component_type[index], vector, q);
+                    parts[index][q] = input_component_type[index] == c->u32_type
+                                          ? value
+                                          : spv_emit_bitcast(&c->emit, c->u32_type, value);
+                }
+            }
+            for (u32 k = 0; k < width; k++) {
+                u32 at = spv_emit_iadd_u32(&c->emit, c->u32_type, base,
+                                           spv_emit_constant_u32(&c->emit, c->u32_type, k * 4));
+                u32 value = c->zero;
+                for (u32 index = 0; index < 16; index++)
+                    for (u32 q = 0; q < 4; q++)
+                        value = spv_emit_select(
+                            &c->emit, c->u32_type,
+                            spv_emit_i_equal(&c->emit, c->bool_type, at,
+                                             spv_emit_constant_u32(&c->emit, c->u32_type, 0x80 + index * 16 + q * 4)),
+                            parts[index][q], value);
+                values[k] = value;
+            }
+            for (u32 k = 0; k < width; k++) reg_write(c, d + k, values[k]);
         } else if (op == O_ALD && (between || B(w, 31, 1))) {
             u32 addr = B(w, 20, 10), width = B(w, 47, 2) + 1, vertex = 0, k;
             int patch = B(w, 31, 1);
@@ -4053,8 +4100,9 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             }
             reg_write(c, d, c->zero); /* the output handle, which the host doesn't have */
         } else if (op == O_AL2P) {
-            u32 offset = spv_emit_constant_u32(&c->emit, c->u32_type, B(w, 20, 11));
+            u32 offset = spv_emit_constant_u32(&c->emit, c->u32_type, (u32)((i32)(B(w, 20, 11) << 21) >> 21));
             reg_write(c, d, spv_emit_iadd_u32(&c->emit, c->u32_type, reg_read(c, a), offset));
+            pred_write(c, B(w, 44, 3), c->true_value); /* in range */
         } else if (op == O_ISBERD) {
             reg_write(c, d, reg_read(c, a));
         } else if (op == O_MOV32I) {
@@ -5679,6 +5727,40 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             u32 value = spv_emit_select(&c->emit, c->u32_type, test, truth, c->zero);
             if (B(w, 47, 1)) flags_logic(c, value);
             reg_write(c, d, value);
+        } else if (op == O_IPA && B(w, 38, 1)) {
+            /* IPA.IDX: the register holds the whole address of a generic input (Prime 4's materials pick their UV
+               set and tangent frame this way). Each declared component, interpolated as IPA does, through a select
+               chain; unknown addresses read 0. */
+            u32 at = reg_read(c, a), value = spv_emit_constant_f32(&c->emit, c->f32_type, 0.0f), wcoord = 0;
+            for (u32 input = 0; input < 32; input++) {
+                if (!((sph[6 + input / 4] >> ((input % 4) * 8)) & 0xff)) continue;
+                u32 interpolation = ipa_interpolation(sph, input);
+                u32 vector = inputs[input] ? spv_emit_load(&c->emit, vec4, inputs[input]) : 0;
+                for (u32 q = 0; q < 4; q++) {
+                    if (!((sph[6 + input / 4] >> ((input % 4) * 8 + q * 2)) & 3)) continue;
+                    u32 part = vector ? spv_emit_vec4_extract(&c->emit, c->f32_type, vector, q)
+                                      : spv_emit_constant_f32(&c->emit, c->f32_type, q == 3 ? 1.0f : 0.0f);
+                    if (vector && interpolation == 2) {
+                        if (!wcoord)
+                            wcoord = spv_emit_vec4_extract(&c->emit, c->f32_type,
+                                                           spv_emit_load(&c->emit, vec4, fragcoord), 3);
+                        part = spv_emit_fmul(&c->emit, c->f32_type, part, wcoord);
+                        spv_emit_no_contraction(&c->emit, part);
+                    }
+                    value = spv_emit_select(
+                        &c->emit, c->f32_type,
+                        spv_emit_i_equal(&c->emit, c->bool_type, at,
+                                         spv_emit_constant_u32(&c->emit, c->u32_type, 0x80 + input * 16 + q * 4)),
+                        part, value);
+                }
+            }
+            if (B(w, 54, 2) == 1) {
+                u32 rhs = spv_emit_bitcast(&c->emit, c->f32_type, reg_read(c, b));
+                value = spv_emit_fmul(&c->emit, c->f32_type, value, rhs);
+                spv_emit_no_contraction(&c->emit, value);
+            }
+            value = float_saturate(c, value, B(w, 51, 1));
+            reg_write(c, d, spv_emit_bitcast(&c->emit, c->u32_type, value));
         } else if (op == O_IPA) {
             u32 addr = B(w, 30, 8) * 4;
             u32 component = (addr >> 2) & 3;

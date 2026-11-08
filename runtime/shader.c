@@ -971,14 +971,16 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
       case 5: crd=T("ivec2(%s,%s)",R(c,ra),R(c,ra+1)); lod=T("int(%s)",R(c,rb)); break;
       case 6: crd=T("ivec2(%s,%s)",R(c,ra),R(c,ra+1)); break;
       case 7: type=2; crd=T("ivec3(%s,%s,%s)",R(c,ra),R(c,ra+1),R(c,rb)); break;
-      case 8: array=1; crd=T("ivec3(%s,%s,%s)",R(c,ra+1),R(c,rb),R(c,ra)); break;
+      case 8: array=1; crd=T("ivec3(%s,%s,int(%s & 0xFFFFu))",R(c,rb),R(c,rb+1),R(c,ra)); break;   /* 2D array: x, y from Rb, Rb+1, the layer from Ra's low 16 bits (the Vulkan translator's order; the terrain's height fetch reads its tile at the same Rb pair as its 2D fetch) */
       case 12: crd=T("ivec2(%s,%s)",R(c,ra),R(c,ra+1)); lod=T("int(%s)",R(c,rb)); ofs=R(c,rb+1); break;
       default: crd=T("ivec2(%s,%s)",R(c,ra),R(c,rb)); break;
     }
     int s=tex_slot(c,off,type,array,0,1);
     if(type==0) crd=T("ivec2(%s, 0)",crd);
     if(ofs) crd=T("(%s + ivec2(bitfieldExtract(int(%s),0,4),bitfieldExtract(int(%s),4,4)))",crd,ofs,ofs);
-    if(type==1 && (c->stage==ST_FS || c->stage==ST_VS)){ crd=T("swr_fc(%s, %d)",crd,s); c->si->uses_position_in=1; }
+    if(type==1 && (c->stage==ST_FS || c->stage==ST_VS)){   /* an array (enc 8) scales x,y and keeps the layer: swr_fc on the ivec3 made the
+         call texelFetch(sampler2DArray, ivec2), which NVIDIA rejects (6 shaders in a play session, their draws never drawn) */
+      crd= array? T("ivec3(swr_fc((%s).xy, %d), (%s).z)",crd,s,crd) : T("swr_fc(%s, %d)",crd,s); c->si->uses_position_in=1; }
     const char* smp= T("texelFetch(tex%d, %s, %s)",s,crd,lod);
     emitl(c,"{ vec4 t_ = %s;",IW(c,s,smp)); c->indent++; write_texs(c,w,"t_",!B(w,59,1)); c->indent--; emitl(c,"}");   /* bit59: fp32 */
     break; }
@@ -1018,7 +1020,7 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     if(array && id!=O_TLD) crd=T("vec%d(%s, float(%s))",dim+1,crd,arr);
     if(array && eid==O_TLD) crd=T("ivec%d(%s, int(%s))",dim+1,crd,arr);
     const char* smp;
-    if(eid==O_TMML){ smp= g_glsl_es? "vec4(0.0)" : T("vec4(textureQueryLod(tex%d, %s), 0.0, 0.0)",s,crd); }
+    if(eid==O_TMML){ smp= g_glsl_es? "vec4(0.0)" : T("vec4(intBitsToFloat(ivec2(textureQueryLod(tex%d, %s).yx * 256.0)), 0.0, 0.0)",s,crd); }   /* hw: (unclamped, clamped) LOD as fixed point 8.8 integers, the reverse of GLSL's order (the Vulkan translator's and Ryujinx's); the terrain's virtual texture picks its pages with it */
     else if(eid==O_TLD){ if(dim==2 && !array && (c->stage==ST_FS || c->stage==ST_VS)){ crd=T("swr_fc(%s, %d)",crd,s); c->si->uses_position_in=1; }
       smp=T("texelFetch(tex%d, %s, %s)",s,crd,lod?lod:"0"); }
     else if(eid==O_TLD4){ u32 comp=B(w,56,2); smp= dc? T("textureGather(tex%d, %s, %s)",s,crd,dref) : T("textureGather(tex%d, %s, %u)",s,crd,comp); }
@@ -1249,7 +1251,12 @@ static int stk_resolve(Ctx* c, u32 n, int fwd, const u32* brx_all, int brx_n){
 /* ---- structured emission for forward-only shaders (nested if/else, no pc var) ----
    forward branch i->t (BRA, or SYNC/BRK once resolved) opens 'if(!cond){' and closes at t. needs properly
    nested ranges; an unconditional branch right before a close turns into 'else'. otherwise use the pc guards. */
-typedef struct { u32 end, end2; u8 els, in_else; } Iv;
+typedef struct { u32 end, end2; u8 els, in_else, loop; } Iv;
+/* Loops (2026-11-08): a conditional backward BRA j -> t whose body [t, j] is entered only at t and left only by falling
+   out after j becomes '{ do { ... } while(taken && guard); }'. Before, one such loop sent the whole shader to the pc
+   switch dispatcher: every shader the NVIDIA driver took 1-229 s to build (22 in an hour of play, 60-157 KB of GLSL)
+   was one, and while it built the driver blocked the GL thread (frozen frames, the map's slow open).
+   lend[t] = j for a loop head, lbh[j] = t+1 for its back-edge; SWR_SHADER_NOLOOP=1 = the old way */
 #define ST_MAX 64
 
 /* target of branch i, 0 if not a branch, ~0u if it breaks structuring */
@@ -1267,13 +1274,19 @@ static int st_uncond(Ctx* c, u32 i){ u64 w=c->w[i]; if(!(B(w,16,3)==7 && !B(w,19
   return 1; }
 
 /* jt[i]: 0 normal, ~0u becomes 'else', otherwise the equivalent nearer target */
-static int st_check(Ctx* c, u32 n, u32* jt){
+static int st_check(Ctx* c, u32 n, u32* jt, const u32* lend, const u32* lbh){
   Iv S[ST_MAX]; int sp=0;
   for(u32 i=11;i<n;i++){ if(!IDX_OK(i)) continue;
-    while(sp && S[sp-1].end==i){ if(S[sp-1].els && !S[sp-1].in_else){ S[sp-1].in_else=1; S[sp-1].end=S[sp-1].end2; } else sp--; }
+    while(sp && !S[sp-1].loop && S[sp-1].end==i){ if(S[sp-1].els && !S[sp-1].in_else){ S[sp-1].in_else=1; S[sp-1].end=S[sp-1].end2; } else sp--; }
+    if(lend && lend[i]){ u32 j=lend[i];   /* loop head: whatever encloses it must also enclose its back-edge */
+      if(sp && S[sp-1].end<=j) return 0;
+      if(sp>=ST_MAX) return 0;
+      S[sp].end=j; S[sp].end2=0; S[sp].els=0; S[sp].in_else=0; S[sp].loop=1; sp++; }
     const Op* op=decode(c->w[i]); if(!op) continue;
+    if(lbh && lbh[i]){ if(!sp || !S[sp-1].loop || S[sp-1].end!=i) return 0; sp--; continue; }   /* back-edge closes its loop */
     u32 t=st_jump(c,i,op); if(!t) continue; if(t==~0u) return 0;
     if(sp && t>S[sp-1].end){   /* jumps into the current if */
+      if(S[sp-1].loop) return 0;   /* leaves the loop (a break): not handled */
       Iv* tp=&S[sp-1]; u32 e=tp->end, g=e-1; while(g>i && !IDX_OK(g)) g--;
       /* then-block ending in a jump to the same target: equivalent to targeting that jump */
       const Op* og= g>i && g<n? decode(c->w[g]) : NULL;
@@ -1283,7 +1296,8 @@ static int st_check(Ctx* c, u32 n, u32* jt){
         if(st_uncond(c,i) && nx==e && e<n && !tp->els && (sp<2 || (S[sp-2].end>e && t<=S[sp-2].end))){ tp->els=1; tp->end2=t; jt[i]=~0u; continue; }
         return 0; } }
     if(sp>=ST_MAX) return 0;
-    S[sp].end=t; S[sp].end2=0; S[sp].els=0; S[sp].in_else=0; sp++; }
+    S[sp].end=t; S[sp].end2=0; S[sp].els=0; S[sp].in_else=0; S[sp].loop=0; sp++; }
+  for(int k=0;k<sp;k++) if(S[k].loop) return 0;   /* an if may run to the end; a loop must have closed */
   return 1; }
 
 char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
@@ -1320,23 +1334,42 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   /* linear, no BRX: only branch targets need a guard */
   int merge= fwd && !has_brx;
   u32* jt=NULL; int stru=0;
-  if(fwd && !has_brx && (!has_stk || c->stk_static) && !getenv("SWR_SHADER_NOSTRUCT")){ jt=calloc(n+1,sizeof(u32)); stru=st_check(c,n,jt); }
+  /* loops: every backward branch a conditional BRA (plain predicate, condition code always true) with its own head */
+  u32* lend=NULL; u32* lbh=NULL;
+  { static int nl=-1; if(nl<0) nl=getenv("SWR_SHADER_NOLOOP")!=NULL;
+    if(flow && !fwd && !has_brx && !nl && !getenv("SWR_SHADER_SWITCH")){ int ok=1, any=0; lend=calloc(n+1,sizeof(u32)); lbh=calloc(n+1,sizeof(u32));
+      for(u32 i=11;i<n && ok;i++){ if(!IDX_OK(i)) continue; const Op* op=decode(c->w[i]); if(!op) continue; int id=op->id; u64 w=c->w[i];
+        if(id==O_PCNT||id==O_CONT||id==O_CAL||id==O_RET||id==O_JMP) ok=0;
+        else if((id==O_SSY||id==O_PBK) && bra_target(w,i)<=i) ok=0;
+        else if(id==O_BRA){ u32 t=bra_target(w,i); if(t>i) continue;
+          u32 pg=B(w,16,3); if(pg==7 && B(w,19,1)) continue;   /* never runs */
+          if(pg==7 || strcmp(cc_flow(B(w,0,5)),"true") || t<11 || !IDX_OK(t) || lend[t]) { ok=0; break; }
+          lend[t]=i; lbh[i]=t+1; any=1; } }
+      if(!ok || !any){ free(lend); free(lbh); lend=lbh=NULL; } } }
+  if((fwd || lend) && !has_brx && (!has_stk || c->stk_static) && !getenv("SWR_SHADER_NOSTRUCT")){ jt=calloc(n+1,sizeof(u32)); stru=st_check(c,n,jt,lend,lbh); }
+  if(!stru){ free(lend); free(lbh); lend=lbh=NULL; }
+  if(lend){ extern volatile unsigned g_sh_loops_structured; g_sh_loops_structured++; }
   /* body */
   c->indent= flow? 3 : 1;
   size_t exit_end=(size_t)-1;   /* where the last top level EXIT's text ends */
   if(stru){ Iv S[ST_MAX]; int sp=0;
     for(u32 i=11;i<n;i++){
       if(!IDX_OK(i)) continue;
-      while(sp && S[sp-1].end==i){ if(S[sp-1].els && !S[sp-1].in_else){ c->indent=sp; emitl(c,"} else {"); S[sp-1].in_else=1; S[sp-1].end=S[sp-1].end2; }
+      while(sp && !S[sp-1].loop && S[sp-1].end==i){ if(S[sp-1].els && !S[sp-1].in_else){ c->indent=sp; emitl(c,"} else {"); S[sp-1].in_else=1; S[sp-1].end=S[sp-1].end2; }
         else { sp--; c->indent=sp+1; emitl(c,"}"); } }
+      if(lend && lend[i]){ c->indent=sp+1; emitl(c,"{ uint lg%d_ = 0u; do {",sp);
+        memset(c->wtag,0,sizeof c->wtag);   /* register tags from before the loop don't hold on its second pass */
+        S[sp].end=lend[i]; S[sp].end2=0; S[sp].els=0; S[sp].in_else=0; S[sp].loop=1; sp++; }
       c->indent=sp+1;
       c->nest=sp;   /* forward only, so writes in any branch already clear labels as we go */
       const Op* op=decode(c->w[i]);
       if(!op){ c->si->unsupported++; emitl(c,"/* desconocida %016llx */",(unsigned long long)c->w[i]); continue; }
+      if(lbh && lbh[i]){ u64 w=c->w[i]; u32 pg=B(w,16,3); sp--; c->indent=sp+1;   /* back-edge: repeat while it is taken */
+        emitl(c,"} while(%s && ++lg%d_ < 1048576u); }", B(w,19,1)? T("(!%s)",P(c,pg)) : P(c,pg), sp); continue; }
       u32 t=st_jump(c,i,op);
       if(t){ if(jt[i]!=~0u){ u64 w=c->w[i]; u32 pg=B(w,16,3); if(jt[i]) t=jt[i];
           emitl(c,"if(%s) {", pg==7? "false" : B(w,19,1)? P(c,pg) : T("(!%s)",P(c,pg)));
-          S[sp].end=t; S[sp].end2=0; S[sp].els=0; S[sp].in_else=0; sp++; }
+          S[sp].end=t; S[sp].end2=0; S[sp].els=0; S[sp].in_else=0; S[sp].loop=0; sp++; }
         else { S[sp-1].els=1; S[sp-1].end2=t; }   /* branch ending the then -> else */
         continue; }
       if(op->id==O_BRA||op->id==O_SYNC||op->id==O_BRK) continue;   /* never taken / goes to i+1 */
@@ -1346,7 +1379,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
     while(sp){ sp--; c->indent=sp+1; emitl(c,"}"); }
     if(exit_end!=c->out.n){ c->indent=1; emitl(c,"return;"); } }   /* no second return after the final EXIT */
   else if(fwd) sb_put(&c->out,"  uint pc = 11u;\n");
-  else if(flow){ sb_put(&c->out,"  uint pc = 11u; uint guard_ = 0u;\n  while(true){\n    if(++guard_ > 16384u) return;\n    switch(pc){\n"); }
+  else if(flow){ sb_put(&c->out,"  /* swr-loop1 */\n  uint pc = 11u; uint guard_ = 0u;\n  while(true){\n    if(++guard_ > 16384u) return;\n    switch(pc){\n"); }
   /* dead code still goes through translation (keeps ShaderInfo/decls the same), the text is thrown away */
   int dead=0; Sb live={0};
   for(u32 i=11;i<n && !stru;i++){
@@ -1366,7 +1399,7 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
       dead=1; live=c->out; memset(&c->out,0,sizeof c->out); }
   }
   if(dead){ free(c->out.p); c->out=live; }
-  free(jt);
+  free(jt); free(lend); free(lbh);
   if(stru){}
   else if(fwd){ if(!dead){ c->indent=3; emitl(c,"return;"); } c->indent=2; emitl(c,"} while(false);"); c->indent=1; emitl(c,"return;"); }
   else if(flow){ if(!dead){ c->indent=3; emitl(c,"return;"); } sb_put(&c->out,"      default: return;\n    }\n  }\n"); }

@@ -261,9 +261,15 @@ static AVCodecContext* ff_ctx(void){
   return g_ffc[g_stream]=c; }
 #endif
 
+#if defined(_WIN32) && !defined(SWR_NO_H264)
+static int mf_load(void); static int g_mf;
+#endif
 static int dec_open(void){
 #ifdef SWR_H264_FFMPEG
   if(ff_load()) return 1;
+#endif
+#if defined(_WIN32) && !defined(SWR_NO_H264)
+  if(g_mf!=0 && mf_load()) return 1;   /* Media Foundation (mfvideo.inc); 0 after it failed: OpenH264 */
 #endif
 #ifdef SWR_NO_H264
   if(!g_dec_fail){ g_dec_fail=1; LOG("video: this build has no H.264 decoder (the game's videos stay black)\n"); } return 0;
@@ -296,13 +302,18 @@ static void keep_nv12(const u8* py, const u8* puv, int sy, int suv, u32 w, u32 h
 static void keep_frame(unsigned char** pl, SBufferInfo* bi){
   keep_planes(pl[0],pl[1],pl[2],bi->UsrData.sSystemBuffer.iStride[0],bi->UsrData.sSystemBuffer.iStride[1],(u32)bi->UsrData.sSystemBuffer.iWidth,(u32)bi->UsrData.sSystemBuffer.iHeight); }
 #endif
+#if defined(_WIN32) && !defined(SWR_NO_H264)
+#include "mfvideo.inc"
+#endif
 
 #ifdef SWR_HAVE_VP9
 #define SWR_NATIVE_VIDEO_RETIRE 1
 #include "vp9video.inc"
 #endif
 
+volatile unsigned long long g_video_last_ns;   /* last video decode (plat_ns): the shader pre-build stays off while a video plays */
 static void nvdec_execute(u32* r){
+  g_video_last_ns=plat_ns();
   { static int said; if(said<4){ said++; LOG("video: NVDEC job, control params %08x (codec %u)\n",r[0x400/4],r[0x400/4]&0xF); } }
 #ifdef SWR_HAVE_VP9
   if(vp9_job(r,r[0x400/4]&0xF)) return;      /* a VP9 frame of a .webm the game read: decoded with libvpx */
@@ -331,6 +342,10 @@ static void nvdec_execute(u32* r){
     if(dump){ if(!df[g_stream]){ char p[600]; snprintf(p,sizeof p,"%s.%d",getenv("SWR_DUMP_H264"),g_stream); df[g_stream]=fopen(p,"wb"); }
       if(df[g_stream]){ fwrite(buf,1,o,df[g_stream]); fflush(df[g_stream]); } } }
   unsigned st=0; int out=0;
+#if defined(_WIN32) && !defined(SWR_NO_H264)
+  if(g_mf==1 && !mf_dec()){ g_mf=0; LOG("video: no Media Foundation H.264 decoder: OpenH264 instead\n"); if(!dec_open()) return; }
+  if(g_mf==1) out=mf_decode(buf,o,&st); else
+#endif
 #ifdef SWR_H264_FFMPEG
   if(g_ff==1){ AVCodecContext* fc=ff_ctx(); if(!fc) return;
     ff.pkt->data=buf; ff.pkt->size=(int)o;
@@ -459,9 +474,17 @@ static void vic_luma_rows(void* c, u32 y0, u32 y1){ VicJob* j=c;
 static void vic_chroma_rows(void* c, u32 y0, u32 y1){ VicJob* j=c;
   for(u32 y=y0;y<y1;y++){ const u8* s=j->fuv+(u64)y*j->fw; if(!j->blk) vic_put(j->pc,(u64)y*j->pitch,s,j->w,j->clim); else vic_block_row(j->pc,s,j->w,y,j->pitch,(j->sh+1)/2,j->bh,j->clim); } }
 
+/* a black picture (video-range Y 16, UV 128) for a VIC job whose picture isn't decoded yet: leaving the output
+   surface as it was showed its uninitialised memory, a rainbow-static flash as the intro movie started */
+static u8 *g_black_y, *g_black_uv; static u32 g_black_w, g_black_h;
+static void black_frame(u32 w, u32 h){
+  if(g_black_y && g_black_w==w && g_black_h==h) return;
+  free(g_black_y); free(g_black_uv); g_black_y=malloc((size_t)w*h); g_black_uv=malloc((size_t)w*((h+1)/2)+w);
+  if(g_black_y) memset(g_black_y,16,(size_t)w*h); if(g_black_uv) memset(g_black_uv,128,(size_t)w*((h+1)/2)+w); g_black_w=w; g_black_h=h; }
 static void vic_execute(u32* r){
-  if(!g_vframes) return;
-  u8*fy=g_fy,*fuv=g_fuv;u32 fw=g_fw,fh=g_fh;
+  int black=0;
+  if(!g_vframes){ black_frame(1920,1088); if(!g_black_y || !g_black_uv) return; black=1; }
+  u8*fy= black? g_black_y : g_fy,*fuv= black? g_black_uv : g_fuv;u32 fw= black? 1920 : g_fw,fh= black? 1088 : g_fh;
   DecodedSurface*picture=decoded_surface_find((u64)r[0x400/4]<<8);
   { static int left=-1; if(left<0){ const char* e=getenv("SWR_TRACE_NVDEC_REGS"); left= e? atoi(e) : 0; }
     if(left>0){ left--; if(!g_regs_trace) g_regs_trace=fopen("nvdec_regs.txt","w"); FILE* tf=g_regs_trace; if(tf){ fprintf(tf,"VIC %x frame %d owner %s\n",r[0x400/4],picture? (int)picture->frame : -1,picture&&picture->owner? (const char*)(uintptr_t)picture->owner : "-"); fflush(tf); } } }
@@ -470,12 +493,12 @@ static void vic_execute(u32* r){
     /* with H.264 every picture is filed by its surface, so a miss is a surface not decoded yet (a video starting).
        The fallbacks below (newest picture of the same size, else the last one decoded on any channel) then showed a
        picture of another video: Metroid Prime 4's title screen flashed in its intro. They stay for VP9 */
-    if(strict) return; }
+    if(strict){ black_frame(fw? fw : 1920,fh? fh : 1088); if(!g_black_y || !g_black_uv) return; fy=g_black_y; fuv=g_black_uv; if(!fw){ fw=1920; fh=1088; } } }
   if(picture){fy=picture->y;fuv=picture->uv;fw=picture->w;fh=picture->h;}
   { static u32 nv; nv++; if(nv%120==0) LOG("video: %u VIC jobs so far\n",nv); }
   u64 ly=(u64)r[0x720/4]<<8, lc=(u64)r[0x724/4]<<8, cfg_iova=(u64)r[0x708/4]<<8;
   u8* cs=iova_ptr(cfg_iova,0x28); u64 cfg=0; if(cs) memcpy(&cfg,cs+0x20,8);
-  if(!picture){u8*sc=iova_ptr(cfg_iova,0xe0);if(sc){u64 sf=0;memcpy(&sf,sc+0xd0,8);u32 iw=(u32)((sf>>32)&0x3fff)+1,ih=(u32)((sf>>46)&0x3fff)+1;for(int i=0;i<32;i++){DecodedSurface*d=&decoded_surfaces[i];if(d->used&&d->w==iw&&d->h==ih&&(!picture||d->used>picture->used))picture=d;}if(picture){fy=picture->y;fuv=picture->uv;fw=picture->w;fh=picture->h;}}}
+  if(!picture && fy!=g_black_y){u8*sc=iova_ptr(cfg_iova,0xe0);if(sc){u64 sf=0;memcpy(&sf,sc+0xd0,8);u32 iw=(u32)((sf>>32)&0x3fff)+1,ih=(u32)((sf>>46)&0x3fff)+1;for(int i=0;i<32;i++){DecodedSurface*d=&decoded_surfaces[i];if(d->used&&d->w==iw&&d->h==ih&&(!picture||d->used>picture->used))picture=d;}if(picture){fy=picture->y;fuv=picture->uv;fw=picture->w;fh=picture->h;}}}
   u32 fmt=(u32)(cfg&0x7F), blk=(u32)((cfg>>11)&15), bh=(u32)((cfg>>15)&15);
   u32 sw=(u32)((cfg>>32)&0x3FFF)+1, sh=(u32)((cfg>>46)&0x3FFF)+1;
   if(!cs){ fmt=0x44; sw=fw; sh=fh; }

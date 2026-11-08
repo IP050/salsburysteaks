@@ -2,6 +2,7 @@
    Licensed under the Apache License 2.0. See LICENSE.txt and NOTICE.txt;
    any copy or derived work must keep the credit to SwitchRecomp by MZ Labs. */
 /* hid. Games read the shared memory directly, so we fill it in the real layout (17 entry LIFOs). */
+#include <math.h>
 #include "rt.h"
 #include "hid_layout.h"
 
@@ -9,6 +10,8 @@ KShmem* kshmem_new(u64 size, const char* name);
 u8* kshmem_ptr(KShmem* s);
 static KShmem* g_hid_shm;
 PadState g_pad;
+/* the controller's motion, set by the input backend (backend_win32.c sdl_poll): Switch units and axes */
+volatile float g_motion_gyro[3], g_motion_acc[3]; volatile unsigned long long g_motion_ns;
 static u64 g_samp;
 static u32 g_style_supported=0x7F;
 static KEvent* g_style_ev[10];
@@ -63,11 +66,29 @@ void hid_update(void){
   u8 z[0x28]; memset(z,0,sizeof z); memcpy(z,&g_samp,8);
   for(int i=1;i<10;i++){ if(i==8) continue; u8* e=b+HO_HidSharedMemory_npad+i*HS_HidNpadSharedMemoryEntry;
     lifo_push(e+HO_HidNpadInternalState_full_key_lifo,HS_HidNpadCommonStateAtomicStorage,z,0x28,g_samp); }
-  /* six-axis: at rest, gravity down */
+  /* six-axis: the controller's gyro and accelerometer when the backend has them (fresh within 200 ms), else at rest,
+     gravity down. Units: G, rotations per second, rotations (angle), and the orientation as a 3x3 matrix, integrated
+     here from the angular velocity */
   u8 six[HS_HidSixAxisSensorState]; memset(six,0,sizeof six);
   memcpy(six,&g_samp,8); memcpy(six+8,&g_samp,8);
-  float acc[3]={0,0,-1}; memcpy(six+HO_HidSixAxisSensorState_acceleration,acc,12);
-  float dir[9]={1,0,0, 0,1,0, 0,0,1}; memcpy(six+HO_HidSixAxisSensorState_direction,dir,36);
+  float acc[3]={0,0,-1}, gyr[3]={0,0,0};
+  static float ang[3], q[4]={1,0,0,0}; static u64 m_last;
+  { u64 now=plat_ns(); float dt= m_last? (float)((now-m_last)/1e9) : 0.f; m_last=now; if(dt>0.1f) dt=0.1f;
+    if(g_motion_ns && now-g_motion_ns<200000000ull){
+      for(int k=0;k<3;k++){ gyr[k]=g_motion_gyro[k]; acc[k]=g_motion_acc[k]; ang[k]+=gyr[k]*dt; }
+      /* q += 0.5 * q * (0, w) dt, w in rad/s */
+      float wx=gyr[0]*6.2831853f, wy=gyr[1]*6.2831853f, wz=gyr[2]*6.2831853f;
+      float a=q[0], b=q[1], c=q[2], d=q[3], h=0.5f*dt;
+      q[0]+=h*(-b*wx-c*wy-d*wz); q[1]+=h*(a*wx+c*wz-d*wy); q[2]+=h*(a*wy-b*wz+d*wx); q[3]+=h*(a*wz+b*wy-c*wx);
+      float n=sqrtf(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]); if(n>0) for(int k=0;k<4;k++) q[k]/=n; } }
+  memcpy(six+HO_HidSixAxisSensorState_acceleration,acc,12);
+  memcpy(six+HO_HidSixAxisSensorState_acceleration+12,gyr,12);   /* angular_velocity follows acceleration */
+  memcpy(six+HO_HidSixAxisSensorState_acceleration+24,ang,12);   /* then angle */
+  { float w=q[0], x=q[1], y=q[2], z=q[3];
+    float dir[9]={1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y),
+                  2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x),
+                  2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)};
+    memcpy(six+HO_HidSixAxisSensorState_direction,dir,36); }
   u32 sattr=1; memcpy(six+HO_HidSixAxisSensorState_attributes,&sattr,4);
   lifo_push(e0+HO_HidNpadInternalState_full_key_six_axis_sensor_lifo,HS_HidSixAxisSensorStateAtomicStorage,six,sizeof six,g_samp);
   lifo_push(e0+HO_HidNpadInternalState_joy_dual_left_six_axis_sensor_lifo,HS_HidSixAxisSensorStateAtomicStorage,six,sizeof six,g_samp);
@@ -120,7 +141,10 @@ static int hid_disp(SvcObj* o, IpcCtx* c){
     case 40: out_copy_h(c,h_new(&kevent_new("xpad id",0)->o)); return 0;         /* AcquireXpadIdEventHandle */
     case 55: case 59: out64(c,0); return 0;                                        /* GetXpadIds: none */
     case 58: case 62: out_copy_h(c,h_new(&kshmem_new(0x1000,"hid lifo")->o)); return 0;
-    case 68: case 82: out8(c,1); return 0;                                         /* IsSixAxisSensorFusionEnabled / AtRest */
+    case 68: out8(c,1); return 0;                                                  /* IsSixAxisSensorFusionEnabled */
+    case 82: { u64 now=plat_ns(); int moving= g_motion_ns && now-g_motion_ns<200000000ull &&
+                 fabsf(g_motion_gyro[0])+fabsf(g_motion_gyro[1])+fabsf(g_motion_gyro[2])>0.01f;   /* > ~3.6 deg/s */
+               out8(c,moving? 0 : 1); return 0; }                                    /* IsSixAxisSensorAtRest */
     case 69: case 70: case 71: case 72: case 73: case 74: case 75: case 76: case 77: case 78: case 79: case 80: case 81: case 83: case 84: case 85: case 86: case 87: case 88: case 89:
       if(c->cmd==71||c->cmd==73||c->cmd==79||c->cmd==84||c->cmd==86||c->cmd==88){ out32(c,0); out32(c,0); } return 0;
     case 100: { g_style_supported=in32(c,0);                                         /* SetSupportedNpadStyleSet */

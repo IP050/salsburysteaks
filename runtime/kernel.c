@@ -160,7 +160,7 @@ KThread* kthread_create(u64 entry, u64 arg, u64 stack_top, int prio, int core){
 void swr_fpcr_apply(CPU* c);
 
 static void thread_body(void* p){
-  KThread* t=p; kthread_set(t); plat_diag_guest(t); CPU* c=&t->cpu;
+  KThread* t=p; kthread_set(t); plat_diag_guest(t); { extern void plat_prof_guest(u64,const char*); plat_prof_guest(t->id,t->name); } CPU* c=&t->cpu;
   if(t->is_main){extern void plat_prof_mark_main(void);plat_prof_mark_main();}
   swr_fpcr_apply(c);
   core0_acquire(t);

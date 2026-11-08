@@ -31,6 +31,7 @@ typedef struct {
   ABuffer q[8];int nq;double position,played_fraction;u64 played;u32 consumed;
   u8 submitted[4],was_playing,format_warned; i16 h1[AC],h2[AC];
   float filter[AC][2][4];
+  u8 playing, starved; double step;   /* audio_headroom: playing this update, ran dry mid-block, its resampling step */
 } AVoice;
 typedef struct {u8 valid,used;u32 count,dest;float volume,matrix[24][24];} AMix;
 /* I3DL2 reverb (effect type 5). A game can run one in place on buffers of its submix with a low dry gain: without it that
@@ -127,7 +128,7 @@ static float abiquad(AVoice*v,const u8*vi,u32 channel,float value){
 static void aoutput(const i16*pcm){
 #ifdef _WIN32
   enum {NB=32};static HWAVEOUT device;static WAVEHDR headers[NB];static i16 samples[NB][AF*2];static u8 busy[NB];
-  static int attempted;static u64 writes,dropped;static SRWLOCK lock=SRWLOCK_INIT;
+  static int attempted;static u64 writes,dropped,underruns;static int paused;static SRWLOCK lock=SRWLOCK_INIT;
   static int trace_checked;static FILE*trace;static u64 previous_ns;
   if(!trace_checked){trace_checked=1;const char*path=getenv("SWR_TEST_AUDIO_STATS");if(path&&*path){trace=fopen(path,"w");if(trace)fprintf(trace,"ns,guest_frame,dt_ms,writes,drops,queued,clipped,silent,potential_empty\n");}}
   AcquireSRWLockExclusive(&lock);
@@ -136,13 +137,20 @@ static void aoutput(const i16*pcm){
     MMRESULT result=waveOutOpen(&device,WAVE_MAPPER,&format,0,0,CALLBACK_NULL);
     if(result!=MMSYSERR_NOERROR){device=NULL;WARN("audio: waveOutOpen failed (%u)\n",result);}
     else{for(int k=0;k<NB;k++){headers[k].lpData=(LPSTR)samples[k];headers[k].dwBufferLength=sizeof samples[k];waveOutPrepareHeader(device,&headers[k],sizeof(WAVEHDR));}
-      LOG("audio: Windows output opened, stereo PCM16 at 48000 Hz\n");}}}
+      waveOutPause(device);paused=1;   /* it starts once PRIME chunks are queued (below) */
+      LOG("audio: Windows output opened, stereo PCM16 at 48000 Hz, about 40 ms buffered before it plays\n");}}}
   if(device){int slot=-1,queued=0;for(int k=0;k<NB;k++){if(busy[k]&&(headers[k].dwFlags&WHDR_DONE))busy[k]=0;if(!busy[k]&&slot<0)slot=k;if(busy[k])queued++;}
     int potential_empty=queued==0&&writes>0;
-    if(slot>=0){memcpy(samples[slot],pcm,sizeof samples[slot]);MMRESULT result=waveOutWrite(device,&headers[slot],sizeof(WAVEHDR));if(result==MMSYSERR_NOERROR){busy[slot]=1;writes++;}else WARN("audio: waveOutWrite failed (%u)\n",result);}else dropped++;
+    /* The mixer hands over ~3 chunks (5 ms each) every 16.7 ms. Played straight away, only one to three chunks were ever
+       waiting, and a burst a millisecond late left the output dry for an instant: crackles and pops. Now the output waits
+       until PRIME chunks (40 ms) are queued, and if it runs dry it pauses and builds that cushion again */
+    enum {PRIME=8};
+    if(potential_empty&&!paused){underruns++;waveOutPause(device);paused=1;}
+    if(slot>=0){memcpy(samples[slot],pcm,sizeof samples[slot]);MMRESULT result=waveOutWrite(device,&headers[slot],sizeof(WAVEHDR));if(result==MMSYSERR_NOERROR){busy[slot]=1;writes++;queued++;}else WARN("audio: waveOutWrite failed (%u)\n",result);}else dropped++;
+    if(paused&&queued>=PRIME){waveOutRestart(device);paused=0;}
     if(trace){u64 now=plat_ns();u32 clipped=0,silent=0;for(u32 n=0;n<AF*2;n++){if(pcm[n]==32767||pcm[n]==-32768)clipped++;if(pcm[n]==0)silent++;}
       fprintf(trace,"%llu,%d,%.6f,%llu,%llu,%d,%u,%u,%d\n",(unsigned long long)now,g_frames,previous_ns?(now-previous_ns)/1e6:0,(unsigned long long)writes,(unsigned long long)dropped,queued,clipped,silent,potential_empty);previous_ns=now;if(writes%200==0)fflush(trace);}
-    if(writes&&writes%2000==0)LOG("audio: %llu chunks queued, %llu overflow drops\n",(unsigned long long)writes,(unsigned long long)dropped);
+    if(writes&&writes%2000==0)LOG("audio: %llu chunks queued, %llu overflow drops, %llu underruns (the output ran dry and rebuffered)\n",(unsigned long long)writes,(unsigned long long)dropped,(unsigned long long)underruns);
   }
   ReleaseSRWLockExclusive(&lock);
 #elif !defined(__ANDROID__)
@@ -180,6 +188,17 @@ static void aoutput(const i16*pcm){
 #else
 static void aoutput(const i16*pcm);
 #endif
+static u64 g_audio_starved, g_audio_clipped, g_audio_gaps;   /* reported with the "active voices" line */
+/* How many more 5 ms blocks every playing voice can still mix from what it has queued (looping sounds don't count).
+   main.c mixes no more than this when catching up after a late update: a voice that ran dry mid-block was cut off
+   (an audible click), and the game would have queued more on its next update */
+u32 audio_headroom(SvcObj* o){
+  ARenderer* r=(ARenderer*)(size_t)o->u[4]; if(!r) return 1000;
+  double best=1e9;
+  for(u32 id=0;id<AV;id++){ AVoice* v=&r->voices[id]; if(!v->playing || !v->nq || v->q[v->nq-1].loop) continue;
+    double rem=-v->position; for(int k=0;k<v->nq;k++) rem+=v->q[k].frames;
+    double st= v->step>0? v->step : 1.0; double blocks=rem/st/AF; if(blocks<best) best=blocks; }
+  return best>=1000? 1000 : best<0? 0 : (u32)best; }
 static void acapture(const i16*pcm){
   static int checked;static FILE*f;static u32 bytes;static u32 limit=48000*4*12;
   if(!checked){checked=1;const char*seconds=getenv("SWR_DUMP_AUDIO_SECONDS");if(seconds){int n=atoi(seconds);if(n>0&&n<=900)limit=48000*4*(u32)n;}const char*path=getenv("SWR_DUMP_AUDIO");if(path&&*path){f=fopen(path,"wb+");if(f){u8 header[44]={0};fwrite(header,1,44,f);}}}
@@ -323,16 +342,17 @@ void audio_render(SvcObj*o,const u32*ih,const u8*input,u64 size,const u8*voices,
       for(u32 x=0;x<4;x++){int slot=(head+x)&3;const u8*wb=vi+0x60+slot*0x38;
         if(wb[0x1A])v->submitted[slot]=0;
         else if(au64(wb)&&au64(wb+8)&&!v->submitted[slot]){v->submitted[slot]=1;atrace_voice("submit",id,v,vi,wb);ABuffer b=adecode(v,vi,wb,slot);
+          if(b.pcm&&v->starved){g_audio_gaps++;v->starved=0;}   /* it had run dry and the game kept going: a real gap */
           if(b.pcm&&v->nq<8)v->q[v->nq++]=b;else{free(b.pcm);v->consumed++;if(!v->format_warned){v->format_warned=1;WARN("audio: voice %u buffer rejected, format=%u channels=%u start=%d end=%d bytes=%llu\n",id,vi[0xB],au32(vi+0x18),ai32(wb+0x10),ai32(wb+0x14),(unsigned long long)au64(wb+8));}}}}
       for(u8 n=vi[0x159];n&&v->nq;n--){apop(v);v->position=0;}
       if(play==1&&v->was_playing){atrace_voice("stop",id,v,vi,NULL);aclear(v,1);memset(v->filter,0,sizeof v->filter);}
-      v->was_playing=play!=1;
+      v->was_playing=play!=1; v->playing= play==0;
       if(play==0&&v->nq&&o->u[3]==0&&!g_audio_status_only){active++;u32 rate=au32(vi+0xC);float pitch=af32(vi+0x1C),volume=af32(vi+0x20);if(!rate||rate>192000)rate=48000;if(!(pitch>0)||pitch>8)pitch=1;
-        double step=(double)rate*pitch/48000.0;u32 mix=au32(vi+0x58),spl=au32(vi+0x5C);
+        double step=(double)rate*pitch/48000.0;v->step=step;u32 mix=au32(vi+0x58),spl=au32(vi+0x5C);
         const ASplit*st= mix>=AM&&spl<ASI&&r->split[spl].count? &r->split[spl] : NULL;   /* routed through a splitter */
         if(mix>=AM)mix=0;u32 nc=r->mix[mix].valid?r->mix[mix].count:2;if(nc>24)nc=24;
         if(!r->logged_voice){r->logged_voice=1;LOG("audio: first voice %u, format %u, %u channels, %u Hz, volume %.3f, mix %u, %u buffers\n",id,vi[0xB],au32(vi+0x18),rate,volume,mix,v->nq);}
-        for(int n=0;n<AF&&v->nq;n++){ABuffer*b=&v->q[0];u32 at=(u32)v->position;if(at>=b->frames)at=b->frames-1;u32 next=at+1;if(next>=b->frames)next=b->loop?0:at;float fraction=(float)(v->position-at);
+        int n=0;for(;n<AF&&v->nq;n++){ABuffer*b=&v->q[0];u32 at=(u32)v->position;if(at>=b->frames)at=b->frames-1;u32 next=at+1;if(next>=b->frames)next=b->loop?0:at;float fraction=(float)(v->position-at);
           for(u32 ch=0;ch<b->channels;ch++){float value=b->pcm[at*b->channels+ch]+(b->pcm[next*b->channels+ch]-b->pcm[at*b->channels+ch])*fraction;value=abiquad(v,vi,ch,value)*volume;
             if(st){for(u32 k=ch;k<st->count;k+=b->channels){if(st->ids[k]>=ASD)continue;const ADest*d=&r->dest[st->ids[k]];if(!d->used||d->mix>=AM||!r->mix[d->mix].valid)continue;
                 u32 dc=r->mix[d->mix].count>24?24:r->mix[d->mix].count;for(u32 dst=0;dst<dc;dst++){float gain=d->volume[dst];if(gain)r->samples[((size_t)d->mix*24+dst)*AF+n]+=value*gain;}}
@@ -346,6 +366,7 @@ void audio_render(SvcObj*o,const u32*ih,const u8*input,u64 size,const u8*voices,
             if(g_opt_audio_eos_sample_count&&v->q[0].eos){v->played=(u64)v->position;v->played_fraction=v->position-v->played;}
             apop(v);}
         }
+        if(n<AF){ g_audio_starved++; v->starved=1; }   /* the voice ran out of queued sound partway through this 5 ms block */
       }
     }
     memcpy(status+i*16,&v->played,8);memcpy(status+i*16+8,&v->consumed,4);
@@ -361,7 +382,7 @@ void audio_render(SvcObj*o,const u32*ih,const u8*input,u64 size,const u8*voices,
   if(o->u[3]==0){i16 pcm[AF*2];extern int g_opt_volume;float final_volume=(r->mix[0].valid?r->mix[0].volume:1)*(float)g_opt_volume*0.01f;   /* [Audio] volume, live */float peak=0;
     {static int checked;static FILE*csv;if(!checked){checked=1;const char*e=getenv("SWR_AUDIO_MIX_CSV");if(e&&*e){csv=fopen(e,"w");if(csv)fprintf(csv,"ns,tick,active,sink_count,input,source,rms,peak\n");}}
       if(csv&&r->ticks%40==0){for(u32 ch=0;ch<r->sink_count;ch++){u32 source=r->sink_inputs[ch];if(source>=24)continue;double sum=0;float peak=0;for(int n=0;n<AF;n++){float value=r->samples[(size_t)source*AF+n]*final_volume;sum+=(double)value*value;if(fabsf(value)>peak)peak=fabsf(value);}fprintf(csv,"%llu,%llu,%u,%u,%u,%u,%.8f,%.8f\n",(unsigned long long)plat_ns(),(unsigned long long)r->ticks,active,r->sink_count,ch,source,sqrt(sum/AF),peak);}fflush(csv);}}
-    for(int n=0;n<AF;n++)for(int ch=0;ch<2;ch++){float sample=astereo_sample(r,n,ch,final_volume);if(!isfinite(sample))sample=0;float absolute=fabsf(sample);if(absolute>peak)peak=absolute;if(sample>0.9999695f)sample=0.9999695f;if(sample< -1)sample= -1;pcm[n*2+ch]=(i16)lrintf(sample*32768);}
-    aoutput(pcm);acapture(pcm);if(r->ticks%1000==0)LOG("audio: %u active voices, final mix volume %.3f, peak %.4f, sink channels %u\n",active,final_volume,peak,r->sink_count);
+    for(int n=0;n<AF;n++)for(int ch=0;ch<2;ch++){float sample=astereo_sample(r,n,ch,final_volume);if(!isfinite(sample))sample=0;float absolute=fabsf(sample);if(absolute>peak)peak=absolute;if(sample>0.9999695f){sample=0.9999695f;g_audio_clipped++;}if(sample< -1){sample= -1;g_audio_clipped++;}pcm[n*2+ch]=(i16)lrintf(sample*32768);}
+    aoutput(pcm);acapture(pcm);if(r->ticks%1000==0){LOG("audio: %u active voices, final mix volume %.3f, peak %.4f, sink channels %u; since the last line %llu voice blocks ran out of sound early, %llu real gaps (a voice ran dry, then got more sound), %llu samples clipped\n",active,final_volume,peak,r->sink_count,(unsigned long long)g_audio_starved,(unsigned long long)g_audio_gaps,(unsigned long long)g_audio_clipped);g_audio_starved=0;g_audio_clipped=0;g_audio_gaps=0;}
   }r->ticks++;
 }

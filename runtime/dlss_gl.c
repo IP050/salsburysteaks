@@ -119,6 +119,7 @@ static int gl_load(void){
 
 static int has_ext(const VkExtensionProperties* have, u32 n, const char* name){ for(u32 i=0;i<n;i++) if(!strcmp(have[i].extensionName,name)) return 1; return 0; }
 
+static GLubyte g_dl_uuid[16];
 static int vk_up(void){
   HMODULE lib=LoadLibraryA("vulkan-1.dll"); if(!lib) return fail("vulkan-1.dll not found");
   vkGetInstanceProcAddr_=(PFN_vkGetInstanceProcAddr)(void*)GetProcAddress(lib,"vkGetInstanceProcAddr"); if(!vkGetInstanceProcAddr_) return fail("vulkan-1.dll is incomplete");
@@ -133,7 +134,7 @@ static int vk_up(void){
   VKI_FN(VKI)
   #undef VKI
   /* the GPU the GL context runs on */
-  GLubyte uuid[16]={0}; gl.gub(GL_DEVICE_UUID_EXT_,0,uuid);
+  GLubyte uuid[16]; memcpy(uuid,g_dl_uuid,16);   /* read on the GL thread before this thread started (gl.* needs the GL context) */
   VkPhysicalDevice pds[16]; u32 npd=16; vkEnumeratePhysicalDevices(D.inst,&npd,pds);
   for(u32 i=0;i<npd && !D.pd;i++){
     VkPhysicalDeviceIDProperties idp={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES}; VkPhysicalDeviceProperties2 p2={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,&idp};
@@ -272,9 +273,23 @@ static NgxResourceVK res(int i, VkImageAspectFlags aspect, int rw){
 
 /* ---------------------------------------------------------------- the per-frame step, on the GL thread */
 typedef struct { GLuint color, depth, mv; GLenum zfmt; u32 w, h; float jx, jy; int reset, have_mv; } DlJob;
+/* NGX + its Vulkan device start on a thread of their own: on the GL thread the first call froze the whole pipeline for
+   1.4 s right as the intro's audio started (audible hitching). Until they are up, frames go out without DLAA */
+static volatile LONG g_dl_bg;   /* 0 not started, 1 starting, 2 up, 3 failed */
+static void dl_bg(void* a){ (void)a; u64 t0=plat_ns(); int ok= ngx_load() && vk_up(); InterlockedExchange(&g_dl_bg,ok? 2 : 3);
+  LOG("dlaa (OpenGL): NGX and Vulkan %s on a background thread in %.0f ms\n",ok? "started" : "failed to start",(plat_ns()-t0)/1e6); }
+/* where a frame's DLAA step spends its time (the map waited in here) */
+static u64 g_dlt[6], g_dltmax[6], g_dltn;
 static void dl_run(const DlJob* j){
   if(D.failed) return;
-  if(!D.tried){ D.tried=1; if(!gl_load()){ fail("the OpenGL driver lacks memory/semaphore sharing"); return; } if(!ngx_load() || !vk_up()) return; D.ok=1; }
+  if(!D.tried){
+    if(g_dl_bg==0){   /* here on the GL thread: its functions and the GPU's id first, then the slow part on the side */
+      if(!gl_load()){ D.tried=1; fail("the OpenGL driver lacks memory/semaphore sharing"); return; }
+      gl.gub(GL_DEVICE_UUID_EXT_,0,g_dl_uuid);
+      g_dl_bg=1; if(plat_thread(dl_bg,NULL,1u<<20)) dl_bg(NULL); }
+    if(g_dl_bg==1) return;   /* still starting */
+    D.tried=1; if(g_dl_bg!=2) return; D.ok=1; }
+  u64 tp0=plat_ns();
   if(!j->w) return;   /* start-up only: NGX is up, the images follow with the first frame */
   if(D.ok<1 || !images(j->w,j->h,j->zfmt)) return;
   /* inputs into the shared images */
@@ -284,8 +299,9 @@ static void dl_run(const DlJob* j){
   GLenum lay[IM_N]={GL_LAYOUT_GENERAL_EXT_,GL_LAYOUT_GENERAL_EXT_,GL_LAYOUT_GENERAL_EXT_,GL_LAYOUT_GENERAL_EXT_};
   gl.sig(D.g_ready,0,NULL,IM_N,D.gtex,lay);
   /* DLSS on Vulkan */
+  u64 tp1=plat_ns();
   u32 c=D.cur; D.cur^=1; VkCommandBuffer cb=D.cb[c];
-  vkWaitForFences(D.dev,1,&D.fence[c],VK_TRUE,~0ull); vkResetFences(D.dev,1,&D.fence[c]); vkResetCommandBuffer(cb,0);
+  vkWaitForFences(D.dev,1,&D.fence[c],VK_TRUE,~0ull); u64 tp2=plat_ns(); vkResetFences(D.dev,1,&D.fence[c]); vkResetCommandBuffer(cb,0);
   VkCommandBufferBeginInfo bi={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,NULL,VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,NULL}; vkBeginCommandBuffer(cb,&bi);
   barrier_all(cb,VK_IMAGE_LAYOUT_GENERAL);
   if(!j->have_mv){ VkClearColorValue z={{0,0,0,0}}; VkImageSubresourceRange all={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
@@ -306,7 +322,7 @@ static void dl_run(const DlJob* j){
   p_setf(p,"MV.Scale.X",1.0f); p_setf(p,"MV.Scale.Y",1.0f);
   p_setu(p,"DLSS.Render.Subrect.Dimensions.Width",j->w); p_setu(p,"DLSS.Render.Subrect.Dimensions.Height",j->h);
   p_setf(p,"DLSS.Pre.Exposure",1.0f); p_setf(p,"DLSS.Exposure.Scale",1.0f); p_setf(p,"FrameTimeDeltaInMsec",16.67f);
-  NgxResult r=ngx.eval(cb,D.feat,p,NULL);
+  u64 tp3=plat_ns(); NgxResult r=ngx.eval(cb,D.feat,p,NULL); u64 tp4=plat_ns();
   barrier_all(cb,VK_IMAGE_LAYOUT_GENERAL);
   vkEndCommandBuffer(cb);
   VkPipelineStageFlags ws=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
@@ -314,7 +330,7 @@ static void dl_run(const DlJob* j){
   if(vkQueueSubmit(D.q,1,&si,D.fence[c])!=VK_SUCCESS){ fail("Vulkan submit"); return; }
   D.fresh=0;
   /* GL waits for the result, then it goes back into the scene target */
-  gl.wait(D.g_done,0,NULL,IM_N,D.gtex,lay);
+  u64 tp5=plat_ns(); gl.wait(D.g_done,0,NULL,IM_N,D.gtex,lay); u64 tp6=plat_ns();
   if(!NGX_OK(r)){ LOG("dlaa (OpenGL): DLSS evaluation failed (%08x)\n",(unsigned)r); D.failed=1; return; }
   GLint rfb=0, dfb=0; gl.geti(GL_READ_FRAMEBUFFER_BINDING,&rfb); gl.geti(GL_DRAW_FRAMEBUFFER_BINDING,&dfb);
   GLboolean sc=gl.isen(GL_SCISSOR_TEST); if(sc) gl.dis(GL_SCISSOR_TEST);
@@ -322,6 +338,12 @@ static void dl_run(const DlJob* j){
   gl.bindfb(GL_DRAW_FRAMEBUFFER,D.fbo_dst); gl.fbtex(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,j->color,0);
   gl.blit(0,0,(GLint)j->w,(GLint)j->h,0,0,(GLint)j->w,(GLint)j->h,GL_COLOR_BUFFER_BIT,GL_NEAREST);
   gl.bindfb(GL_READ_FRAMEBUFFER,(GLuint)rfb); gl.bindfb(GL_DRAW_FRAMEBUFFER,(GLuint)dfb); if(sc) gl.en(GL_SCISSOR_TEST);
+  { u64 tp7=plat_ns(); u64 ph[6]={tp1-tp0,tp2-tp1,tp4-tp3,tp5-tp4,tp6-tp5,tp7-tp6};   /* copies in, fence wait, NGX eval, submit, GL wait, blit back */
+    for(int i=0;i<6;i++){ g_dlt[i]+=ph[i]; if(ph[i]>g_dltmax[i]) g_dltmax[i]=ph[i]; } g_dltn++;
+    if(tp7-tp0>12000000ull){ static int said; if(said<40){ said++; LOG("dlaa (OpenGL): a %.1f ms step: copies %.1f, fence wait %.1f, eval %.1f, submit %.1f, GL wait %.1f, blit %.1f ms\n",(tp7-tp0)/1e6,ph[0]/1e6,ph[1]/1e6,ph[2]/1e6,ph[3]/1e6,ph[4]/1e6,ph[5]/1e6); } }
+    if(g_dltn>=600){ LOG("dlaa (OpenGL): step averages over %llu frames (worst): copies %.2f (%.1f), fence wait %.2f (%.1f), eval %.2f (%.1f), submit %.2f (%.1f), GL wait %.2f (%.1f), blit %.2f (%.1f) ms\n",(unsigned long long)g_dltn,
+        g_dlt[0]/1e6/g_dltn,g_dltmax[0]/1e6,g_dlt[1]/1e6/g_dltn,g_dltmax[1]/1e6,g_dlt[2]/1e6/g_dltn,g_dltmax[2]/1e6,g_dlt[3]/1e6/g_dltn,g_dltmax[3]/1e6,g_dlt[4]/1e6/g_dltn,g_dltmax[4]/1e6,g_dlt[5]/1e6/g_dltn,g_dltmax[5]/1e6);
+      memset(g_dlt,0,sizeof g_dlt); memset(g_dltmax,0,sizeof g_dltmax); g_dltn=0; } }
   if(++D.evals==1 || D.evals%600==0) LOG("dlaa (OpenGL): %d frames, %ux%u, jitter %.3f %.3f, motion vectors %s\n",D.evals,j->w,j->h,j->jx,j->jy,j->have_mv? "yes" : "none");
 }
 

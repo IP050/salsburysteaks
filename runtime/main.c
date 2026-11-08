@@ -36,14 +36,25 @@ int fps_overlay_rects(int W,int H,int (*r)[5],int max){
   float s=(float)H/1080.f;if(s<0.5f)s=0.5f;(void)W;
   int dh=(int)(26*s+0.5f),dw=(int)(14*s+0.5f),t=(int)(3*s+0.5f),gap=(int)(6*s+0.5f),pad=(int)(8*s+0.5f),x0=(int)(16*s+0.5f),y0=x0;
   if(t<2)t=2;
-  int n=0,total=ng*dw+(ng-1)*gap;
-  if(n<max){r[n][0]=x0-pad;r[n][1]=y0-pad;r[n][2]=total+2*pad;r[n][3]=dh+2*pad;r[n][4]=0;n++;}
+  /* visor style: dark panel, thin cyan frame with a brighter top-left corner tick, cyan digits (orange under 55 FPS,
+     like the low-energy warning). Kinds: 0 panel, 1 digits, 2 frame, 3 digits (warning), 4 corner accent */
+  int n=0,total=ng*dw+(ng-1)*gap, kind= fps>=0 && fps<55? 3 : 1, b=t>2? t/2 : 1;
+  int px=x0-pad,py=y0-pad,pw=total+2*pad,ph=dh+2*pad;
+  if(n<max){r[n][0]=px;r[n][1]=py;r[n][2]=pw;r[n][3]=ph;r[n][4]=0;n++;}
+  { const int fr[4][4]={{px,py,pw,b},{px,py+ph-b,pw,b},{px,py,b,ph},{px+pw-b,py,b,ph}};
+    for(int k=0;k<4&&n<max;k++){r[n][0]=fr[k][0];r[n][1]=fr[k][1];r[n][2]=fr[k][2];r[n][3]=fr[k][3];r[n][4]=2;n++;} }
+  { int c=pad+t; const int ac[2][4]={{px-b,py-b,c,t},{px-b,py-b,t,c}};
+    for(int k=0;k<2&&n<max;k++){r[n][0]=ac[k][0];r[n][1]=ac[k][1];r[n][2]=ac[k][2];r[n][3]=ac[k][3];r[n][4]=4;n++;} }
   int half=dh/2;
   for(int i=0;i<ng;i++){int x=x0+i*(dw+gap),y=y0;
     const int seg[7][4]={{x,y,dw,t},{x+dw-t,y,t,half+t/2},{x+dw-t,y+half-t/2,t,dh-half+t/2},{x,y+dh-t,dw,t},{x,y+half-t/2,t,dh-half+t/2},{x,y,t,half+t/2},{x,y+half-t/2,dw,t}};
-    for(int k=0;k<7&&n<max;k++)if(glyph[i]>>k&1){r[n][0]=seg[k][0];r[n][1]=seg[k][1];r[n][2]=seg[k][2];r[n][3]=seg[k][3];r[n][4]=1;n++;}}
+    for(int k=0;k<7&&n<max;k++)if(glyph[i]>>k&1){r[n][0]=seg[k][0];r[n][1]=seg[k][1];r[n][2]=seg[k][2];r[n][3]=seg[k][3];r[n][4]= i>=ng-3? 1 : kind;n++;}}
   return n;
 }
+/* sRGB colour of each overlay rect kind (fps_overlay_rects): the visor HUD's cyan, its warning orange, a dark panel */
+void fps_overlay_color(int kind, float c[3]){
+  static const float k[5][3]={{0.02f,0.06f,0.08f},{0.45f,0.92f,1.0f},{0.16f,0.52f,0.62f},{1.0f,0.55f,0.12f},{0.75f,0.98f,1.0f}};
+  if(kind<0||kind>4) kind=0; c[0]=k[kind][0]; c[1]=k[kind][1]; c[2]=k[kind][2]; }
 int g_opt_audio_eos_sample_count=1;   /* always on (cinematic clock ~2x and cut music without it); SWR_AUDIO_OLD_EOS=1 = off, tests only */
 char g_opt_pad_map[128]="";   /* physical-position button remapping, empty = identity */
 int g_opt_ctrl_api=0, g_opt_ctrl_index=0, g_opt_deadzone=7000;
@@ -341,7 +352,7 @@ static const IniOpt INI_GRAPHICS[]={
   {"dynamic_resolution","0","1 = lower the resolution automatically when the GPU can't keep up (down to dynamic_resolution_min)"},
   {"dynamic_resolution_min","0.6","Lowest internal resolution allowed by dynamic_resolution"},
   {"game_dynamic_resolution","0","1 = let the game lower its own resolution like on the console (0 = always full resolution)"},
-  {"show_fps","0","1 = FPS counter in the top-left corner (frames that reach the screen)"},
+  {"show_fps","0","1 = FPS counter in the top-left corner (frames that reach the screen); F2 toggles it in game"},
   {"upscaler","bilinear","How a picture smaller than the window is enlarged: bilinear, or fsr = AMD FidelityFX FSR 1\n;   (edge-adaptive upscaling + sharpening; OpenGL renderer). Pair it with resolution below 1, e.g. 0.67"},
   {"fsr_sharpness","80","FSR 1 sharpening (RCAS), 0-100"},
   {"antialiasing","0","1 = smooth jagged edges (FXAA on the final picture; OpenGL and native Vulkan). Not needed at\n;   resolution above 1 (the downscale already averages) or with DLAA"},
@@ -444,7 +455,7 @@ void ini_write(void){
   fprintf(f,";  Metroid Prime 4 Beyond - settings\n");
   fprintf(f,";  Edit a value and save: most settings apply live while the game runs\n");
   fprintf(f,";  (docked, language, fullscreen and frame generation apply on restart).\n");
-  fprintf(f,";  Keys in game: F1 menu, F3 screenshot, F4 FPS limit, F5 trace,\n");
+  fprintf(f,";  Keys in game: F1 menu, F2 FPS counter, F3 screenshot, F4 FPS limit, F5 trace,\n");
   fprintf(f,";  F7 record video, F8 full-res screenshot, F11 fullscreen.\n");
   fprintf(f,"; =====================================================================\n");
   for(int s=0;INI_SECS[s].title;s++){
@@ -714,6 +725,11 @@ static void split_path(const char* argv0){
   const char* base= s? s+1 : p;
   strncpy(g_exename,base,255); char* dot=strrchr(g_exename,'.'); if(dot && (!strcmp(dot,".exe")||!strcmp(dot,".EXE"))) *dot=0;
   if(s){ s[1]=0; strncpy(g_exedir,p,1023); } else g_exedir[0]=0;
+#ifdef _WIN32
+  /* captures/ (F5 traces, F8 screenshots) and the other relative paths belong next to the EXE: started through a
+     shortcut or "explorer.exe <path>" the working folder can be anything (one run's 1.9 GB went to System32) */
+  if(g_exedir[0]) SetCurrentDirectoryA(g_exedir);
+#endif
 }
 
 int swr_main(int argc, char** argv){
@@ -747,7 +763,8 @@ int swr_main(int argc, char** argv){
   plat_install_crash_handler();
   g_t0=plat_ns(); g_t0_ticks=plat_ticks_raw();
   g_present_pacing_candidate=!getenv("SWR_NO_PRESENT_PACING")&&(getenv("SWR_PRESENT_PACING")!=NULL||!strcmp(g_exename,"Metroid Prime 4 Beyond"));
-  LOG("%s (recompiled; SwitchRecomp runtime by MZ Labs)\n",g_exename); LOG("settings: startup fps_limit=%d, forced_vsync=%d\n",g_opt_fps,g_opt_vsync);
+  LOG("%s (recompiled; SwitchRecomp runtime by MZ Labs)\n",g_exename);
+  LOG("build: %s %s (profiles and traces name runtime code by offset: keep the EXE of this build to read them)\n",__DATE__,__TIME__); LOG("settings: startup fps_limit=%d, forced_vsync=%d\n",g_opt_fps,g_opt_vsync);
   if(load_code()) fatal("Could not load the game's recompiled code.");
   if(g_mod->abi!=1) fatal("The recompiled code is from another SwitchRecomp version.");
   g_title_id=g_mod->title_id;
@@ -868,6 +885,12 @@ int audren_update(SvcObj* o, IpcCtx* c){
     if(o->u[6]){ memcpy(&owed,&o->u[7],8); owed+=(double)(now-o->u[6])/5000000.0; if(owed>8) owed=8; blocks=(u32)owed; owed-=blocks; memcpy(&o->u[7],&owed,8); }
     o->u[6]=now;
     { extern int g_audio_status_only; g_audio_status_only= blocks==0; audio_render(o,ih,in,is,voices_in,nvoices,q); g_audio_status_only=0; }
+    /* Catching up after a late update (several blocks at once): no further than every playing voice has sound queued.
+       A voice that ran dry mid-block was cut off, an audible click, while the game would have queued more on its next
+       update. The blocks not mixed carry over (the 40 ms output cushion covers them); past 6 owed they are mixed anyway,
+       so a sound that simply ends can't hold the rest back */
+    if(blocks>1){ extern u32 audio_headroom(SvcObj*); u32 hr=audio_headroom(o); u32 extra=blocks-1;
+      if(extra>hr){ double owed2=0; memcpy(&owed2,&o->u[7],8); double keep=(double)(extra-hr); if(owed2+keep<=6.0){ owed2+=keep; memcpy(&o->u[7],&owed2,8); blocks=hr+1; } } }
     if(blocks>1){ static u8* again; static u32 again_cap; u32 vbytes=nvoices*0x170;
       if(vbytes>again_cap){ free(again); again=malloc(vbytes); again_cap=vbytes; }
       memcpy(again,voices_in,vbytes); for(u32 i=0;i<nvoices;i++){ again[i*0x170+8]=0; again[i*0x170+0x159]=0; }

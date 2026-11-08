@@ -2,7 +2,7 @@
    Licensed under the Apache License 2.0. See LICENSE.txt and NOTICE.txt;
    any copy or derived work must keep the credit to SwitchRecomp by MZ Labs. */
 /* win32 backend: window, WGL, keyboard, XInput.
-   F1 menu  F3 screenshot  F4 fps limit  F11 fullscreen  Esc quit
+   F1 menu  F2 FPS counter  F3 screenshot  F4 fps limit  F11 fullscreen  Esc quit
    The same window first shows the Play screen / setup (beyond_ui/fe.cpp, Direct3D 11, no pixel format), then the game. */
 #include "rt.h"
 #include <math.h>
@@ -40,7 +40,8 @@ void backend_ini(const char* k, const char* v){
   else if(!strcmp(k,"seconds")) g_seconds=atoi(v);
   else if(!strcmp(k,"shot")) strncpy(g_shot,v,1023);
   else if(!strcmp(k,"script")) {strncpy(g_script,v,sizeof g_script-1);g_script[sizeof g_script-1]=0;}
-  else if(!strcmp(k,"renderer")){ g_want_vk= !strcmp(v,"vulkan"); extern void snxvk_ini(const char*); snxvk_ini(v); }   /* vulkan_native: snxvk_glue.c */
+  else if(!strcmp(k,"renderer")){ if(getenv("SWR_RENDERER")) v=getenv("SWR_RENDERER");   /* test boots: the renderer without editing the ini */
+    g_want_vk= !strcmp(v,"vulkan"); extern void snxvk_ini(const char*); snxvk_ini(v); }   /* vulkan_native: snxvk_glue.c */
 }
 
 /* a status after the window title (shader pre-build progress); NULL restores the title */
@@ -82,6 +83,9 @@ static void (*sdl_pump)(void);
 static int (*sdl_gcrumble)(SDLGC,unsigned short,unsigned short,unsigned);
 static int sdl_ok; static SDLGC sdl_pad[8]; static int sdl_npad; static u64 sdl_rescan;
 static int (*sdl_gctype)(int);   /* SDL_GameControllerTypeForIndex, SDL 2.0.12+ (optional) */
+static int (*sdl_gcfinger)(SDLGC,int,int,unsigned char*,float*,float*,float*);   /* SDL_GameControllerGetTouchpadFinger, SDL 2.0.14+ (optional) */
+/* motion (SDL 2.0.14+, optional): SDL_GameControllerHasSensor / SetSensorEnabled / GetSensorData; 1 accel, 2 gyro */
+static int (*sdl_gchassensor)(SDLGC,int); static int (*sdl_gcsetsensor)(SDLGC,int,int); static int (*sdl_gcsensor)(SDLGC,int,float*,int);
 static void sdl_load(void){
   static int done; if(done) return; done=1;   /* also called early by backend_pad_family */
   extern int g_opt_ctrl_api; if(g_opt_ctrl_api==2) return;
@@ -95,6 +99,10 @@ static void sdl_load(void){
   SDLF(sdl_gcupdate,"SDL_GameControllerUpdate") SDLF(sdl_pump,"SDL_PumpEvents")
 #undef SDLF
   *(FARPROC*)&sdl_gcrumble=GetProcAddress(h,"SDL_GameControllerRumble");
+  *(FARPROC*)&sdl_gcfinger=GetProcAddress(h,"SDL_GameControllerGetTouchpadFinger");   /* touchpad slide up: FPS counter */
+  *(FARPROC*)&sdl_gchassensor=GetProcAddress(h,"SDL_GameControllerHasSensor");
+  *(FARPROC*)&sdl_gcsetsensor=GetProcAddress(h,"SDL_GameControllerSetSensorEnabled");
+  *(FARPROC*)&sdl_gcsensor=GetProcAddress(h,"SDL_GameControllerGetSensorData");
   *(FARPROC*)&sdl_gctype=GetProcAddress(h,"SDL_GameControllerTypeForIndex");   /* SDL 2.0.9+; optional: no rumble without it */
   sdl_sethint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS","0");   /* positions, not printed labels */
   sdl_sethint("SDL_JOYSTICK_HIDAPI_PS4","1"); sdl_sethint("SDL_JOYSTICK_HIDAPI_PS5","1");
@@ -124,6 +132,11 @@ static void sdl_scan(void){
     int have=0; for(int i=0;i<sdl_npad;i++) if(sdl_pad[i]==g) have=1;
     if(have) sdl_gcclose(g);   /* Open on an open pad only adds a reference */
     else { sdl_pad[sdl_npad++]=g; LOG("input: controller %d connected: %s\n",sdl_npad,sdl_gcname(g)? sdl_gcname(g) : "?"); } } }
+/* F5 (and the DualSense touchpad click): thread states, then the render-target dump and the next frame's trace */
+static void capture_hotkey(void){ extern void gpu_gl_dump_rts(void); extern void kernel_dump_threads(void); extern __thread FILE* g_log_redirect;
+  CreateDirectoryA("captures",NULL); FILE* f=fopen("captures/threads.txt","w");   /* written next to the trace */
+  if(f){ g_log_redirect=f; kernel_dump_threads(); g_log_redirect=NULL; fclose(f); }
+  kernel_dump_threads(); gpu_gl_dump_rts(); }
 /* returns 1 when SDL handled input this frame */
 static int sdl_poll(u64* b, i32* lx, i32* ly, i32* rx, i32* ry){
   if(!sdl_ok) return 0;
@@ -142,6 +155,35 @@ static int sdl_poll(u64* b, i32* lx, i32* ly, i32* rx, i32* ry){
     if(ay<-32767) ay=-32767; if(ay>32767) ay=32767; if(by<-32767) by=-32767; if(by>32767) by=32767;   /* SDL y is down-positive */
     int dzv=g_opt_deadzone; if(ax>-dzv && ax<dzv) ax=0; if(ay>-dzv && ay<dzv) ay=0; if(bx>-dzv && bx<dzv) bx=0; if(by>-dzv && by<dzv) by=0;
     if(!*lx && !*ly){ *lx=ax; *ly=ay; } if(!*rx && !*ry){ *rx=bx; *ry=by; } }
+  { /* DualSense (and DualShock 4) touchpad click (SDL button 20, a button the Switch doesn't have): the F5 capture,
+       once per press */
+    static int tp_was; int tp=0; for(int i=first;i<last && i<sdl_npad;i++) if(sdl_gcbutton(sdl_pad[i],20)) tp=1;
+    if(tp && !tp_was) capture_hotkey(); tp_was=tp;
+    /* touchpad slide up (finger 0 moves up a third of the pad, no click): the FPS counter on/off, like F2. Once per
+       touch; a click during the touch cancels it so the F5 capture never also toggles the counter */
+    static int t_down, t_done; static float t_y0;
+    if(sdl_gcfinger){ unsigned char st=0; float fx=0, fy=0, fp=0; int got=0;
+      for(int i=first;i<last && i<sdl_npad && !got;i++) if(sdl_gcfinger(sdl_pad[i],0,0,&st,&fx,&fy,&fp)==0 && st){ got=1; }
+      if(!got){ t_down=0; }
+      else if(!t_down){ t_down=1; t_done=0; t_y0=fy; }
+      else if(tp){ t_done=1; }
+      else if(!t_done && t_y0-fy>0.33f){ t_done=1; extern int g_opt_show_fps; g_opt_show_fps=!g_opt_show_fps;
+        LOG("settings: touchpad slide, FPS counter %s\n",g_opt_show_fps? "on" : "off"); } } }
+  { /* motion: the first pad with a gyro (DualSense, DualShock 4, Switch Pro...) drives the Switch's six-axis sensor
+       (svc_hid.c). SDL: rad/s and m/s^2, x right, y up, z toward you; the Switch: rotations/s and G, mapped as Eden/yuzu do */
+    extern volatile float g_motion_gyro[3], g_motion_acc[3]; extern volatile unsigned long long g_motion_ns;
+    static SDLGC on_pad; static int said;
+    if(sdl_gchassensor && sdl_gcsetsensor && sdl_gcsensor){
+      for(int i=first;i<last && i<sdl_npad;i++){ SDLGC g=sdl_pad[i]; if(!sdl_gchassensor(g,2)) continue;
+        if(on_pad!=g){ on_pad=g; sdl_gcsetsensor(g,2,1); if(sdl_gchassensor(g,1)) sdl_gcsetsensor(g,1,1);
+          if(said<4){ said++; LOG("input: motion controls from the controller's gyro%s\n",sdl_gchassensor(g,1)? " and accelerometer" : ""); } }
+        float gy[3]={0,0,0}, ac[3]={0,9.80665f,0};
+        if(sdl_gcsensor(g,2,gy,3)==0){ const float tw=6.2831853f;
+          if(sdl_gchassensor(g,1)) sdl_gcsensor(g,1,ac,3);
+          g_motion_gyro[0]=gy[0]/tw; g_motion_gyro[1]=-gy[2]/tw; g_motion_gyro[2]=gy[1]/tw;
+          g_motion_acc[0]=-ac[0]/9.80665f; g_motion_acc[1]=ac[2]/9.80665f; g_motion_acc[2]=-ac[1]/9.80665f;
+          g_motion_ns=plat_ns(); }
+        break; } } }
   return 1; }
 
 static void set_fullscreen(int on){
@@ -253,13 +295,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
     if(w==VK_F1){ return 0; }   /* the in-game menu (ov_wndproc) */
     if(0){ MessageBoxA(h,HELP,"Metroid Prime 4 Beyond",MB_OK); }
     if(w==VK_F3){ g_shot_req=1; return 0; }
+    if(w==VK_F2){ if(l & (1L<<30)) return 0; extern int g_opt_show_fps; g_opt_show_fps=!g_opt_show_fps; LOG("settings: F2 FPS counter %s\n",g_opt_show_fps? "on" : "off"); return 0; }
     if(w==VK_F7){ g_rec_toggle=1; return 0; }
     if(w==VK_TAB){ if(!(l & (1L<<30))){ extern volatile int g_ff_presses; g_ff_presses++; } return 0; }   /* fast forward toggle (fast_forward=1) */
     if(w==VK_F8){ extern volatile int g_shot8_req; g_shot8_req=1; return 0; }
-    if(w==VK_F5){ extern void gpu_gl_dump_rts(void); extern void kernel_dump_threads(void); extern __thread FILE* g_log_redirect;
-      CreateDirectoryA("captures",NULL); FILE* f=fopen("captures/threads.txt","w");   /* written next to the trace */
-      if(f){ g_log_redirect=f; kernel_dump_threads(); g_log_redirect=NULL; fclose(f); }
-      kernel_dump_threads(); gpu_gl_dump_rts(); return 0; }
+    if(w==VK_F5){ capture_hotkey(); return 0; }
     if(w==VK_F4){ if(l & (1L<<30)) return 0; g_opt_fps= g_opt_fps==0? 1 : 0; char t[64]; snprintf(t,sizeof t,"FPS limit: %s",g_opt_fps==0? "unlimited" : "60"); SetWindowTextA(h,t); LOG("settings: F4 fps_limit=%d\n",g_opt_fps); { extern void ini_set(const char*, const char*); char v[8]; snprintf(v,sizeof v,"%d",g_opt_fps); ini_set("fps_limit",v); } return 0; }
     keys_held|=keymap(w);if(test_tap_sample)keys_tapped|=keymap(w); return 0;
   case WM_SYSKEYUP: case WM_KEYUP: keys_held&=~keymap(w); return 0;
@@ -301,6 +341,12 @@ static void set_pixel_format(HDC dc){
 extern int fe_run(void* hwnd);   /* beyond_ui/fe.cpp: its own message loop; 0 = play, 1 = quit */
 static void win_thread(void* arg){
   HINSTANCE hi=GetModuleHandle(NULL);
+  { /* per-monitor DPI aware, before the first window: without it Windows drew the game at 100% and stretched the
+       whole window to the display's scaling (a 2560x1440 screen at 125% saw a 2048x1152 desktop), blurring the
+       picture, the HUD and the Play screen. Now a window pixel is a screen pixel */
+    static int done; if(!done){ done=1; HMODULE u=GetModuleHandleA("user32.dll");
+      typedef BOOL (WINAPI* SPDAC)(HANDLE); SPDAC f= u? (SPDAC)GetProcAddress(u,"SetProcessDpiAwarenessContext") : NULL;
+      if(!(f && f((HANDLE)(INT_PTR)-4 /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */))){ typedef BOOL (WINAPI* SPDA)(void); SPDA g= u? (SPDA)GetProcAddress(u,"SetProcessDPIAware") : NULL; if(g) g(); } } }
   extern HCURSOR cursor_game(void);   /* cursor_win32.c: the game's own pointer, on the Play screen and in the F1 menu */
   WNDCLASSA wc={0}; wc.style=CS_OWNDC; wc.lpfnWndProc=wndproc; wc.hInstance=hi; wc.hCursor=cursor_game();
   wc.hIcon=LoadIcon(hi,MAKEINTRESOURCE(1)); if(!wc.hIcon) wc.hIcon=LoadIcon(NULL,IDI_APPLICATION);

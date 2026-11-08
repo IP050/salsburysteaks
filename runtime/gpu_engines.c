@@ -118,11 +118,18 @@ static void query_get(GpuChannel* ch, u32* r, int base, u32 v){
   } else if(op==2){ /* counter */
     u32 sel=(v>>23)&31;
     { extern int gpu_gl_oq_report(u64,int); extern int g_gl; if(sel==21 && g_gl && gpu_gl_oq_report(addr,(v>>28)&1)) return; }   /* samples passed: measured */
+    if(sel==0x1A){ /* StreamingByteCount: what transform feedback wrote to buffer sub_report, read back by DrawTransformFeedback */
+      extern u32 gpu_gl_so_bytes(int); extern int g_gl; u32 b= g_gl? gpu_gl_so_bytes((int)((v>>5)&3)) : 0;
+      { static int said; if(said<6){ said++; LOG("gpu: stream-out byte count report %08x -> %u bytes at %llx\n",v,b,(unsigned long long)addr); } }
+      if((v>>28)&1) gmem_w32(addr,b); else { u64 q[2]={b,gpu_ticks()}; gmem_write(addr,q,16); }
+      return; }
+    { static u32 seen; if(sel && sel!=1 && sel!=21 && !(seen>>sel&1)){ seen|=1u<<sel; LOG("gpu: counter report selector %u (%08x) answered with a placeholder\n",sel,v); } }
     u64 val= sel==0? 0 : (sel==1? g_draws*3 : 1000);
     if((v>>28)&1) gmem_w32(addr,(u32)val); else { u64 q[2]={val,gpu_ticks()}; gmem_write(addr,q,16); }
   }
 }
 
+int g_r3d_dfseen;
 void maxwell3d_method(GpuChannel* ch, u32 m, u32 v, int last){
   if(m>=0xE00){ /* macro call */
     if(!ch->mme_active){ ch->mme_active=1; ch->mme_index=(m-0xE00)/2; ch->mme_nparams=0; }
@@ -148,6 +155,7 @@ void maxwell3d_method(GpuChannel* ch, u32 m, u32 v, int last){
     case 0x48: ch->mme_start[ch->mme_start_ptr++&0xFF]=v; break;
     case 0x6C: i2m_launch(ch,ch->r3d,0x60); break;
     case 0x6D: i2m_data(ch,v); break;
+    case 0xDF: g_r3d_dfseen=1; break;   /* rasterize enable: 0 until the game writes it (no reset value here) */
     case 0xB2: if(v&(1u<<20)){ extern void gpu_gl_stream_incr(u32); gpu_gl_stream_incr(v&0xFFFF); } break;              /* SyncInfo */
     case 0x674: r3d_clear(ch,v); break;                                    /* ClearBuffers */
     case 0x54C: { extern void gpu_gl_oq_reset(void); extern int g_gl; if((v&0xFF)==1 && g_gl) gpu_gl_oq_reset(); } break;   /* CounterReset: samples passed */
@@ -160,6 +168,13 @@ void maxwell3d_method(GpuChannel* ch, u32 m, u32 v, int last){
       else { r3d_pending_flush(); g_pd.on=1; g_pd.ch=ch; g_pd.indexed=idx; g_pd.topo=topo; g_pd.first=first; g_pd.count=count; g_pd.bv=bv; g_pd.bi=bi; g_pd.inst=g_instance_count+1; }
       /* hw consumes the counts on each draw; if we don't, the next non-indexed draw picks up stale indices */
       R3(0x5F8)=0; R3(0x35E)=0;
+      break; }
+    case 0x48F: { /* DrawAuto byte count: NVN's DrawTransformFeedback draws (bytes / stride 0x4C6) vertices of what
+                     transform feedback captured, with the topology from BEGIN (Eden: DrawArray(topo,0,bytes/stride)) */
+      u32 stride=R3(0x4C6), topo=R3(0x586)&0xFFFF, n= stride? v/stride : 0;
+      { static int said; if(said<6){ said++; LOG("gpu: byte-count draw: %u bytes / stride %u = %u vertices, topology %u\n",v,stride,n,topo); } }
+      r3d_pending_flush();
+      if(n) r3d_draw(ch,0,topo,0,n,0,0,1);
       break; }
     case 0x586: /* BEGIN, bit 26 = next instance */
       if(v&(1u<<26)) g_instance_count++; else if(!(v&(1u<<27))) g_instance_count=0; break;

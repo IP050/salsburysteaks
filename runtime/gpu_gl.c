@@ -113,6 +113,34 @@ static char* dlg_vs_xfb(char* src){
   memcpy(o,src,a); strcpy(o+a,ext); memcpy(o+a+strlen(ext),src+a,b-a); strcpy(o+a+strlen(ext)+(b-a),nd); strcat(o,d+strlen(decl));
   free(src); return o; }
 
+/* The game's transform feedback (3D 0x1D1): a vertex program's outputs written to memory instead of drawn. Metroid
+   Prime 4's desert terrain computes its patches this way (a point draw with no pixel program); without it the patches
+   kept stale data and left holes. Key: per buffer, the attribute word each 4-byte word holds (0xA00 + 0x20*i, a byte
+   each: position x is 28, generic i's component k is 32 + 4*i + k), how many (0x1C1 + 4*i) and the stride (0x1C2 + 4*i) */
+typedef struct { u8 count[4]; u16 stride[4]; u8 layout[4][128]; } XfbKey;
+static const XfbKey* g_vs_xfb; static u32 g_vs_xfb_hash;
+/* the vertex program renamed swr_main_; a new main runs it and copies each captured word into a float output with
+   that buffer and offset (returns inside the program can't skip the copies) */
+static char* vs_xfb_apply(char* src, const XfbKey* k){
+  if(!src) return src;
+  char* m=strstr(src,"void main(){"); char* nl=strchr(src,'\n'); if(!m || !nl || nl>m) return src;
+  size_t cap=strlen(src)+200000; char* o=malloc(cap); if(!o) return src; size_t n=0;
+  #define XA(...) n+=(size_t)snprintf(o+n,cap-n,__VA_ARGS__)
+  memcpy(o,src,(size_t)(nl+1-src)); n=(size_t)(nl+1-src);
+  XA("#extension GL_ARB_enhanced_layouts : require\n");
+  memcpy(o+n,nl+1,(size_t)(m-(nl+1))); n+=(size_t)(m-(nl+1));
+  for(int b=0;b<4;b++){ if(!k->count[b]) continue; XA("layout(xfb_buffer=%d, xfb_stride=%u) out;\n",b,(unsigned)(k->stride[b]? k->stride[b] : k->count[b]*4u));
+    for(int w=0;w<k->count[b];w++) XA("layout(xfb_buffer=%d, xfb_offset=%d) out float swr_xfb%d_%d;\n",b,w*4,b,w); }
+  XA("void swr_main_(){"); strcpy(o+n,m+strlen("void main(){")); n+=strlen(m+strlen("void main(){"));
+  XA("\nvoid main(){ swr_main_();\n");
+  for(int b=0;b<4;b++) for(int w=0;w<k->count[b];w++){ u32 a=k->layout[b][w]; char ex[64]="0.0";
+    if(a>=28 && a<32) snprintf(ex,sizeof ex,"gl_Position.%c","xyzw"[a-28]);
+    else if(a>=32 && a<160){ u32 i=(a-32)/4, c=(a-32)%4; char dcl[48]; snprintf(dcl,sizeof dcl,"out vec4 out_attr%u;",i); if(strstr(src,dcl)) snprintf(ex,sizeof ex,"out_attr%u.%c",i,"xyzw"[c]); }
+    XA("  swr_xfb%d_%d = %s;\n",b,w,ex); }
+  XA("}\n");
+  #undef XA
+  free(src); return o; }
+
 /* ============================================================ formats */
 typedef struct { GLenum ifmt, fmt, type; u8 bpp, bw, bh, compressed, depth, is_int, astc, dec; } GlFmt;
 /* GLES: anything the hw can't sample gets decoded on the CPU */
@@ -429,8 +457,24 @@ static u32 ur2_alloc(u32 n){
 #define BP_N 6
 static struct { GLuint b; u8* p; u64 cap, last; GLsync f; } g_bp[BP_N]; static int g_bp_on, g_bp_next;
 static void bp_free(int k){ if(g_bp[k].f){ p_u2ds(g_bp[k].f); g_bp[k].f=0; } if(g_bp[k].b) glDeleteBuffers(1,&g_bp[k].b); g_bp[k].b=0; g_bp[k].p=NULL; g_bp[k].cap=0; }
+/* NVIDIA on Windows (set in gpu_thread): no compile threads, no glMaxShaderCompilerThreads, and big textures upload from
+   ordinary memory. Its persistently mapped buffers are write-combined memory, which the CPU reads very slowly, and for a
+   compressed 3D texture the driver reads the data back on the CPU: each 181 MB lighting volume took 1.9 s on the GL thread,
+   five in a row a 10 s freeze (MEASURED 2026-11-03, RTX 4060 Ti, driver 617.42) */
+static int g_nv_win;
+/* GL_NV_texture_compression_vtc (NVIDIA): an S3TC texture with depth is stored as 4x4x4 blocks, each the four slices'
+   4x4 blocks one after another (x, then y, then groups of four slices), not slice after slice as the Switch and Mesa
+   have it. Uploaded as they are, Prime 4's lighting volumes (1408x256x1008 BC1) were scrambled across every four
+   slices: the arm cannon and whatever the volumes light black, rainbow noise where the scene read them. So on such a
+   driver the blocks are put in that order first. SWR_NO_VTC=1: off */
+static int g_vtc;
+static int vtc_fmt(GLenum f){ return (f>=0x83F0 && f<=0x83F3) || (f>=0x8C4C && f<=0x8C4F); }   /* S3TC DXT1-5, sRGB too */
+static void vtc_order(const u8* in, u8* out, u32 tw, u32 th, u32 d, u32 bpb){   /* tw x th blocks a slice, bpb bytes a block */
+  size_t slice=(size_t)tw*th*bpb, o=0;
+  for(u32 z0=0;z0<d;z0+=4){ u32 nz= d-z0<4? d-z0 : 4;
+    for(u32 y=0;y<th;y++) for(u32 x=0;x<tw;x++) for(u32 k=0;k<nz;k++){ memcpy(out+o,in+(size_t)(z0+k)*slice+((size_t)y*tw+x)*bpb,bpb); o+=bpb; } } }
 static u8* bp_get(u64 n, int* slot){
-  if(!g_bp_on){ g_bp_on=-1; if(g_gles || getenv("SWR_NO_BIG_PBO")) return NULL;
+  if(!g_bp_on){ g_bp_on=-1; if(g_gles || g_nv_win || getenv("SWR_NO_BIG_PBO")) return NULL;
     if(!u2_procs()) return NULL;
     g_bp_on=1; }
   if(g_bp_on<0 || n>(1ull<<30)) return NULL;
@@ -532,7 +576,9 @@ static void tex_upload_(Tex* t){ if(!g_upl_t0) g_upl_t0=plat_ns(); st_tex_up+=t-
         else if(t->target==GL_TEXTURE_2D) glCompressedTexSubImage2D(GL_TEXTURE_2D,l,0,0,lw,lh,f->ifmt,isz,up);
         else if(t->target==GL_TEXTURE_2D_ARRAY || t->target==GL_TEXTURE_CUBE_MAP_ARRAY) glCompressedTexSubImage3D(t->target,l,0,0,layer,lw,lh,1,f->ifmt,isz,up);
         else if(t->target==GL_TEXTURE_CUBE_MAP) glCompressedTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X+layer,l,0,0,lw,lh,f->ifmt,isz,up);
-        else if(t->target==GL_TEXTURE_3D) glCompressedTexSubImage3D(GL_TEXTURE_3D,l,0,0,0,lw,lh,ld,f->ifmt,isz*ld,up);
+        else if(t->target==GL_TEXTURE_3D){ u8* v= g_vtc && up && ld>1 && vtc_fmt(f->ifmt)? malloc((size_t)isz*ld) : NULL;   /* NVIDIA's 4x4x4 order (g_vtc) */
+          if(v) vtc_order(up,v,tw,th,ld,f->bpp);
+          glCompressedTexSubImage3D(GL_TEXTURE_3D,l,0,0,0,lw,lh,ld,f->ifmt,isz*ld,v? v : up); free(v); }
       } else {
         GLenum fm= (f->astc||f->dec)? GL_RGBA : f->fmt, ty= (f->astc||f->dec)? GL_UNSIGNED_BYTE : f->type;
         if(t->target==GL_TEXTURE_2D) glTexSubImage2D(GL_TEXTURE_2D,l,0,0,lw,lh,fm,ty,up);
@@ -728,6 +774,7 @@ static Tex* lay_src(u64 base, u64 lsz, u32 y, int* layer){
   if(b && b->vol && b->vol->target==GL_TEXTURE_2D_ARRAY && y<b->vol->d && b->vol->wtick==b->wtick){ *layer=(int)y; return b; }
   return tex_find_rt(base+(u64)y*lsz); }
 static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels, GLenum target, GlFmt f, u32 fkey, u32 bl, u32 bh, u32 bd){
+  u64 lt0=plat_ns(); int ncp=0;   /* a slow one is logged at the end: frames with 0.2-1 s of layered work were seen */
   if(!p_cis || levels>15 || d<1) return NULL;
   u64 loff[16], lsz=0; for(u32 l=0;l<levels;l++){ loff[l]=lsz; lsz+= bl? bl_level_size(w,h,1,&f,bh,bd,l,NULL) : 0; }
   if(!bl) return NULL;
@@ -771,11 +818,11 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
         { int ly0; Tex* r0=lay_src(gva+loff[l],lsz,0,&ly0); int whole= ly0==0 && r0 && r0->vol && r0->vol->d>=d;
           for(u32 y=1;y<d && whole;y++){ int ly; Tex* r=lay_src(gva+loff[l],lsz,y,&ly); if(r!=r0 || ly!=(int)y) whole=0; }
           if(whole){ u32 cw=W0>>l, ch=H0>>l; if(!cw) cw=1; if(!ch) ch=1; u32 rw=SC(r0->w), rh=SC(r0->h); if(rw<cw) cw=rw; if(rh<ch) ch=rh;
-            p_cis(r0->vol->id,GL_TEXTURE_2D_ARRAY,0,0,0,0,c->id,target,l,0,0,0,(GLsizei)cw,(GLsizei)ch,(GLsizei)d); continue; } }
+            p_cis(r0->vol->id,GL_TEXTURE_2D_ARRAY,0,0,0,0,c->id,target,l,0,0,0,(GLsizei)cw,(GLsizei)ch,(GLsizei)d); ncp++; continue; } }
         for(u32 y=0;y<d;y++){ int ly; Tex* r=lay_src(gva+loff[l],lsz,y,&ly);
           u32 cw=W0>>l, ch=H0>>l; if(!cw) cw=1; if(!ch) ch=1; u32 rw=SC(r->w), rh=SC(r->h); if(rw<cw) cw=rw; if(rh<ch) ch=rh;
           if(ly>=0) p_cis(r->vol->id,GL_TEXTURE_2D_ARRAY,0,0,0,ly,c->id,target,l,0,0,(GLint)y,(GLsizei)cw,(GLsizei)ch,1);
-          else lvl_copy(r->id,c->id,target,l,(int)y,(GLsizei)cw,(GLsizei)ch,col); } }
+          else lvl_copy(r->id,c->id,target,l,(int)y,(GLsizei)cw,(GLsizei)ch,col); ncp++; } }
       /* sanity check the first few chains: center of level 1 must match its source RT. if the driver dropped the
          copy, switch to blits for good */
       static int nchk; if(pass || g_lvl_mode || !col || maxl<1 || anyvol || nchk>=6) break; nchk++;
@@ -794,7 +841,9 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
       static int said; if(said<8){ said++; LOG("gpu: %s %ux%u at %llx: %d of %u mips rendered by the game, the rest generated\n",target==GL_TEXTURE_CUBE_MAP? "cubemap":target==GL_TEXTURE_2D? "mip chain":"array",w,h,(unsigned long long)gva,maxl+1,levels); } }
     if((int)c->stable!=topl){ glBindTexture(target,c->id); glTexParameteri(target,GL_TEXTURE_MAX_LEVEL,topl); c->stable=(u32)topl; mb_reset(); }
     c->crop_gen=sig; st_lay_copy++; }
-  c->last_used=g_frame; rt0->last_used=g_frame; return c; }
+  c->last_used=g_frame; rt0->last_used=g_frame;
+  { u64 dt=plat_ns()-lt0; static int said; if(dt>20000000ull && said<40){ said++; LOG("gpu: layered %s %ux%u, %u layers, %u levels at %llx took %.1f ms (%d copies)\n",target==GL_TEXTURE_CUBE_MAP? "cubemap" : target==GL_TEXTURE_CUBE_MAP_ARRAY? "cubemap array" : target==GL_TEXTURE_2D? "mip chain" : "array",w,h,d,levels,(unsigned long long)gva,dt/1e6,ncp); } }
+  return c; }
 /* startup driver checks for the stuff the post-processing relies on. results go to the log as
    "gpu: driver check". each test writes a known color and reads it back */
 static GLuint st_prog, st_samp, st_out, st_ofbo;
@@ -908,7 +957,12 @@ static u64 slab_hash(Tex* t, u32 i){ u64 a=t->gva+(u64)i*t->slb; u8* p=gmem_ptr(
     if(cpu){ const u64* q=(const u64*)GP(cpu); for(u64 k=0;k<n/8;k+=16) h=(h^q[k])*0x100000001B3ull; } else h=(h^o)*0x100000001B3ull;
     o+=n; }
   return h; }
-static int slab_setup(Tex* t){
+/* fill: a new volume isn't uploaded whole but left to slab_poll, slab by slab under the per-frame budget (g_slab_bud).
+   NVIDIA on Windows: a door or a load brings six such volumes at once, 210-450 ms each there even from ordinary memory,
+   a 1.5-2 s freeze; filled over about two seconds instead, the lighting completes while the game keeps running.
+   SWR_SLAB_FILL=0 / 1 turns it off / on anywhere, SWR_SLAB_MB the budget (8 MB a frame, about 13 ms on that card) */
+static u64 g_slab_bud; static u32 g_slab_bud_frame; static int g_slab_fill=-1;
+static int slab_setup(Tex* t, int fill){
   static int off=-1; if(off<0) off=getenv("SWR_NO_SLABS")!=NULL;
   if(off || t->slh || t->target!=GL_TEXTURE_3D || t->levels!=1 || !t->bl || t->size<(32u<<20) || t->f.astc || t->f.dec) return 0;
   const GlFmt* f=&t->f; u32 tw=(t->w+f->bw-1)/f->bw, th=(t->h+f->bh-1)/f->bh, rowb=tw*f->bpp, lbh=0;
@@ -919,8 +973,8 @@ static int slab_setup(Tex* t){
   if(!sb || (u64)n*sb!=lsz || n<2 || (u64)n<<lbd < t->d){ static int nd; if(nd<8){ nd++; LOG("slab layout mismatch: lsz %llu slab %llu n %u lbh %u lbd %u\n",(unsigned long long)lsz,(unsigned long long)sb,n,lbh,lbd); } return 0; }
   t->slh=malloc((size_t)n*8); if(!t->slh) return 0;
   t->nsl=n; t->slb=sb; t->slz=1u<<lbd; t->sl_lbh=lbh; t->sl_lbd=lbd; t->sl_rowb=rowb; t->sl_th=th; t->slcur=0;
-  for(u32 i=0;i<n;i++) t->slh[i]=slab_hash(t,i);
-  static int said; if(said<8){ said++; LOG("gpu: 3D texture %ux%ux%u at %llx (%llu MB) is updated by slab: %u slabs of %u slices\n",t->w,t->h,t->d,(unsigned long long)t->gva,(unsigned long long)(t->size>>20),n,t->slz); }
+  for(u32 i=0;i<n;i++) t->slh[i]= fill? slab_hash(t,i)^1 : slab_hash(t,i);   /* fill: every slab differs, so each is uploaded */
+  static int said; if(said<8){ said++; LOG("gpu: 3D texture %ux%ux%u at %llx (%llu MB) is updated by slab: %u slabs of %u slices%s\n",t->w,t->h,t->d,(unsigned long long)t->gva,(unsigned long long)(t->size>>20),n,t->slz,fill? ", filled over the next frames" : ""); }
   return 1; }
 static void slab_upload(Tex* t, u32 i){
   u32 z0=i*t->slz, nz=t->slz; if(z0>=t->d) return; if(z0+nz>t->d) nz=t->d-z0;
@@ -928,14 +982,35 @@ static void slab_upload(Tex* t, u32 i){
   if(!src){ own=malloc(t->slb); if(!own) return; gmem_read_par(sa,own,t->slb); src=own; }   /* not contiguous: read it in pieces */
   size_t n=(size_t)t->sl_rowb*t->sl_th*nz; u8* lin=malloc(n); if(!lin){ free(own); return; }
   DsJob dj={lin,src,t->slb,t->sl_rowb,t->sl_th,t->sl_lbh,t->sl_lbd}; pf_run(ds_rows,&dj,nz*t->sl_th,(u32)((256u<<10)/(t->sl_rowb? t->sl_rowb : 1)));
-  glBindTexture(GL_TEXTURE_3D,t->id); glPixelStorei(GL_UNPACK_ALIGNMENT,1); glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
+  glPixelStorei(GL_UNPACK_ALIGNMENT,1); glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
+  if(t->f.compressed && (g_nv_win || (g_vtc && vtc_fmt(t->f.ifmt))) && p_cis && !getenv("SWR_NO_SLAB_STAGE")){   /* BC6H volumes as slow as BC1 */
+    /* NVIDIA (VTC): a compressed upload into the 3D texture, even of one 16-slice slab, cost 80-150 ms on the GL thread
+       (the driver converting far more than the slab: 49 of them were 7 s in two minutes as the game streamed its lighting
+       bricks). Into a 2D array of the same format it is an ordinary upload, in the game's own block order, and the GPU
+       copies the layers into the volume's slices (glCopyImageSubData: compressed, same format) */
+    static GLuint stg; static u32 sw, sh, sd; static GLenum sf;
+    if(!stg || sw!=t->w || sh!=t->h || sd<nz || sf!=t->f.ifmt){ if(stg) glDeleteTextures(1,&stg); glGenTextures(1,&stg);
+      glBindTexture(GL_TEXTURE_2D_ARRAY,stg); glTexStorage3D(GL_TEXTURE_2D_ARRAY,1,t->f.ifmt,(GLsizei)t->w,(GLsizei)t->h,(GLsizei)t->slz);
+      sw=t->w; sh=t->h; sd=t->slz; sf=t->f.ifmt; }
+    glBindTexture(GL_TEXTURE_2D_ARRAY,stg);
+    glCompressedTexSubImage3D(GL_TEXTURE_2D_ARRAY,0,0,0,0,(GLsizei)t->w,(GLsizei)t->h,(GLsizei)nz,t->f.ifmt,(GLsizei)n,lin);
+    p_cis(stg,GL_TEXTURE_2D_ARRAY,0,0,0,0,t->id,GL_TEXTURE_3D,0,0,0,(GLint)z0,(GLsizei)t->w,(GLsizei)t->h,(GLsizei)nz);
+    { static int said; if(!said){ said=1; LOG("gpu: compressed 3D textures are updated through a 2D array and a GPU copy (NVIDIA)\n"); } }
+    free(lin); free(own); mb_reset(); st_slab_up++; return; }
+  glBindTexture(GL_TEXTURE_3D,t->id);
+  if(t->f.compressed && g_vtc && nz>1 && vtc_fmt(t->f.ifmt) && t->f.bpp){   /* NVIDIA's 4x4x4 order (g_vtc); slabs start at multiples of 16 slices */
+    u8* v=malloc(n); if(v){ vtc_order(lin,v,t->sl_rowb/t->f.bpp,t->sl_th,nz,t->f.bpp); free(lin); lin=v; } }
   if(t->f.compressed) glCompressedTexSubImage3D(GL_TEXTURE_3D,0,0,0,(GLint)z0,t->w,t->h,nz,t->f.ifmt,(GLsizei)n,lin);
   else glTexSubImage3D(GL_TEXTURE_3D,0,0,0,(GLint)z0,t->w,t->h,nz,t->f.fmt,t->f.type,lin);
   free(lin); free(own); mb_reset(); st_slab_up++; }
 /* check k slabs from the cursor (k = all when the whole texture may have changed) */
 static void slab_poll(Tex* t, u32 k){
   u64 t0=plat_ns(); if(k>t->nsl) k=t->nsl; u32 changed=0;
-  for(u32 q=0;q<k;q++){ u32 i=t->slcur; t->slcur=(t->slcur+1)%t->nsl; u64 h=slab_hash(t,i); if(h!=t->slh[i]){ t->slh[i]=h; slab_upload(t,i); changed++; } }
+  if(g_slab_bud_frame!=g_frame){ g_slab_bud_frame=g_frame; const char* e=getenv("SWR_SLAB_MB"); g_slab_bud= g_slab_fill? (u64)(e? atoi(e) : 8)<<20 : ~0ull; }
+  for(u32 q=0;q<k;q++){ u32 i=t->slcur; u64 h=slab_hash(t,i);
+    if(h!=t->slh[i]){ if(g_slab_bud<t->slb) break;   /* this frame's budget is spent: the next frame goes on from this slab */
+      g_slab_bud-=t->slb; t->slh[i]=h; slab_upload(t,i); changed++; }
+    t->slcur=(t->slcur+1)%t->nsl; }
   if(changed){ t->zero3d=0; static int said; if(said<12){ said++; LOG("gpu: 3D texture %ux%ux%u at %llx: %u of %u slabs changed, uploaded those (%.1f ms)\n",t->w,t->h,t->d,(unsigned long long)t->gva,changed,t->nsl,(plat_ns()-t0)/1e6); } }
   st_slab_ns+=plat_ns()-t0; }
 static Tex* tex_from_tic_(u32* tic);
@@ -1035,7 +1110,10 @@ static Tex* tex_from_tic_(u32* tic){
           if(sh==t->shash){ t->next_check=g_frame+20+((u32)(gva>>9)&7); return t; }
           t->stable=0; }
         if(g_tex_bud>0 || t->stable<4){ t->frame_checked=g_frame; g_tex_bud-=(i64)(t->size>>(t->size>65536? 1 : 0)); st_tex_chk+=t->size;
-          u64 hq=plat_ns(); u64 hh=mem_hash(gva,t->size); st_tchk_ns+=plat_ns()-hq; if(hh!=t->hash){ t->hash=hh; tex_upload(t); t->stable=0; } else if(t->stable<100000) t->stable++;
+          u64 hq=plat_ns(); u64 hh=mem_hash(gva,t->size); st_tchk_ns+=plat_ns()-hq; if(hh!=t->hash){
+            /* the honeycomb holes hunt: a long-stable texture changed and the sampled checks hadn't seen it */
+            if(t->stable>=40 && t->d>1){ static int said; if(said<200){ said++; LOG("gpu: array texture %ux%ux%u at %llx fmt %x changed, unseen by the sampled check for up to %d frames\n",t->w,t->h,t->d,(unsigned long long)gva,t->fkey,(int)(g_frame-t->tfull)); } }
+            t->hash=hh; tex_upload(t); t->stable=0; } else if(t->stable<100000) t->stable++;
           if(t->stable>=39 && t->size>=16384){ t->shash=sample_hash(gva,t->size); t->tfull=g_frame; }
           t->next_check=g_frame+(t->stable<4? 4 : t->stable<12? 8 : 20)+((u32)(gva>>9)&3); } }
       return t; } }
@@ -1044,11 +1122,17 @@ static Tex* tex_from_tic_(u32* tic){
         u64 rsz=(u64)q->w*q->h*(q->f.bpp? q->f.bpp : 4);
         if(gva>=q->gva && gva<q->gva+rsz){ nd++; LOG("gpu: texture %ux%u fmt %x at %llx falls inside render target %llx %ux%u (+%llx)%s: read from memory\n",w,h,tic[0]&0x7F,(unsigned long long)gva,
             (unsigned long long)q->gva,q->w,q->h,(unsigned long long)(gva-q->gva),gva==q->gva? " and is larger than it" : ""); break; } } } }
-  Tex* t=tex_create(gva,w,h,d,levels,target,f,fkey,bl,bh,bd,pitch,0);
   u64 sz=0; u32 dd= target==GL_TEXTURE_3D? d : 1; for(u32 l=0;l<levels;l++) sz+=bl? bl_level_size(w,h,dd,&f,bh,bd,l,NULL) : (u64)pitch*((h+f.bh-1)/f.bh);
   if(target!=GL_TEXTURE_3D) sz*=d;
+  /* a descriptor read at the wrong time or place (an 807x811x808 3D texture, 4.2 GB, whose type didn't match the shader's
+     sampler) made the GPU allocate and upload it: seconds of freeze and half of an 8 GB card. The game's largest real
+     textures are its lighting volumes, 173-363 MB: anything over 1 GB is read as missing */
+  if(sz>(1ull<<30)){ static int said; if(said<4){ said++; LOG("gpu: texture %ux%ux%u at %llx would be %llu MB: not made (a stale or wrong descriptor)\n",w,h,d,(unsigned long long)gva,(unsigned long long)(sz>>20)); } return NULL; }
+  Tex* t=tex_create(gva,w,h,d,levels,target,f,fkey,bl,bh,bd,pitch,0);
   t->size=sz; t->hash=mem_hash(gva,sz); t->frame_checked=g_frame; t->last_used=g_frame; t->dgen=g_dma_gen;
-  tex_upload(t); t->video_gen=video_surface_generation(gmem_ptr(gva,1),sz); slab_setup(t);
+  if(g_slab_fill<0){ const char* e=getenv("SWR_SLAB_FILL"); g_slab_fill= e? atoi(e)!=0 : g_nv_win; }
+  if(!(g_slab_fill && slab_setup(t,1))){ tex_upload(t); slab_setup(t,0); }   /* a big volume fills in slab by slab (slab_setup) */
+  t->video_gen=video_surface_generation(gmem_ptr(gva,1),sz);
   return t; }
 
 /* ============================================================ samplers */
@@ -1087,7 +1171,7 @@ extern int g_glsl_version;
 struct WJob;
 typedef struct Sh { u64 hash; u32 key2; int stage; GLuint gl; ShaderInfo si; struct Sh* next; int failed; char* src;
   GLuint sp; GLint uloc; int sps; struct WJob* sj; u32 clen; u64 qh; float lu[4]; int lu_ok; u64 skey; int xfb; struct WJob* sj_up;
-  GLuint pp; u64 pkey; u64 pt0; } Sh;   /* sp: this shader's own separable program; pp: one the driver is still compiling (sps 4) */
+  GLuint pp; u64 pkey; u64 pt0; volatile int pflag; int pidx; } Sh;   /* sp: this shader's own separable program; pp: one the driver is still compiling (sps 4) */
 static Sh* shh[1024];
 /* per-address cache. shader_hash walks the whole program (~50us per stage per draw on big shaders),
    within a submit a quick hash of the same range is enough */
@@ -1102,7 +1186,7 @@ static void aw_write(const char* path, const void* d, size_t n, int append);
 
 /* common epilogue stuff: alpha test for FS, Y flip for VS */
 
-#define TR_VER 5184   /* bump when the GLSL output changes, invalidates caches */
+#define TR_VER 5187   /* bump when the GLSL output changes, invalidates caches */
 /* the file is named after the version: the loader stops at the first entry of another version, so a bump with a fixed
    name left every new entry unread behind the old ones (all shaders translated again each launch, the file growing) */
 #define TR_HEX_(v) 0x##v##u
@@ -1112,7 +1196,7 @@ static void aw_write(const char* path, const void* d, size_t n, int append);
 #define TR_VERSION TR_HEX(TR_VER)
 #define TRANSLATED_PATH "shader_cache/translated_v" TR_STR(TR_VER) ".bin"
 typedef struct {u32 idx,off,value;} TransDep;
-typedef struct Translated {u64 key;ShaderInfo si;char*src;u32 ndep;TransDep dep[128];struct Translated*next;} Translated;
+typedef struct Translated {u64 key;ShaderInfo si;char*src;u32 ndep;TransDep dep[128];struct Translated*next;int chk;} Translated;   /* chk: 0 unchecked, 1 usable, 2 old loop translation */
 static Translated* translated[512];static u32 translated_count,translated_hits;
 static TransDep trans_dep[128];static u32 trans_ndep;static int trans_overflow;
 static int trans_cb_read(u32 idx,u32 off,u32*out){
@@ -1140,6 +1224,10 @@ static u64 translated_key(u64 hash,int stage,u32 key2,const ShaderInfo*input){
 static Translated*translated_get(u64 key){
   for(Translated*t=translated[(u32)(key^(key>>32))&511];t;t=t->next)if(t->key==key){
     int ok=1;for(u32 i=0;i<t->ndep;i++){u32 v;if(!sh_cb_read(t->dep[i].idx,t->dep[i].off,&v)||v!=t->dep[i].value){ok=0;break;}}
+    /* translated before loops were structured (shader.c, 2026-11-08): the pc switch for a plain loop; translate again.
+       Newer dispatcher output carries the swr-loop1 mark (a shader that still needs it) */
+    if(ok && !t->chk){ static int nl=-1; if(nl<0) nl=getenv("SWR_SHADER_NOLOOP")!=NULL; t->chk= !nl && t->src && strstr(t->src,"switch(pc)") && !strstr(t->src,"swr-loop1")? 2 : 1; }
+    if(ok && t->chk==2) continue;
     if(ok){translated_hits++;return t;}
   }return NULL;
 }
@@ -1199,7 +1287,7 @@ static char* sh_post(char* src, int stage){
 
 static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
   st_shaders++; g_sh_bind= stage==ST_VS? 0 : stage==ST_GS? 3 : 4; g_shader_cb_read=sh_cb_read; /* BRX table is only used to mark targets, length doesn't change */
-  u32 key2= stage==ST_VS? (attr_int^(attr_sint*31)) : (attr_int*0x9E3779B1u ^ attr_sint*0x85EBCA6Bu ^ g_fs_rtk);
+  u32 key2= stage==ST_VS? (attr_int^(attr_sint*31)^(g_vs_xfb? g_vs_xfb_hash : 0)) : (attr_int*0x9E3779B1u ^ attr_sint*0x85EBCA6Bu ^ g_fs_rtk);
   ShA* ca=&sha[(u32)((gva_code>>6)^(gva_code>>18)^((u64)key2*0x9E3779B1u)^((u32)stage<<11))&4095];
   if(ca->s && ca->gva==gva_code && ca->stage==stage && ca->key2==key2){
     if(ca->epoch==g_submit_epoch){ st_sh_fast++; return ca->s; }
@@ -1237,9 +1325,10 @@ static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
   if(stage==ST_FS) src=sh_dbg(src,h);
   GLenum ty= stage==ST_VS? GL_VERTEX_SHADER : stage==ST_FS? GL_FRAGMENT_SHADER : stage==ST_GS? GL_GEOMETRY_SHADER : stage==ST_CS? GL_COMPUTE_SHADER : stage==ST_TCS? GL_TESS_CONTROL_SHADER : GL_TESS_EVALUATION_SHADER;
   (void)ty; if(!src) s->failed=1;
-  if(stage==ST_VS) src=dlg_vs_xfb(src);   /* DLAA: positions captured for motion vectors */
+  if(stage==ST_VS && g_vs_xfb) src=vs_xfb_apply(src,g_vs_xfb);   /* the game's transform feedback (its own variant) */
+  else if(stage==ST_VS) src=dlg_vs_xfb(src);   /* DLAA: positions captured for motion vectors */
   s->src=src; src=NULL;   /* only compiled if it isn't in the disk cache */
-  s->xfb= stage==ST_VS && s->src && strstr(s->src,"xfb_offset")!=NULL;
+  s->xfb= stage==ST_VS && !g_vs_xfb && s->src && strstr(s->src,"xfb_offset")!=NULL;
   { static int dump=-1; if(dump<0){ dump=getenv("SWR_DUMP_SHADERS")!=NULL; } if(dump && s->src){ char pth[256]; snprintf(pth,sizeof pth,"shader_%016llx_%d.glsl",(unsigned long long)h,stage); FILE* f=fopen(pth,"w"); if(f){ fputs(s->src,f); fclose(f);} } }
   free(src); free(tmp);
   s->next=shh[h&1023]; shh[h&1023]=s; return s; }
@@ -1299,7 +1388,12 @@ static u64 prog_key(Sh* vs, Sh* fs){ return src_key(vs)*0x9E3779B97F4A7C15ull ^ 
 
 static u64 sh_key(Sh* s){ return src_key(s)*0x9E3779B97F4A7C15ull ^ 0x5E9A0000ull; }
 static int g_par=-1;
-static u32 g_par_built; static u64 g_par_max;   /* separable programs the driver built in the background (sh_sep_ready sps 4) */
+static int g_lf_light, g_lf_run, g_lf_reveal; static u64 g_lf_wait_ns;   /* load-screen detector (frame_stats) */
+static u64 st_lf_waits, st_lf_wait_ns;   /* draws that waited for shaders on light frames, and how long */
+/* opt-in (SWR_LOAD_WAIT=1): a draw count can't tell a loading screen from the map or a menu, which also draw little */
+volatile unsigned g_sh_loops_structured;   /* shader.c: loops emitted as do/while */
+static int getenv_cached_nolw(void){ static int v=-1; if(v<0) v=getenv("SWR_LOAD_WAIT")==NULL; return v; }
+static u32 g_par_built; static u64 g_par_max; static u32 g_cpf_frame, g_cpf_n;   /* draws' new compiles this frame (sh_sep_ready) */   /* separable programs the driver built in the background (sh_sep_ready sps 4) */
 
 static void pcache_init(void){
   if(g_pcache<0){ g_pcache= p_glProgramBinary && p_glGetProgramBinary && p_glProgramParameteri; if(g_pcache){ plat_mkdir("shader_cache");
@@ -1349,7 +1443,7 @@ static GLuint prog_finish(Sh* vs, Sh* fs, GLuint p){
    second shared context that compiles + links, so the GPU thread never blocks on the driver compiler.
    draws whose program isn't ready yet get skipped for a few frames */
 static int prog_cached(Sh* vs, Sh* fs){ pcache_init(); if(g_pcache<=0) return 0; char path[160]; snprintf(path,sizeof path,"shader_cache/%s_%016llx.bin",g_pc_tag,(unsigned long long)prog_key(vs,fs)); FILE* f=fopen(path,"rb"); if(!f) return 0; fclose(f); return 1; }
-typedef struct WJob { const char* vs; const char* fs; char* own_vs; char* own_fs; u64 key; volatile int state; volatile int run; GLuint prog; int keep; int sep; GLenum stype; char log[1536]; int try_bin; char bin_path[160]; } WJob;
+typedef struct WJob { const char* vs; const char* fs; char* own_vs; char* own_fs; u64 key; volatile int state; volatile int run; GLuint prog; int keep; int sep; GLenum stype; char log[1536]; int try_bin; char bin_path[160]; int drv; } WJob;   /* drv: the pre-build handed it to the driver (no compile thread), state set by pc_step */
 #define WQN 8192
 typedef struct { WJob* volatile e[WQN]; volatile u32 h, t; } WRing;
 static WRing wq_hi, wq_lo; static volatile int g_worker;   /* 0 not started, 1 running, -1 unavailable */
@@ -1411,7 +1505,6 @@ static int g_sync_draws;
 typedef void (APIENTRY*PFN_UPS_)(GLuint,GLbitfield,GLuint); typedef void (APIENTRY*PFN_BPP_)(GLuint); typedef void (APIENTRY*PFN_GPP_)(GLsizei,GLuint*);
 static PFN_UPS_ p_ups; static PFN_BPP_ p_bpp;
 static const char* mp_why_unseen(u64 h, int stage); static int mp_claim(u64 key, Sh* s); static u64 g_mp_last_claim; static int mp_seen(u64 h, int stage); static u64 fb_get(u64 h, int stage, u32 key2); static u32 g_fb_used;
-static int g_nv_win;   /* NVIDIA on Windows: no compile threads, no glMaxShaderCompilerThreads (gpu_thread) */
 static void worker_start(void){
   g_sync_draws= getenv("SWR_SYNC_SHADERS")!=NULL;
   if(g_nv_win || getenv("SWR_NO_WORKERS")){ g_worker=-1; return; }   /* NVIDIA on Windows (see gpu_thread), or a test */
@@ -1431,16 +1524,68 @@ static int g_sep=-1; static GLuint g_pipe; static int g_pipe_on; static GLuint g
 static void prog_u4(GLuint p, GLint loc, int which, const float* v){ if(loc==ULOC_LAZY) glq_prog_uniform_named(p,which,v); else glProgramUniform4fv(p,loc,1,v); }
 static void sh_uloc(Sh* s){u64 start=plat_ns(); s->uloc= s->sp? ULOC_LAZY : -1;shader_uniform_ns+=plat_ns()-start; }
 
+/* Separable programs the driver is still compiling (sh_sep_ready sps 4). Asking it from the GPU thread is a glGetProgramiv
+   round trip: the GPU thread waits until the GL thread has run everything queued before it. Asked at every draw of every
+   pending shader, that was most frames of an hour's play under 15 FPS (341 of 516 five-second samples), and the GL thread
+   so busy that the driver took up to 49 s for one. So the GL thread checks them all once a frame in one queued entry
+   (pc_step, at the end of a frame) and sets each one's flag, which the draws read without waiting. A draw that must
+   have its shader now (tables drawn once at a level load: g_must_wait) still asks directly */
+typedef struct { GLuint p; volatile int* flag; } PcEnt;
+static Sh* g_pc[1024]; static int g_pc_n; static int g_must_wait;
+static WJob* g_pcj[64]; static int g_pcj_n;   /* pre-build jobs the driver builds (mem_prebuild_step, NVIDIA): their state set here too */
+static void pcj_drop(WJob* j){ for(int i=0;i<g_pcj_n;i++) if(g_pcj[i]==j){ g_pcj[i]=g_pcj[--g_pcj_n]; return; } }
+/* a finished driver job is freed 16 frames later: a pc_step entry queued before its result arrived may still write its
+   state on the GL thread, which runs behind */
+static struct { WJob* j; u32 f; } g_jgrave[512]; static int g_jgrave_n;
+static void job_free(WJob* j){ free(j->own_vs); j->own_vs=NULL; if(!j->drv){ free(j); return; }
+  if(g_jgrave_n<512){ g_jgrave[g_jgrave_n].j=j; g_jgrave[g_jgrave_n].f=g_frame; g_jgrave_n++; } }   /* full: kept (a few hundred bytes each) */
+static void job_grave_step(void){ for(int i=0;i<g_jgrave_n;) if(g_frame-g_jgrave[i].f>16){ free(g_jgrave[i].j); g_jgrave[i]=g_jgrave[--g_jgrave_n]; } else i++; }
+typedef void (APIENTRY* PFN_GPIV_)(GLuint,GLenum,GLint*);
+static void e_pcheck(void* a){   /* on the GL thread */
+  static PFN_GPIV_ gp; if(!gp) gp=(PFN_GPIV_)backend_gl_proc("glGetProgramiv");
+  int n=*(int*)a; PcEnt* e=(PcEnt*)((char*)a+16);
+  for(int i=0;i<n;i++){ GLint d=0; gp(e[i].p,0x91B1 /* GL_COMPLETION_STATUS_KHR */,&d);
+    if(d){ GLint ok=0; gp(e[i].p,GL_LINK_STATUS,&ok); __atomic_store_n(e[i].flag,ok? 1 : 2,__ATOMIC_RELEASE); } } }
+static void pc_step(void){   /* GPU thread, every 4th frame: on NVIDIA the GL thread's glGetProgramiv waits while the
+     driver's compile threads hold its compiler (e_pcheck took 224 ms on average, 49 times in a 13-minute session) */
+  if(g_frame&3) return;
+  int n=0; for(int i=0;i<g_pc_n;i++) if(!__atomic_load_n(&g_pc[i]->pflag,__ATOMIC_ACQUIRE)) n++;
+  for(int i=0;i<g_pcj_n;i++) if(!__atomic_load_n(&g_pcj[i]->state,__ATOMIC_ACQUIRE)) n++;
+  if(!n) return;
+  extern void* glq_alloc(size_t sz, size_t extra, void (*ex)(void*)); extern void glq_commit(void); extern int glq_active(void);
+  size_t sz=16+(size_t)n*sizeof(PcEnt); char* a= glq_active()? (char*)glq_alloc(sz,0,e_pcheck) : (char*)malloc(sz);
+  *(int*)a=n; PcEnt* e=(PcEnt*)(a+16); int k=0;
+  for(int i=0;i<g_pc_n && k<n;i++) if(!__atomic_load_n(&g_pc[i]->pflag,__ATOMIC_ACQUIRE)){ e[k].p=g_pc[i]->pp; e[k].flag=&g_pc[i]->pflag; k++; }
+  for(int i=0;i<g_pcj_n && k<n;i++) if(!__atomic_load_n(&g_pcj[i]->state,__ATOMIC_ACQUIRE)){ e[k].p=g_pcj[i]->prog; e[k].flag=&g_pcj[i]->state; k++; }
+  if(glq_active()) glq_commit(); else { e_pcheck(a); free(a); } }
+static void pc_drop(Sh* s){ for(int i=0;i<g_pc_n;i++) if(g_pc[i]==s){ g_pc[i]=g_pc[--g_pc_n]; return; } }
+
 static int sh_sep_ready(Sh* s){
   if(s->sps==2 || s->sps==3){ if(s->sj_up){   /* not 4: still compiling (below). As >=2 it counted as done with no program: 1 million draws skipped in a session */ int st=__atomic_load_n(&s->sj_up->state,__ATOMIC_ACQUIRE);   /* drawn with the pre-built stand-in: swap in the real one once built */
       if(st){ struct WJob* j=s->sj_up; s->sj_up=NULL; if(st==1 && j->prog){ s->sp=j->prog; s->lu_ok=0; sh_uloc(s); pack_add_sh(j->key,s); } free(j); } }
     return 1; }
   if(s->sps==4){ /* the driver is compiling it (GL_KHR_parallel_shader_compile): drawn once it is done */
-    GLint done=0; glGetProgramiv(s->pp,0x91B1 /* GL_COMPLETION_STATUS_KHR */,&done); if(!done) return 0;
-    GLint ok=0; glGetProgramiv(s->pp,GL_LINK_STATUS,&ok); GLuint p=s->pp; s->pp=0;
-    if(!ok){ char e[1024]; e[0]=0; glGetProgramInfoLog(p,sizeof e,NULL,e); WARN("shader %016llx (stage %d) failed to compile: %s\n",(unsigned long long)s->hash,s->stage,e); glDeleteProgram(p); s->sp=0; s->sps=3; return 1; }
+    int fl=__atomic_load_n(&s->pflag,__ATOMIC_ACQUIRE);
+    if(!fl && (g_must_wait || s->pidx<0)){ GLint done=0; glGetProgramiv(s->pp,0x91B1 /* GL_COMPLETION_STATUS_KHR */,&done);   /* must have it now, or not in the list */
+      if(done){ GLint ok=0; glGetProgramiv(s->pp,GL_LINK_STATUS,&ok); fl= ok? 1 : 2; } }
+    if(!fl && g_must_wait){ /* still in the driver's queue but needed now: drop it and compile it directly (below) */
+      if(s->pidx>=0) pc_drop(s); glDeleteProgram(s->pp); s->pp=0; s->sps=0; return sh_sep_ready(s); }
+    if(!fl) return 0;
+    if(s->pidx>=0) pc_drop(s);
+    GLuint p=s->pp; s->pp=0;
+    if(fl!=1){ char e[2048]; e[0]=0; glGetProgramInfoLog(p,sizeof e,NULL,e); WARN("shader %016llx (stage %d) failed to compile: %s\n",(unsigned long long)s->hash,s->stage,e); glDeleteProgram(p); s->sp=0; s->sps=3;
+      static int nd; if(nd<16 && s->src){ nd++; plat_mkdir("captures"); plat_mkdir("captures/failed"); char fp[200];
+        snprintf(fp,sizeof fp,"captures/failed/%016llx_%s.glsl",(unsigned long long)s->hash,s->stage==ST_VS?"vs":"fs"); FILE* f=fopen(fp,"w"); if(f){ fputs(s->src,f); fclose(f); } }
+      return 1; }
     binary_save(p,s->pkey,1); s->sp=p; s->sps=2; sh_uloc(s); pack_add_sh(s->pkey,s);
-    { u64 dt=plat_ns()-s->pt0; __atomic_add_fetch(&g_cmp_ns,dt,__ATOMIC_RELAXED); __atomic_add_fetch(&g_cmp_n,1,__ATOMIC_RELAXED); g_par_built++; if(dt>g_par_max) g_par_max=dt; }
+    { u64 dt=plat_ns()-s->pt0; __atomic_add_fetch(&g_cmp_ns,dt,__ATOMIC_RELAXED); __atomic_add_fetch(&g_cmp_n,1,__ATOMIC_RELAXED); g_par_built++; if(dt>g_par_max) g_par_max=dt;
+      /* slow driver builds (one took 24 s in the desert, its draws skipped all that time): which shader, how big, and its
+         GLSL in captures/slow_shaders/ to see what makes the driver work so hard */
+      if(dt>1000000000ull){ static int ns_; size_t len= s->src? strlen(s->src) : 0;
+        LOG("shaders: %s %016llx took the driver %.1f s to build (%zu bytes of GLSL)\n",s->stage==ST_VS?"VS":s->stage==ST_GS?"GS":"FS",(unsigned long long)s->hash,dt/1e9,len);
+        if(ns_<32 && s->src){ ns_++; plat_mkdir("captures"); plat_mkdir("captures/slow_shaders"); char fp[200];
+          snprintf(fp,sizeof fp,"captures/slow_shaders/%016llx_%s.glsl",(unsigned long long)s->hash,s->stage==ST_VS?"vs":s->stage==ST_GS?"gs":"fs");
+          FILE* f=fopen(fp,"w"); if(f){ fputs(s->src,f); fclose(f); } } } }
     return 1; }
   if(s->sps==1){ int st=__atomic_load_n(&s->sj->state,__ATOMIC_ACQUIRE); if(!st) return 0;
     struct WJob* j=s->sj; s->sj=NULL;
@@ -1474,12 +1619,22 @@ static int sh_sep_ready(Sh* s){
         free(u); warm_stage_put(fk,fp,ful); } } }
   struct WJob* j=calloc(1,sizeof *j); j->vs=s->src; j->key=key; j->keep=1; j->sep=1; j->stype= s->stage==ST_VS? GL_VERTEX_SHADER : s->stage==ST_GS? GL_GEOMETRY_SHADER : GL_FRAGMENT_SHADER;
   if(g_worker==1 && !g_sync_draws && wr_push(&wq_hi,j)){ s->sj=j; s->sps=1; return 0; }
-  if(g_par>0 && !g_sync_draws){ /* no compile thread but the driver compiles in parallel (NVIDIA on Windows): start it and
+  if(g_par>0 && !g_sync_draws && !g_must_wait){ /* at most g_cpf new ones a frame: NVIDIA parses each on the GL thread
+       (glCompileShader 20-170 ms), and a burst of dozens at once was a 1-1.5 s freeze; the rest wait a frame or two.
+       SWR_COMPILES_PER_FRAME=n, 0 = no limit */
+    static int cpf=-1; if(cpf<0){ const char* e=getenv("SWR_COMPILES_PER_FRAME"); cpf= e? atoi(e) : 2; }
+    if(g_cpf_frame!=g_frame){ g_cpf_frame=g_frame; g_cpf_n=0; }
+    if(cpf>0 && g_cpf_n>=(u32)cpf){ free(j); s->sps=0; return 0; }   /* not started yet: sps 0 so the next frame starts it */
+    g_cpf_n++;
+  }
+  if(g_par>0 && !g_sync_draws && !g_must_wait){ /* (a draw that must have it now compiles it below, not behind the driver's queue)
+       no compile thread but the driver compiles in parallel (NVIDIA on Windows): start it and
        draw once it is done (sps 4 above) instead of waiting here, 100-500 ms each (140 of them, 66 s, in a 3.5 min run) */
     GLuint a=glCreateShader(j->stype); const char* s1=s->src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
     GLuint p=glCreateProgram(); glAttachShader(p,a); p_glProgramParameteri(p,0x8258,GL_TRUE); if(g_pcache>0) p_glProgramParameteri(p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
     glLinkProgram(p); glDeleteShader(a);   /* flagged: freed together with the program */
-    s->pp=p; s->pkey=key; s->pt0=plat_ns(); s->sps=4; free(j); return 0; }
+    s->pp=p; s->pkey=key; s->pt0=plat_ns(); s->sps=4; s->pflag=0; s->pidx=-1; if(g_pc_n<1024){ g_pc[g_pc_n++]=s; s->pidx=1; }   /* pidx -1: list full, asked directly */
+    free(j); return 0; }
   /* no compile thread, do it inline */
   u64 inline_start=plat_ns();
   GLuint a=glCreateShader(j->stype); const char* s1=s->src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
@@ -1542,6 +1697,7 @@ static int sh_cb_read(u32 idx, u32 off, u32* out){ if(idx>=18) return 0; u64 a=g
 static Tex* g_rt[8]; static Tex* g_zt; static int g_nrt;
 
 /* RT memory signature; if the CPU or DMA overwrote it something else lives there now */
+static void state_dirty(void);
 static Tex* rt_texture(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth){
   GlFmt f= rt_format(fmt);
   u32 fkey=fmt|(depth? 0x10000 : 0);
@@ -1556,10 +1712,24 @@ static Tex* rt_texture(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth){
   Tex* t=tex_create(gva,w,h,1,1,GL_TEXTURE_2D,f,fkey,!((tile>>12)&1),(tile>>4)&15,(tile>>8)&15,0,1);
   glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
   /* seed from memory in case the CPU wrote it */
+  int seeded=0;
   if(!depth && !f.compressed && f.fmt==GL_RGBA && f.bpp==4){
     u64 sz=(u64)w*h*4; u8* lin=malloc(sz); u8* src=gmem_ptr(gva,sz*2);
-    if(src && t->bl){ deswizzle(lin,w*4,src,w*4,h,t->bh); glBindTexture(GL_TEXTURE_2D,t->id); glTexSubImage2D(GL_TEXTURE_2D,0,0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,lin); }
+    if(src && lin && t->bl){ deswizzle(lin,w*4,src,w*4,h,t->bh); glBindTexture(GL_TEXTURE_2D,t->id); glTexSubImage2D(GL_TEXTURE_2D,0,0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,lin); seeded=1; }
     free(lin); }
+  /* everything else starts as black (depth: far). glTexStorage leaves whatever was in video memory, and a target shown
+     before the game's first draw into it (the intro's first frames) flashed that as rainbow static */
+  if(!seeded && !f.compressed){
+    GLuint cf=0; glGenFramebuffers(1,&cf); glBindFramebuffer(GL_DRAW_FRAMEBUFFER,cf);
+    GLboolean sc=glIsEnabled(GL_SCISSOR_TEST); glDisable(GL_SCISSOR_TEST);
+    int fst= f.ifmt==GL_DEPTH24_STENCIL8 || f.ifmt==GL_DEPTH32F_STENCIL8;
+    if(depth){ glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,fst? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,t->id,0);
+      if(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE){ glDepthMask(GL_TRUE); glStencilMaskSeparate(GL_FRONT_AND_BACK,0xFF); glClearDepth(1.0); glClearStencil(0); glClear(GL_DEPTH_BUFFER_BIT|(fst? GL_STENCIL_BUFFER_BIT : 0)); } }
+    else { glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t->id,0); { GLenum bb=GL_COLOR_ATTACHMENT0; glDrawBuffers(1,&bb); }
+      if(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE){ glColorMaski(0,1,1,1,1);
+        if(f.is_int){ static const GLuint z[4]={0,0,0,0}; glClearBufferuiv(GL_COLOR,0,z); } else { glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT); } } }
+    if(sc) glEnable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); glDeleteFramebuffers(1,&cf); state_dirty(); mb_reset(); }
   t->hash=rt_sig(gva);
   return t; }
 
@@ -1872,7 +2042,7 @@ void gpu_gl_fps_overlay(void){
   int n=fps_overlay_rects(w,h,r,64); if(!n) return;
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0); glEnable(GL_SCISSOR_TEST); glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
   for(int i=0;i<n;i++){ glScissor(r[i][0],h-r[i][1]-r[i][3],r[i][2],r[i][3]);
-    if(r[i][4]) glClearColor(1.0f,0.92f,0.2f,1.0f); else glClearColor(0.0f,0.0f,0.0f,1.0f);
+    { extern void fps_overlay_color(int,float*); float c[3]; fps_overlay_color(r[i][4],c); glClearColor(c[0],c[1],c[2],1.0f); }
     glClear(GL_COLOR_BUFFER_BIT); }
   glDisable(GL_SCISSOR_TEST); state_dirty(); }
 
@@ -1993,7 +2163,7 @@ static void capture_draw(GpuChannel* ch, int indexed, u32 first, u32 count){
 #define GL_SHADER_STORAGE_BUFFER 0x90D2
 #endif
 static GLuint g_sbuf[3][16];
-static GLuint buf_cached(GLenum target, u64 start, u64 len);
+static GLuint buf_cached(GLenum target, u64 start, u64 len); static int g_vb_force; static u64 g_vbf_off, g_vbf_len;
 static GLenum img_fmt(GLenum f);
 /* image stores in vertex and pixel shaders (SUST): bind each image the shader writes at this draw, units 0-3 for the
    vertex stage and 4-7 for the pixel stage (shader.c), and make the next draw see the writes. The written texture is
@@ -2325,6 +2495,7 @@ static int getenv_cached_rtswz(void){ static int v=-1; if(v<0) v=getenv("SWR_OLD
    its first read after it was drawn this frame, so post effects, bloom and the HUD get the anti-aliased image. A new
    target has to win 30 frames in a row before DLSS moves to it; 30 frames without one (menus, videos) drop it */
 extern int snxvk_dlss_mode; extern int dlgl_failed(void);
+static void tr_stamp(int draw); static int g_tr_on;
 extern void dlgl_queue(GLuint color, GLuint depth, GLuint mv, GLenum zfmt, u32 w, u32 h, float jx, float jy, int reset);
 static struct {
   u64 reads[16]; int nreads; u64 written[8]; int nwritten;
@@ -2386,6 +2557,45 @@ static void e_tf(void* p){   /* on the GL thread, where the driver hands out the
 static void dmv_tf(int begin){   /* begin/end transform feedback: not in the queue's table, a custom entry on the GL thread */
   if(!glq_active()){ e_tf(&begin); return; }
   int* q=(int*)glq_alloc(sizeof(int),0,e_tf); *q=begin; glq_commit(); }
+/* the game's transform feedback around a draw: each enabled buffer (0xE0 + 8*i: enable, address, size, start offset)
+   gets a GL buffer holding guest memory's current bytes (so what the draw doesn't write stays), bound for capture; after
+   the draw the captured bytes go to compute's staging buffer as a pending write (cs_stage_add): later draws read them
+   on the GPU, and they land in guest memory at the end of the submit */
+static void cs_stage_add(GLuint src, u64 addr, u32 size);
+static GLuint g_xfbb[4]; static u32 g_xfbcap[4], g_xfbsz[4], g_xfb_bound; static u64 g_xfba[4]; static u64 st_xfb_draws;
+/* bytes in each stream-out buffer after the last capture (its start offset + what that draw wrote): what the
+   StreamingByteCount report stores and what a DrawTransformFeedback (byte-count draw, 0x48F) later draws from */
+static u32 g_so_fill[4];
+u32 gpu_gl_so_bytes(int i){ return g_so_fill[i&3]; }
+static void e_tfm(void* p){
+  if(!r_btf){ r_btf=(PFN_BTF)backend_gl_proc("glBeginTransformFeedback"); r_etf=(PFN_ETF)backend_gl_proc("glEndTransformFeedback"); }
+  if(!r_btf || !r_etf){ g_tf_missing=1; return; }
+  GLenum m=*(GLenum*)p; if(m) r_btf(m); else r_etf(); }
+static void tfm(GLenum m){ if(!glq_active()){ e_tfm(&m); return; } GLenum* q=(GLenum*)glq_alloc(sizeof(GLenum),0,e_tfm); *q=m; glq_commit(); }
+static int game_xfb_begin(u32* r, GLenum mode, u32 count, u32 instances){
+  /* only the bytes this draw writes (its output vertices x the buffer's stride): the buffers are sized for the most the
+     game ever captures (15.7 and 11.9 MB for the desert terrain's 457 points), and uploading, copying and reading back
+     all of it every draw cost ~80 MB of transfers a frame, 25 FPS in the desert */
+  u64 verts= mode==GL_POINTS? count : mode==GL_LINES? count/2*2 : (mode==GL_LINE_STRIP || mode==GL_LINE_LOOP)? (count>1? (u64)(count-1)*2 : 0)
+           : mode==GL_TRIANGLES? count/3*3 : (count>2? (u64)(count-2)*3 : 0);
+  verts*= instances? instances : 1;
+  u32 bound=0;
+  for(int i=0;i<4;i++){ const u32* t=&r[0xE0+8*i]; i32 size=(i32)t[3]; u64 a=(((u64)(t[1]&0xFF)<<32)|t[2])+t[4];
+    if(!t[0] || size<=0 || !(r[0x1C1+4*i]|r[0x1C2+4*i])) continue;
+    u64 stride= r[0x1C2+4*i]? r[0x1C2+4*i] : (u64)r[0x1C1+4*i]*4; u64 bytes=verts*stride; if(bytes>(u64)size) bytes=(u64)size; bytes&=~3ull;
+    if(!bytes || bytes>(64u<<20)) continue;
+    if(!g_xfbb[i]) glGenBuffers(1,&g_xfbb[i]);
+    if(g_xfbcap[i]<(u32)bytes){ glBindBuffer(GL_TRANSFORM_FEEDBACK_BUFFER,g_xfbb[i]); glBufferData(GL_TRANSFORM_FEEDBACK_BUFFER,(GLsizeiptr)bytes,NULL,GL_DYNAMIC_COPY); g_xfbcap[i]=(u32)bytes; }
+    glBindBufferRange(GL_TRANSFORM_FEEDBACK_BUFFER,(GLuint)i,g_xfbb[i],0,(GLsizeiptr)bytes);
+    g_xfba[i]=a; g_xfbsz[i]=(u32)bytes; g_so_fill[i]=t[4]+(u32)bytes; bound|=1u<<i; }
+  if(!bound) return 0;
+  GLenum pm= mode==GL_POINTS? GL_POINTS : (mode==GL_LINES || mode==GL_LINE_STRIP || mode==GL_LINE_LOOP)? GL_LINES : GL_TRIANGLES;
+  tfm(pm); g_xfb_bound=bound; return 1; }
+static void game_xfb_end(void){
+  tfm(0);
+  for(int i=0;i<4;i++) if(g_xfb_bound>>i&1){ cs_stage_add(g_xfbb[i],g_xfba[i],g_xfbsz[i]); trace_note("  transform feedback: buffer %d -> %llx, %u bytes\n",i,(unsigned long long)g_xfba[i],g_xfbsz[i]); }
+  g_xfb_bound=0; st_xfb_draws++;
+  { static int said; if(said<3){ said++; LOG("gpu: transform feedback captured %u + %u bytes (buffers at %llx, %llx)\n",g_xfbsz[0],g_xfbsz[1],(unsigned long long)g_xfba[0],(unsigned long long)g_xfba[1]); } } }
 static float halton(u32 i, u32 b){ float f=1, r=0; for(;i;i/=b){ f/=(float)b; r+=f*(float)(i%b); } return r; }
 static int dlg_scene_draw(void){ return dlg_on() && !g_dmv.failed && g_dlg.chosen && !g_dlg.done && g_zt && g_zt->gva==g_dlg.chosen_z; }
 /* r3d_draw_gl, before apply_state: this draw's jitter */
@@ -2470,7 +2680,9 @@ static int dlg_eval(void){
   if(!t || !z) return 0;
   u32 w=SC(t->w), h=SC(t->h);
   GLuint mv=dlg_mv_pass(z,w,h);
+  if(g_tr_on) tr_stamp(99999);   /* DLAA timed as "draw 99999" in a traced frame */
   dlgl_queue(t->id,z->id,mv,z->f.ifmt,w,h,g_dmv.jit_used? g_dmv.jx : 0.0f,g_dmv.jit_used? g_dmv.jy : 0.0f,g_dlg.reset);
+  if(g_tr_on) tr_stamp(-99999);
   g_dlg.reset=0; t->wgen++; g_dlg.evals++; g_dlg.evaluated=1;
   { static int said; if(!said){ said=1; LOG("dlaa (OpenGL): scene target %llx %ux%u, depth %llx\n",(unsigned long long)t->gva,w,h,(unsigned long long)z->gva); } }
   return 1; }
@@ -2695,7 +2907,30 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len){
   /* Small vertex/index streams include full-screen postprocessing quads.
      CPU writes are not tracked by the GPU write log; validate their bytes
      even when a command submission or write-watch page stays unchanged. */
+  /* Per-instance streams: check only the slice this draw reads (its first instance's record to its last). The pool is
+     one region of up to 16+ MB shared by every instanced draw; re-hashing all of it each submit was ~72 MB a frame in
+     the desert (48 FPS). A changed slice is uploaded alone; each slice is checked once per submit. */
+  if(g_vb_force && e && len>4096 && e->hash!=~0ull && g_vbf_len){
+    u64 so=g_vbf_off, sn=g_vbf_len; if(so<len){ if(so+sn>len) sn=len-so;
+      static struct { VbC* e; u64 so, sn, h; u32 epoch; } sl[4096];
+      u32 sk=(u32)(((uintptr_t)e>>4)^(so*0x9E3779B1u)^(sn<<7))&4095;
+      if(sl[sk].e==e && sl[sk].so==so && sl[sk].sn==sn && sl[sk].epoch==g_submit_epoch){ glBindBuffer(target,e->id); return e->id; }
+      u8* sp=gmem_ptr(start+so,sn);
+      if(sp){ u64 hs=fast_hash(sp,sn,0x534C4943u); st_vb_hashed+=sn; glBindBuffer(target,e->id);
+        if(!(sl[sk].e==e && sl[sk].so==so && sl[sk].sn==sn && sl[sk].h==hs)){
+          glBufferSubData(target,(GLintptr)so,(GLsizeiptr)sn,sp); st_vb_up+=sn; e->stable=0; }
+        sl[sk].e=e; sl[sk].so=so; sl[sk].sn=sn; sl[sk].h=hs; sl[sk].epoch=g_submit_epoch; e->epoch=g_submit_epoch;
+        return e->id; } } }
   if(e && len>4096 && e->epoch==g_submit_epoch){ glBindBuffer(target,e->id); return e->id; }
+  /* Per-instance streams skip the sampled shortcuts below: the desert terrain's patch list is rewritten a few entries
+     at a time as you move, which 62 sampled spots missed for seconds; patches kept old places and left holes (a magenta
+     traced frame showed no terrain draw covering them) */
+  int skip_ok=1;
+  if(g_vb_force && e && len>4096){ skip_ok=0;
+    u8* fs_=gmem_ptr(start,len); if(fs_){ u64 hf=fast_hash(fs_,len,0); st_vb_hashed+=len;
+      if(hf==e->hash){ e->epoch=g_submit_epoch; e->chk_epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; }
+      if(e->stable>=16){ static int said; if(said<60){ said++; LOG("gpu: instance stream %llx (%llu bytes) changed while it looked stable (the sampled check would have kept the old one)\n",(unsigned long long)start,(unsigned long long)len); } } } }
+  if(skip_ok){
   /* nobody touched it since last time (still rechecked every 240 submits) */
   if(e && len>4096 && g_ww>0 && e->cpu && g_submit_epoch-e->chk_epoch<240 && gmmu_translate(start)==e->cpu && !ww_dirty(e->cpu,len,e->chk_epoch)){
     e->epoch=g_submit_epoch; st_ww_skip++; glBindBuffer(target,e->id); return e->id; }
@@ -2709,6 +2944,7 @@ static GLuint buf_cached(GLenum target, u64 start, u64 len){
     if(g_submit_epoch-e->schk<4){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; }
     u64 sh=sample_hash(start,len); e->schk=g_submit_epoch; st_vb_hashed+=2048;
     if(sh==e->shash){ e->epoch=g_submit_epoch; glBindBuffer(target,e->id); return e->id; } }
+  }   /* skip_ok */
   u8* src=gmem_ptr(start,len); u64 cpu= src? (u64)(src-g_mem) : 0;
   if(!src){ if(g_stage_cap<len){ u8* nb=realloc(g_stage_buf,len); if(!nb) return 0; g_stage_buf=nb; g_stage_cap=len; } gmem_read(start,g_stage_buf,len); src=g_stage_buf; }
   u64 h=fast_hash(src,len,0); st_vb_hashed+=len;
@@ -2762,14 +2998,39 @@ static void tr_thumb(Tex* t, char* out){ state_dirty();
   u64 h=fast_hash(px,sizeof px,0); if(h==t->tr_last){ strcpy(out,"(no change)"); return; }
   t->tr_last=h; char p[128]; snprintf(p,sizeof p,"%s/d%04d.ppm",g_tr_dir,g_tr_n); tr_save(p,px,TRW,TRH); g_tr_img++; snprintf(out,32,"d%04d.ppm",g_tr_n); }
 
+/* The centre line hunt: after a draw, a full-height strip 8 pixels wide around the viewport's centre column (the
+   viewport x translate, scaled like the target), read as floats so bright HDR areas don't clip. seam = how much the
+   biggest step between the 4 middle columns exceeds the steps at the strip's edges, averaged over rows, absolute and
+   relative to the strip's mean brightness. The first draw whose seam jumps is the one that makes the line. */
+static void tr_seam(Tex* t, float cx){
+  if(!t || t->f.depth || t->f.is_int || t->target!=GL_TEXTURE_2D || t->w<64) return;
+  u32 W=SC(t->w), H=SC(t->h); int c=(int)((double)cx*W/t->w+0.5); if(c<4 || c+4>(int)W) return;
+  static float* px; static u32 cap; if(cap<H*8*4){ free(px); cap=H*8*4; px=malloc((size_t)cap*4); if(!px){ cap=0; return; } }
+  GLboolean sc=glIsEnabled(GL_SCISSOR_TEST); glDisable(GL_SCISSOR_TEST);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t->id,0); glReadBuffer(GL_COLOR_ATTACHMENT0);
+  glPixelStorei(GL_PACK_ALIGNMENT,4); glReadPixels(c-4,0,8,(GLsizei)H,GL_RGBA,GL_FLOAT,px);
+  glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); if(sc) glEnable(GL_SCISSOR_TEST); state_dirty(); mb_reset();
+  double seam=0, lum=0;
+  for(u32 y=0;y<H;y++){ float L[8]; for(int i=0;i<8;i++){ const float* q=px+((size_t)y*8+i)*4; L[i]=q[0]+q[1]+q[2]; if(!(L[i]==L[i])) L[i]=0; lum+=L[i]; }
+    float s[7]; for(int i=0;i<7;i++) s[i]=fabsf(L[i+1]-L[i]);
+    float mid=s[2]; if(s[3]>mid) mid=s[3]; if(s[4]>mid) mid=s[4];
+    float base=(s[0]+s[6])*0.5f; seam+= mid>base? mid-base : 0; }
+  seam/=H; lum/=(double)H*8;
+  trace_note("  seam rt0 at x=%d of %u: %.4f (relative %.4f)\n",c,W,seam,lum>1e-6? seam/lum : 0.0); }
+
 static int tr_tex_id(Tex* t){ if(!t) return -1; for(int i=0;i<g_tr_ntex;i++) if(g_tr_tex[i]==t) return i; if(g_tr_ntex<2048){ g_tr_tex[g_tr_ntex]=t; return g_tr_ntex++; } return -1; }
 
 static void tr_shader(u64 addr, Sh* sh, int stage){
   if(!sh) return; for(int i=0;i<g_tr_nsh;i++) if(g_tr_sh[i]==sh->hash) return; if(g_tr_nsh>=1024) return; g_tr_sh[g_tr_nsh++]=sh->hash;
-  u8* b=malloc(0x8000); gmem_read(addr,b,0x8000); char p[128];
-  snprintf(p,sizeof p,"%s/sh_%016llx_%s.bin",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); }
+  /* one shared folder per translator version (captures/shaders/<TR_VER>), each shader written once: a copy in every
+     trace folder had grown to 52,000 files */
+  char p[128]; { static int made; if(!made){ made=1; plat_mkdir("captures/shaders"); snprintf(p,sizeof p,"captures/shaders/%d",TR_VER); plat_mkdir(p); } }
+  snprintf(p,sizeof p,"captures/shaders/%d/sh_%016llx_%s.glsl",TR_VER,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs");
+  { FILE* ex=fopen(p,"rb"); if(ex){ fclose(ex); trace_note("  shader %016llx %s: %d untranslated%s%s, failed=%d\n",(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs",sh->si.unsupported,sh->si.unsupported?" first: ":"",sh->si.first_unsupported,sh->failed); return; } }
+  u8* b=malloc(0x8000); gmem_read(addr,b,0x8000);
+  snprintf(p,sizeof p,"captures/shaders/%d/sh_%016llx_%s.bin",TR_VER,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); FILE* f=fopen(p,"wb"); if(f){ fwrite(b,1,0x8000,f); fclose(f); }
   ShaderInfo si; memset(&si,0,sizeof si); si.attr_int_mask=sh->si.attr_int_mask; si.attr_sint_mask=sh->si.attr_sint_mask; char* g=shader_to_glsl(b,0x8000,stage,&si);
-  if(g){ snprintf(p,sizeof p,"%s/sh_%016llx_%s.glsl",g_tr_dir,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); f=fopen(p,"wb"); if(f){ fputs(g,f); fclose(f); } free(g); }
+  if(g){ snprintf(p,sizeof p,"captures/shaders/%d/sh_%016llx_%s.glsl",TR_VER,(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs"); f=fopen(p,"wb"); if(f){ fputs(g,f); fclose(f); } free(g); }
   free(b);
   trace_note("  shader %016llx %s: %d untranslated%s%s, failed=%d\n",(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs",sh->si.unsupported,sh->si.unsupported?" first: ":"",sh->si.first_unsupported,sh->failed); }
 
@@ -2784,6 +3045,30 @@ static void tr_textures(GpuChannel* ch, int stage, Sh* sh){
       st->type,st->array?" array":"",st->shadow?" shadow":"",tic[0]&0x7FFFF,(tic[4]&0xFFFF)+1,(tic[5]&0xFFFF)+1,((tic[5]>>16)&0x3FFF)+1,(tic[4]>>23)&0xF,((tic[3]>>28)&0xF)+1,(tic[4]>>22)&1,
       (unsigned long long)(((u64)(tic[2]&0xFFFF)<<32)|tic[1]),(tic[0]>>19)&0xFFF,t? (t->is_rt? "RT" : "tex") : "NULL",tr_tex_id(t),t?t->w:0,t?t->h:0,tsc[0],tsc[1],tsc[2],tic[3],tic[4],tic[5],tic[6],tic[7]); } }
 
+/* GPU time per draw in a traced frame (the map hunt: its frames waited on the GPU inside DLAA). A timestamp before and
+   after each draw, on the GL thread through custom queue entries; read back at the end of the frame into
+   <trace>/gpu_times.txt. The trace's own readbacks happen between draws, outside the before/after pairs */
+#define TS_MAX 16384
+typedef void (APIENTRY* PFN_QC_)(GLuint,GLenum); typedef void (APIENTRY* PFN_GQ_)(GLsizei,GLuint*); typedef void (APIENTRY* PFN_GQO64_)(GLuint,GLenum,GLuint64*);
+static PFN_QC_ p_qc; static PFN_GQ_ p_gq; static PFN_GQO64_ p_gqo; static GLuint g_tsq[TS_MAX]; static int g_tsd[TS_MAX]; static int g_ts_n, g_ts_ok=-1;
+static void e_ts_stamp(void* p){   /* GL thread */
+  if(g_ts_ok<0){ p_qc=(PFN_QC_)backend_gl_proc("glQueryCounter"); p_gq=(PFN_GQ_)backend_gl_proc("glGenQueries"); p_gqo=(PFN_GQO64_)backend_gl_proc("glGetQueryObjectui64v");
+    g_ts_ok= p_qc && p_gq && p_gqo; if(g_ts_ok) p_gq(TS_MAX,g_tsq); }
+  if(!g_ts_ok) return; int i=*(int*)p; if(i>=0 && i<TS_MAX) p_qc(g_tsq[i],GL_TIMESTAMP); }
+static void tr_stamp(int draw){   /* draw > 0: before draw #draw, < 0: after it */
+  if(g_ts_n>=TS_MAX) return; int i=g_ts_n++; g_tsd[i]=draw;
+  if(!glq_active()){ e_ts_stamp(&i); return; }
+  int* q=(int*)glq_alloc(sizeof(int),0,e_ts_stamp); *q=i; glq_commit(); }
+typedef struct { int n; char path[200]; } TsRead;
+static void e_ts_read(void* p){   /* GL thread, end of the traced frame: pairs -> per-draw GPU microseconds */
+  TsRead* r=(TsRead*)p; if(!g_ts_ok || r->n<2) return;
+  static GLuint64 t[TS_MAX]; for(int i=0;i<r->n;i++) p_gqo(g_tsq[i],GL_QUERY_RESULT,&t[i]);
+  FILE* f=fopen(r->path,"w"); if(!f) return;
+  fprintf(f,"# GPU time of each draw in this traced frame (timestamps before and after it), microseconds\n");
+  double sum=0; int nd=0;
+  for(int i=0;i+1<r->n;i++) if(g_tsd[i]>0 && g_tsd[i+1]==-g_tsd[i]){ double us=(double)(t[i+1]-t[i])/1000.0; sum+=us; nd++; fprintf(f,"#%d %.1f\n",g_tsd[i],us); }
+  fprintf(f,"# %d draws, %.2f ms of GPU time inside draws; first to last timestamp %.2f ms\n",nd,sum/1000.0,(double)(t[r->n-1]-t[0])/1e6);
+  fclose(f); }
 static void tr_draw(GpuChannel* ch, Sh* vs, Sh* fs, u64 vsa, u64 fsa, int indexed, u32 topology, u32 count, u32 instances){
   if(!g_tr_on || g_tr_n>=6000) return; u32* r=ch->r3d; g_tr_n++;
   float vt[6]; memcpy(vt,&r[0x280],24); float ref; memcpy(&ref,&r[0x4C4],4);
@@ -2794,6 +3079,7 @@ static void tr_draw(GpuChannel* ch, Sh* vs, Sh* fs, u64 vsa, u64 fsa, int indexe
     trace_note("  z %llx %ux%u fmt=%x test=%u func=%x write=%u stencil=%u zscale=%.9g ztrans=%.9g range=%.9g..%.9g mode=%u\n",(unsigned long long)g_zt->gva,g_zt->w,g_zt->h,g_zt->fkey,r[0x4B3],r[0x4C3],r[0x4BA],r[0x4E0],vt[2],vt[5],dn,df,r[0x35F]&1); }
   trace_note("  blend en=%u,%u indep=%u common[sep=%u eq=%x src=%x dst=%x eqa=%x srca=%x dsta=%x] ind0[%x %x %x %x %x %x %x] mask=%x/%x common=%u srgb=%u alphatest=%u f=%x ref=%.3f cull=%u/%x vp(%.0f,%.0f,%.0f,%.0f) origin=%x yctl=%x vpctl=%x\n",
     r[0x4D8],r[0x4D9],r[0x4B9],r[0x4CF],r[0x4D0],r[0x4D1],r[0x4D2],r[0x4D3],r[0x4D4],r[0x4D6],r[0x780],r[0x781],r[0x782],r[0x783],r[0x784],r[0x785],r[0x786],r[0x680],r[0x681],r[0x3E4],r[0x4B8],r[0x4BB],r[0x4C5],ref,r[0x646],r[0x648],vt[0],vt[1],vt[3],vt[4],r[0x4EB],r[0x5E4],r[0x35F]);
+  if(r[0x380]&1) trace_note("  scissor x=%u..%u y=%u..%u\n",r[0x381]&0xFFFF,r[0x381]>>16,r[0x382]&0xFFFF,r[0x382]>>16);
   tr_shader(vsa,vs,ST_VS); if(fsa) tr_shader(fsa,fs,ST_FS);
   tr_textures(ch,0,vs); if(fsa) tr_textures(ch,4,fs);
   { static int all=-1; if(all<0) all=getenv("SWR_TRACE_CB_ALL")!=NULL;   /* test only: constants of every draw (camera matrices) */
@@ -2802,7 +3088,11 @@ static void tr_draw(GpuChannel* ch, Sh* vs, Sh* fs, u64 vsa, u64 fsa, int indexe
     for(int st=0;st<2;st++){ Sh* sh= st? fs : vs; int stg= st? 4 : 0; if(!sh || (st && !fsa)) continue;
       for(int ci=0;ci<18;ci++) if(sh->si.cbuf_mask&(1u<<ci)){ u64 ca=g_cb.cb[stg][ci]; if(!ca) continue; float v[128]; gmem_read(ca,v,sizeof v);
         trace_note("  %s cb%d @%llx:",st? "fs" : "vs",ci,(unsigned long long)ca); for(int k=0;k<nv;k++) trace_note(" d[%d]=(%.6g,%.6g,%.6g,%.6g)",k,v[k*4],v[k*4+1],v[k*4+2],v[k*4+3]); trace_note("\n"); } } } }
-  char nm[40]; tr_thumb(g_rt[0],nm); trace_note("  result rt0: %s\n",nm); }
+  /* the centre split hunt: a material's light-grid constants (tile scale, stride, mask) are in its cb7 */
+  if(count>6 && fs && fsa && (fs->si.cbuf_mask&(1u<<7)) && g_cb.cb[4][7]){ u32 v[12]; gmem_read(g_cb.cb[4][7],v,sizeof v); float fv[12]; memcpy(fv,v,sizeof v);
+    trace_note("  fs cb7 @%llx: d[0]=(%.6g,%.6g,%.6g,%.6g) d[1]=(%.6g,%.6g,%.6g,%.6g) d[2]=(%08x,%08x,%08x,%08x)\n",(unsigned long long)g_cb.cb[4][7],fv[0],fv[1],fv[2],fv[3],fv[4],fv[5],fv[6],fv[7],v[8],v[9],v[10],v[11]); }
+  char nm[40]; tr_thumb(g_rt[0],nm); trace_note("  result rt0: %s\n",nm);
+  if(strcmp(nm,"(no change)") && strcmp(nm,"-")) tr_seam(g_rt[0],vt[3]); }
 
 static void trace_frame(void){
   if(g_tr_on){
@@ -2816,6 +3106,7 @@ static void trace_frame(void){
           for(u32 k=0;k<W*H*D;k++) for(int c=0;c<4;c++) m[c]+=px[k*4+c];
           trace_note("   texel0=(%.4g,%.4g,%.4g,%.4g) mean=(%.4g,%.4g,%.4g,%.4g)\n",px[0],px[1],px[2],px[3],m[0]/(W*H*D),m[1]/(W*H*D),m[2]/(W*H*D),m[3]/(W*H*D)); free(px); mb_reset(); } }
       if(t->f.depth || t->f.is_int || (t->target!=GL_TEXTURE_2D && t->target!=GL_TEXTURE_2D_ARRAY)) continue;
+      { static int td=-1; if(td<0) td=getenv("SWR_TRACE_TEX")!=NULL; if(!td) continue; }   /* texture images: 29 GB over 230 traces, on request only */
       /* GPU downsizes to max 512 and we read only that; layer 0 for arrays */
       u32 w=t->is_rt? SC(t->w) : t->w, h=t->is_rt? SC(t->h) : t->h;
       u32 st=1; while(w/st>512 || h/st>512) st*=2; u32 ow=w/st? w/st : 1, oh=h/st? h/st : 1;
@@ -2834,14 +3125,26 @@ static void trace_frame(void){
           for(u32 y=0;y<oh;y++) for(u32 x=0;x<ow;x++) memcpy(o+((size_t)y*ow+x)*4,px+((size_t)y*st*w+x*st)*4,4); free(px); ok=1; } }
       if(ok){ char p[160]; snprintf(p,sizeof p,"%s/tex%03d_%llx_%ux%u_f%x%s.ppm",g_tr_dir,i,(unsigned long long)t->gva,t->w,t->h,t->fkey,t->is_rt?"_rt":""); tr_save(p,o,ow,oh); }
       free(o); }
+    { TsRead rr; rr.n=g_ts_n; snprintf(rr.path,sizeof rr.path,"%s/gpu_times.txt",g_tr_dir);
+      if(!glq_active()) e_ts_read(&rr); else { TsRead* q=(TsRead*)glq_alloc(sizeof *q,0,e_ts_read); *q=rr; glq_commit(); } }
     fclose(g_tr); g_tr=NULL; g_tr_on=0; LOG("trace: frame saved in %s (%d draws, %d images)\n",g_tr_dir,g_tr_n,g_tr_img); fflush(NULL); }
   { static int envf=-2; if(envf==-2){ const char* e=getenv("SWR_TRACE"); envf= e? atoi(e) : -1; } if(envf>=0 && (int)g_frame==envf) g_tr_arm=1; }
   if(g_tr_arm){ g_tr_arm=0; plat_mkdir("captures"); plat_mkdir("captures/traces");
     /* each F5 in its own folder (captures/traces/001, 002, ...): one trace.txt was overwritten by the next F5 */
     { static int nt; char q[96]; do snprintf(g_tr_dir,sizeof g_tr_dir,"captures/traces/%03d",++nt), snprintf(q,sizeof q,"%s/trace.txt",g_tr_dir); while(nt<999 && (g_tr=fopen(q,"rb"))!=NULL && !fclose(g_tr)); plat_mkdir(g_tr_dir); g_tr=fopen(q,"w"); }
-    g_tr_on= g_tr!=NULL; g_tr_n=0; g_tr_img=0; g_tr_ntex=0; g_tr_nsh=0;
+    g_tr_on= g_tr!=NULL; g_tr_n=0; g_tr_img=0; g_tr_ntex=0; g_tr_nsh=0; g_ts_n=0;
     for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) t->tr_last=0;
-    LOG("trace: recording the next frame...\n"); }
+    /* the traced frame starts from magenta on the scene target (1400..1500 wide): with a still camera every draw only
+       repeats last frame's pixels, so nothing showed which draw paints what. Still magenta at the end = never painted */
+    { GLuint mf=0; glGenFramebuffers(1,&mf); glBindFramebuffer(GL_DRAW_FRAMEBUFFER,mf); glDisable(GL_SCISSOR_TEST); glColorMaski(0,1,1,1,1); { GLenum bb=GL_COLOR_ATTACHMENT0; glDrawBuffers(1,&bb); }
+      for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && !t->f.depth && !t->f.is_int && t->target==GL_TEXTURE_2D && t->w>=1400 && t->w<1500 && t->gva!=~0ull){
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t->id,0);
+        if(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE){ glClearColor(1.f,0.f,1.f,1.f); glClear(GL_COLOR_BUFFER_BIT); LOG("trace: scene target %llx %ux%u cleared to magenta\n",(unsigned long long)t->gva,t->w,t->h); } }
+      glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); glDeleteFramebuffers(1,&mf); state_dirty(); mb_reset(); }
+    LOG("trace: recording the next frame...\n");
+    { extern volatile int g_shot8_req; g_shot8_req=1; }
+    { extern int plat_prof_window(const char*,int); char pp[340]; snprintf(pp,sizeof pp,"%s/threads.csv",g_tr_dir);   /* profile=1: every thread for 10 s */
+      if(plat_prof_window(pp,10000)) LOG("profile: sampling every thread for 10 s into %s\n",pp); } }   /* the traced frame also as a full-size F8 screenshot (the trace's own images are 512 wide) */
 }
 static void lsfg_pump(void); static int g_lfn;
 void cs_flush_pending(void);
@@ -2868,8 +3171,13 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
   /* stage slots: 0 VertexA, 1 VertexB, 2 TessCtrl, 3 TessEval, 4 Geometry, 5 Fragment.
      VertexB is always on even with the enable bit clear (NVN doesn't set it) */
   g_last_r3d=r;
+  static XfbKey xk; int xfb_on=0;
+  if((r[0x1D1]&1) && !((r[0x820]|r[0x830]|r[0x840])&1)){ memset(&xk,0,sizeof xk);
+    for(int i=0;i<4;i++){ u32 words=r[0x1C1+4*i]; xk.count[i]=(u8)(words>128? 128 : words); xk.stride[i]=(u16)r[0x1C2+4*i]; memcpy(xk.layout[i],&r[0xA00+0x20*i],128); }
+    if(xk.count[0]|xk.count[1]|xk.count[2]|xk.count[3]){ xfb_on=1; g_vs_xfb=&xk; g_vs_xfb_hash=(u32)fast_hash((const u8*)&xk,sizeof xk,0x58464231u)|1u; } }
   for(int i=1;i<6;i+=4){ u32 cfg=r[0x800+i*0x10]; if(i!=1 && !(cfg&1)) continue; u64 addr=code+r[0x801+i*0x10];
     if(i==1) TM(TM_SH,vs=shader_get(addr,ST_VS,attr_int,attr_sint)); else TM(TM_SH,fs=fs_get_keyed(ch,addr)); }
+  g_vs_xfb=NULL;
   /* geometry stage (separate programs only): keyed by the input primitive and the vertex stage's outputs, which a
      passthrough shader sends on. SWR_NO_GS=1: draw without it as before */
   Sh* gs=NULL;
@@ -2898,9 +3206,18 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
   int must_wait=0;
   { u32 ctl=r[0x487]; if((ctl&15)>=1){ u32* q=&r[0x200+((ctl>>4)&7)*0x10];
       if(q[0]|q[1]){ if(((q[5]>>16)&1) || (q[6]&0xFFFF)>1 || (q[2] && q[3] && q[2]<=64 && q[3]<=64)) must_wait=1; } } }
-  if(must_wait && g_sep>0){ u64 t0=plat_ns(); while((!sh_sep_ready(vs) || !sh_sep_ready(fs)) && plat_ns()-t0<3000000000ull) plat_sleep_ns(500000); st_waited++; }
+  /* on a loading screen or fade (and the first frame after it) a draw waits for its shaders instead of being skipped,
+     within the frame's budget: the area appears whole instead of with missing pieces. During play nothing changes */
+  extern volatile unsigned long long g_video_last_ns;
+  if(!must_wait && g_sep>0 && g_lf_light && !getenv_cached_nolw() && plat_ns()-g_video_last_ns>2000000000ull &&((vs->sps!=2 && vs->sps!=3) || (fs->sps!=2 && fs->sps!=3))){
+    u64 budget= g_lf_reveal? 1000000000ull : 250000000ull;
+    if(g_lf_wait_ns<budget){ u64 t0=plat_ns(); g_must_wait=1;
+      while((!sh_sep_ready(vs) || !sh_sep_ready(fs)) && plat_ns()-t0<budget-g_lf_wait_ns) plat_sleep_ns(500000);
+      g_must_wait=0; u64 dt=plat_ns()-t0; g_lf_wait_ns+=dt; st_lf_waits++; st_lf_wait_ns+=dt; } }
+  if(must_wait && g_sep>0){ u64 t0=plat_ns(); g_must_wait=1; while((!sh_sep_ready(vs) || !sh_sep_ready(fs)) && plat_ns()-t0<3000000000ull) plat_sleep_ns(500000); g_must_wait=0; st_waited++;
+    { u64 dt=plat_ns()-t0; static int said; if(dt>100000000ull && said<200){ said++; LOG("shaders: a draw that must have its shaders waited %.0f ms (vs %016llx fs %016llx)\n",dt/1e6,(unsigned long long)vs->hash,(unsigned long long)fs->hash); } } }
   if(g_sep>0){ int rv, rf; TM(TM_SHREADY,(rv=sh_sep_ready(vs), rf=sh_sep_ready(fs)));
-    if(gs && must_wait){ u64 t0=plat_ns(); while(!sh_sep_ready(gs) && plat_ns()-t0<3000000000ull) plat_sleep_ns(500000); }
+    if(gs && must_wait){ u64 t0=plat_ns(); g_must_wait=1; while(!sh_sep_ready(gs) && plat_ns()-t0<3000000000ull) plat_sleep_ns(500000); g_must_wait=0; }
     if(gs && !sh_sep_ready(gs)){ st_compiling++; trace_note("DRAW SKIPPED: compiling\n"); return; }
     if(gs && !gs->sp) gs=NULL;   /* failed to compile: draw without it, as before */
     if(!rv || !rf){ st_compiling++; trace_note("DRAW SKIPPED: compiling\n"); return; }
@@ -3005,7 +3322,9 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
       if(share && lim>=start){ static u64 vl_lim[2048], vl_lo[2048]; u32 h=(u32)((lim>>4)^(lim>>20))&2047;
         if(vl_lim[h]!=lim || start<vl_lo[h]){ if(vl_lim[h]==lim && vl_lo[h]-start>(16u<<20)) vl_lo[h]=start; else if(vl_lim[h]!=lim){ vl_lim[h]=lim; vl_lo[h]=start; } else vl_lo[h]=start; }
         if(start-vl_lo[h]<=(16u<<20)){ vb_base=vl_lo[h]; len=lim-vb_base+1; if(len>64u<<20){ len=64u<<20; vb_base=start; len=lim-start+1; if(len>64u<<20) len=64u<<20; } } } }
-    GLuint vbid=buf_cached(GL_ARRAY_BUFFER,vb_base,len); off+=(u32)(start-vb_base);
+    g_vb_force= r[0x620+buf]!=0;   /* per-instance stream (the terrain's patch list): the slice this draw reads is checked */
+    g_vbf_off=start-vb_base; g_vbf_len= stride? ((u64)base_instance+(instances? instances : 1)+1)*stride : 256;
+    GLuint vbid=buf_cached(GL_ARRAY_BUFFER,vb_base,len); off+=(u32)(start-vb_base); g_vb_force=0; g_vbf_len=0;
     u32 cnt=attr_count(size), bits=attr_bits(size);
     GLenum gt; GLboolean norm= ty==1||ty==2;
     if(size==0x30) gt= ty==1? GL_INT_2_10_10_10_REV : GL_UNSIGNED_INT_2_10_10_10_REV;
@@ -3024,8 +3343,14 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
       glVertexAttribDivisor(i,div); }
   }
   g_tm[TM_BUF]+=plat_ns()-tb0_; tb0_=plat_ns();
+  if(g_tr_on) tr_stamp(g_tr_n+1);   /* GPU timestamp before the draw (traced frame only) */
   GLenum mode=topo(topology);
   if(topology==7 || topology==8 || topology==9){ mode=GL_TRIANGLE_FAN; if(topology==7) mode=GL_TRIANGLES; if(topology==8) mode=GL_TRIANGLE_STRIP; }   /* quad strip = tri strip */
+  int xfb_live= xfb_on? game_xfb_begin(r,mode,count,instances) : 0;
+  /* rasterize enable (0xDF) off: the capture pass only feeds transform feedback; drawn, its 931 terrain points landed
+     in the G-buffer and depth */
+  extern int g_r3d_dfseen; int xfb_discard= xfb_live && g_r3d_dfseen && !(r[0xDF]&1);
+  if(xfb_discard){ glEnable(GL_RASTERIZER_DISCARD); { static int said; if(!said){ said=1; LOG("gpu: transform feedback pass with rasterization off (drawn with rasterizer discard)\n"); } } }
   if(indexed){
     u32 fmt=r[0x5F6]; u32 isz= fmt==0? 1 : fmt==1? 2 : 4; u64 ia=((u64)r[0x5F2]<<32)|r[0x5F3];
     u64 ilen=((u64)first+count)*isz; u8* src=NULL;   /* 64-bit: first+count can wrap */
@@ -3052,7 +3377,10 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
       glDrawArraysInstancedBaseInstance(mode,first,count,instances,base_instance);
       if(cap) dlg_capture_end(); }
   }
+  if(xfb_live) game_xfb_end();
+  if(xfb_discard) glDisable(GL_RASTERIZER_DISCARD);
   g_tm[TM_DRAW]+=plat_ns()-tb0_;
+  if(g_tr_on) tr_stamp(-(g_tr_n+1));   /* and after it */
   tr_draw(ch,vs,fs,code+r[0x801+1*0x10],(r[0x800+5*0x10]&1)? code+r[0x801+5*0x10] : 0,indexed,topology,count,instances);
 }
 
@@ -3288,6 +3616,7 @@ static void shot8_poll(void){
   if(p) p_s8unmap(GL_PIXEL_PACK_BUFFER);
   glBindBuffer(GL_PIXEL_PACK_BUFFER,0); }
 
+static int g_blit_rt;   /* shown image is an RT, i.e. scaled by the res scale */
 static void shot8_capture(GLuint tex, const float* xf, int tw, int th){
   shot8_poll();
   { static int tf; if(!tf){ tf= getenv("SWR_SHOT8_TEST")? 1 : -1; } if(tf>0 && ++tf==40) g_shot8_req=1; }   /* automated test hook */
@@ -3296,7 +3625,9 @@ static void shot8_capture(GLuint tex, const float* xf, int tw, int th){
   if(!p_s8map){ p_s8map=(PFNGLMAPBUFFERRANGEPROC)backend_gl_proc("glMapBufferRange"); p_s8unmap=(PFNGLUNMAPBUFFERPROC)backend_gl_proc("glUnmapBuffer");
     p_s8fs=(PFNGLFENCESYNCPROC)backend_gl_proc("glFenceSync"); p_s8cws=(PFNGLCLIENTWAITSYNCPROC)backend_gl_proc("glClientWaitSync"); p_s8ds=(PFNGLDELETESYNCPROC)backend_gl_proc("glDeleteSync"); }
   if(!p_s8map || !p_s8unmap || !p_s8fs || !p_s8cws || !p_s8ds){ WARN("F8 screenshot: the video driver lacks the required features\n"); return; }
-  /* actual size of the shown content (visible part of the texture) */
+  /* actual size of the shown content (visible part of the texture), at the texture's real size: tw x th is the game's
+     size, and at an internal resolution above 1 the picture was shrunk to it nearest-neighbour, rougher than the screen */
+  if(g_blit_rt){ tw=(int)SC((u32)tw); th=(int)SC((u32)th); }   /* a render target is presented: its texture is scaled */
   int w=(int)(tw*fabsf(xf[2])+0.5f), h=(int)(th*fabsf(xf[3])+0.5f); if(w<16||h<16||w>8192||h>8192) return;
   if(w!=g_s8_w || h!=g_s8_h){
     if(g_s8_tex){ glDeleteTextures(1,&g_s8_tex); glDeleteFramebuffers(1,&g_s8_fbo); glDeleteBuffers(1,&g_s8_pbo); }
@@ -3420,7 +3751,6 @@ static void lsfg_pump(void){ if(!g_lfn) return; u64 now=plat_ns(); int k=0;
 
 /* real frame: copy into the LSFG input, generate the in-between frames and present them spread over the
    interval, real one last. 0 = not active (already at target, or no dll) */
-static int g_blit_rt;   /* shown image is an RT, i.e. scaled by the res scale */
 static int lsfg_frame(GLuint tex, const float* xf, int tw, int th){
   if(!lsfg_ready() || tw<=0 || th<=0) return 0;
 #ifdef _WIN32
@@ -3610,6 +3940,12 @@ static void do_screenshot(const char* path){
   free(px); g_last_shot_hash=hh; }
 
 /* debug: dump the recently used RTs to screenshots/ with some stats */
+typedef struct { u8* px; u32 w, h, step, ow, oh; char path[256]; } RtDump;
+static void rt_dump_write(void* a){   /* a dump_rts image to its .ppm, off the GPU thread */
+  RtDump* j=a; size_t n=(size_t)j->ow*j->oh*3; u8* o=malloc(n);
+  if(o){ for(u32 y=0;y<j->oh;y++) for(u32 x=0;x<j->ow;x++){ const u8* q=j->px+(((size_t)(j->h-1-y*j->step))*j->w+x*j->step)*4; u8* d=o+((size_t)y*j->ow+x)*3; d[0]=q[0]; d[1]=q[1]; d[2]=q[2]; }
+    FILE* f=fopen(j->path,"wb"); if(f){ fprintf(f,"P6\n%u %u\n255\n",j->ow,j->oh); fwrite(o,1,n,f); fclose(f); } free(o); }
+  free(j->px); free(j); }
 static void dump_rts(void){
   Tex* list[16]; int n=0;
   for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && !t->f.depth && !t->f.is_int){
@@ -3626,10 +3962,14 @@ static void dump_rts(void){
     for(size_t k=0;k<np;k++){ u8* q=px+k*4; sr+=q[0]; sg+=q[1]; sb+=q[2]; sa+=q[3]; if(q[0]+q[1]+q[2]>12) nz++; }
     LOG("  rt %llx %ux%u fmt=%x used=%u  average color=(%llu,%llu,%llu,a%llu)  non-black=%llu%%\n",(unsigned long long)t->gva,t->w,t->h,t->fkey,t->last_used,
       (unsigned long long)(sr/np),(unsigned long long)(sg/np),(unsigned long long)(sb/np),(unsigned long long)(sa/np),(unsigned long long)(nz*100/np));
-    /* downscaled, max 480 wide */
-    u32 step=(w+479)/480; if(!step) step=1; u32 ow=w/step, oh=h/step; char path[256]; snprintf(path,sizeof path,"captures/rt_%d_%02d_%llx_%ux%u.ppm",ndump,i,(unsigned long long)t->gva,t->w,t->h);
-    FILE* f=fopen(path,"wb"); if(f){ fprintf(f,"P6\n%u %u\n255\n",ow,oh); for(u32 y=0;y<oh;y++) for(u32 x=0;x<ow;x++){ u8* q=px+(((size_t)(h-1-y*step))*w+x*step)*4; fwrite(q,1,3,f); } fclose(f); }
-    free(px); }
+    /* downscaled to at most 480 wide, except the screen-sized targets: full size, so a 1-pixel seam or a half of the
+       screen at another detail level can be seen (the scene and the final picture, a few MB each) */
+    u32 step= w>=960? 1 : (w+479)/480; if(!step) step=1; u32 ow=w/step, oh=h/step; char path[256]; snprintf(path,sizeof path,"captures/rt_%d_%02d_%llx_%ux%u.ppm",ndump,i,(unsigned long long)t->gva,t->w,t->h);
+    /* written on a thread of its own: a byte-triplet fwrite per pixel of the full-size targets held the game 1.5-2 s per
+       F5, a freeze of its own that looked like the stall being reported */
+    RtDump* jd=malloc(sizeof *jd);
+    if(jd){ jd->px=px; jd->w=w; jd->h=h; jd->step=step; jd->ow=ow; jd->oh=oh; snprintf(jd->path,sizeof jd->path,"%s",path); if(plat_thread(rt_dump_write,jd,1u<<20)) rt_dump_write(jd); }
+    else free(px); }
   glBindFramebuffer(GL_READ_FRAMEBUFFER,0); glDeleteFramebuffers(1,&fb);
   LOG("--------------------------------------------\n"); fflush(NULL);
 }
@@ -3678,6 +4018,7 @@ static WarmJob wj[6]; static int wj_n;
 
 static void warm_load(void){
   pcache_init();translated_load(); FILE* f=fopen(PACK_PATH,"rb"); if(!f) return; u32 cap=0;
+  GLuint* wp=NULL; int wp_n=0, wp_cap=0;   /* programs loaded from binaries: their uniforms are looked up at boot (glq_uloc_prime) */
   for(;;){ u32 mg,a,b; u64 key; if(fread(&mg,4,1,f)!=1 || (mg!=0x4B435053 && mg!=0x33504853) || fread(&key,8,1,f)!=1) break;
     if(mg==0x33504853){ u32 st=0; if(fread(&st,4,1,f)!=1 || fread(&a,4,1,f)!=1 || a>(8u<<20)) break;
       char* src=malloc(a+1); if(fread(src,1,a,f)!=a){ free(src); break; } src[a]=0;
@@ -3685,7 +4026,7 @@ static void warm_load(void){
       if(g_worker!=1){
         if(g_pcache>0 && (st!=ST_VS || strstr(src,"gl_Position = vec4(0.0, 0.0, 0.0, 1.0)"))){
           char path[160];snprintf(path,sizeof path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
-          GLuint p=binary_load(path,1);if(p) warm_stage_put(key,p,ULOC_LAZY);
+          GLuint p=binary_load(path,1);if(p){ warm_stage_put(key,p,ULOC_LAZY); if(wp_n>=wp_cap){ wp_cap= wp_cap? wp_cap*2 : 1024; wp=realloc(wp,wp_cap*sizeof *wp); } wp[wp_n++]=p; }
         }free(src);continue;
       }
       char path[160]; snprintf(path,sizeof path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
@@ -3700,6 +4041,7 @@ static void warm_load(void){
     if(wq_n>=cap){ cap= cap? cap*2 : 256; wq=realloc(wq,cap*sizeof *wq); } wq[wq_n].key=key; wq[wq_n].vs=vs; wq[wq_n].fs=fs; wq[wq_n].sep=0; wq[wq_n].stage=0; wq_n++; }
   fclose(f);
   if(warm_stage_count)LOG("shaders: %u cached stage programs prepared before starting the game\n",warm_stage_count);
+  { extern void glq_uloc_prime(const GLuint*,int); if(wp_n && !getenv("SWR_NO_ULOC_PRIME")) glq_uloc_prime(wp,wp_n); free(wp); }
   if(wq_n) LOG("shaders: %u from the pack are precompiled in the background while you play\n",wq_n); }
 static WJob* wlo[16]; static int wlo_n;
 
@@ -3875,7 +4217,8 @@ static int mp_claim(u64 key, Sh* s){
       u64 t0=plat_ns(); while(!__atomic_load_n(&j->state,__ATOMIC_ACQUIRE)) plat_sleep_ns(100000); g_mp_wait_ns+=plat_ns()-t0; }
     if(j->state!=1 || !j->prog) return 0;
     s->sp=j->prog; s->uloc=ULOC_LAZY; g_mp_built++; g_mp_joined++;
-    free(j->own_vs); free(j); g_mpj[k]=g_mpj[--g_mpj_n]; return 1; }
+    if(j->drv){ pcj_drop(j); binary_save(j->prog,key,1); }
+    job_free(j); g_mpj[k]=g_mpj[--g_mpj_n]; return 1; }
   return 0; }
 /* for the first-draw log: where a shader the pre-build hadn't translated was */
 /* A shader drawn before the scanner found it: the game is loading more, and in a new area it keeps doing so for a while
@@ -3921,16 +4264,27 @@ static void mp_scan_thread(void* arg){ plat_diag_role("shader-scan"); (void)arg;
     { u64 until=plat_ns()+(pass<10? 2000000000ull : 5000000000ull);   /* or sooner when a draw found a shader it had missed */
       while(plat_ns()<until){ if(__atomic_exchange_n(&g_mp_wake,0,__ATOMIC_ACQ_REL)){ woke=1; break; } plat_sleep_ns(20000000); } } } }
 static void mem_prebuild_step(void){
-  if(g_mp_on<0){ g_mp_on= g_opt_prebuild && !g_gles && g_sep==1 && g_worker==1 && g_pcache>0 && !getenv("SWR_NO_MEM_PREBUILD");
+  /* NVIDIA on Windows: opt-in (SWR_NV_PREBUILD=1). Tried on by default 2026-11-07, compiling only on frames with < 40 draws:
+     those include the title screen, menus and the map, glCreateProgram took 50-117 ms on the GL thread (300-390 ms frames),
+     and the driver's background builds later blocked the GL thread 100-240 ms in play, one frame 1.9 s */
+  if(g_mp_on<0){ g_mp_on= g_opt_prebuild && !g_gles && g_sep==1 && (g_worker==1 || (g_nv_win && g_par>0 && getenv("SWR_NV_PREBUILD"))) && g_pcache>0 && !getenv("SWR_NO_MEM_PREBUILD");
     if(g_mp_on){ pm_init(&g_mp_m); if(plat_thread(mp_scan_thread,NULL,512*1024)) g_mp_on=0; }
     LOG("shaders: pre-build from GPU memory %s\n",g_mp_on? "on (shaders are built as soon as the game loads them, before it draws with them)" : "off"); }
   if(!g_mp_on) return;
   /* finished compiles: keep the program ready for the game's first draw */
   for(int k=0;k<g_mpj_n;){ int st=__atomic_load_n(&g_mpj[k].j->state,__ATOMIC_ACQUIRE); if(!st){ k++; continue; }
-    WJob* j=g_mpj[k].j; if(st==1 && j->prog){ warm_stage_put(g_mpj[k].key,j->prog,ULOC_LAZY); g_mp_built++; } else if(st!=3) g_mp_failed++;
-    free(j->own_vs); free(j); g_mpj[k]=g_mpj[--g_mpj_n]; }
+    WJob* j=g_mpj[k].j; if(j->drv) pcj_drop(j);
+    if(st==1 && j->prog){ if(j->drv && !j->try_bin) binary_save(j->prog,g_mpj[k].key,1); warm_stage_put(g_mpj[k].key,j->prog,ULOC_LAZY); g_mp_built++; }
+    else { if(j->drv && j->prog) glDeleteProgram(j->prog); if(st!=3) g_mp_failed++; }
+    job_free(j); g_mpj[k]=g_mpj[--g_mpj_n]; }
   u64 t0=plat_ns();
-  while(g_mpj_n<63 && plat_ns()-t0<1500000ull){   /* at most 1.5 ms of translating per loop (a slot kept for a variant) */
+  /* NVIDIA (no compile thread): the driver builds them, at most g_pb_cpf new compiles a frame (its glCompileShader runs
+     on the GL thread, 20-170 ms each); found seconds before the game draws with them, so a door or a load takes most */
+  static int pb_cpf=-1; static u32 pb_frame, pb_n; if(pb_cpf<0){ const char* e=getenv("SWR_PREBUILD_PER_FRAME"); pb_cpf= e? atoi(e) : 4; }
+  if(pb_frame!=g_frame){ pb_frame=g_frame; pb_n=0; }
+  extern volatile unsigned long long g_video_last_ns;
+  int pb_ok= g_lf_light && plat_ns()-g_video_last_ns>2000000000ull;   /* loading or fade, no video in the last 2 s */
+  while(g_mpj_n<63 && plat_ns()-t0<1500000ull && (g_worker==1 || (pb_ok && pb_n<(u32)pb_cpf && g_frame-g_cpf_frame>=2)) && g_pcj_n<64){   /* NVIDIA: only when the draws started none this frame or the last */   /* at most 1.5 ms of translating per loop (a slot kept for a variant) */
     pm_lock(&g_mp_m); MemProg mp= g_mp_next<g_mp_n? g_mp[g_mp_next++] : (MemProg){NULL,0,0}; pm_unlock(&g_mp_m);
     if(!mp.code) break;
     int stage=mp.stage; u32 hl; u64 h=shader_hash(mp.code,mp.avail,&hl);
@@ -3967,7 +4321,14 @@ static void mem_prebuild_step(void){
     char bp[200]; snprintf(bp,sizeof bp,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
     WJob* j=calloc(1,sizeof *j); j->vs=src; j->own_vs=src; j->key=key; j->keep=1; j->sep=1; j->stype= stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER;
     { FILE* t=fopen(bp,"rb"); if(t){ fclose(t); j->try_bin=1; snprintf(j->bin_path,sizeof j->bin_path,"%s",bp); g_mp_had++; } }   /* built before: the thread loads it */
-    if(!wr_push(&wq_lo,j)){ free(src); free(j); g_mp_found--; break; }
+    if(g_worker!=1){   /* NVIDIA: a binary from an earlier run loads now; else the driver builds it and pc_step reports when done */
+      j->drv=1; j->run=1;   /* run 1: a draw that comes first waits for this build (mp_claim) instead of starting its own */
+      GLuint bp_p= j->try_bin? binary_load(bp,1) : 0;
+      if(bp_p){ j->prog=bp_p; j->state=1; }
+      else { j->try_bin=0; GLuint a=glCreateShader(j->stype); const char* s1=src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
+        GLuint pg=glCreateProgram(); glAttachShader(pg,a); p_glProgramParameteri(pg,0x8258,GL_TRUE); p_glProgramParameteri(pg,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
+        glLinkProgram(pg); glDeleteShader(a); j->prog=pg; g_pcj[g_pcj_n++]=j; pb_n++; } }
+    else if(!wr_push(&wq_lo,j)){ free(src); free(j); g_mp_found--; break; }
     g_mpj[g_mpj_n++]=(MpJob){j,key,stage}; }
     free(mp.code); }
   g_mp_ns+=plat_ns()-t0;
@@ -4041,6 +4402,15 @@ static void res_dyn_step(void){
 /* end of frame: was it slow, and where did the time go */
 static u64 g_idle_ns;   /* GPU thread waiting for the game's next piece of work */
 static void frame_stats(void){
+  { /* load-screen detector: gameplay draws 200-700 times a frame; loading screens, fades and the intro's video a handful.
+       Measured at the end of a frame, so it applies to the next one: after two light frames the next frame may wait for
+       its shaders (nobody sees a hitch on a loading screen), including the first full frame when the area appears, so it
+       appears whole. Budget per frame: 1 s after a real load (30+ light frames), 0.25 s after a short fade */
+    static u64 ld; u64 nd=g_draws-ld; ld=g_draws; int light= nd<40;
+    g_lf_run= light? g_lf_run+1 : 0; g_lf_light= g_lf_run>=2;
+    g_lf_reveal= g_lf_run>=30;
+    g_lf_wait_ns=0;
+    static int was; if(g_lf_light!=was){ was=g_lf_light; static int said; if(said<40 && (g_mp_on>0 || !getenv_cached_nolw())){ said++; LOG("shaders: %s (%llu draws last frame)\n",g_lf_light? "light frames (loading or fade): new shaders are built now" : "full frames again: shaders only as needed",(unsigned long long)nd); } } }
   extern volatile unsigned long long g_glq_wait_ns, g_glq_waits; extern unsigned long long g_glq_wait_max; extern const char* g_glq_wait_what; static u64 l_gw, l_gn, l_idle;
   u64 now=plat_ns(); if(!g_fr_t0){ g_fr_t0=now; memset(g_tm,0,sizeof g_tm); g_fr_shnew=st_sh_new; l_gw=g_glq_wait_ns; l_gn=g_glq_waits; l_idle=g_idle_ns; return; }
   u64 dt=now-g_fr_t0; g_fr_t0=now; if(dt>g_fr_max) g_fr_max=dt;
@@ -4076,10 +4446,12 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
     g_par=0; int vl=0; GLint n=0; glGetIntegerv(GL_NUM_EXTENSIONS,&n); typedef const GLubyte* (APIENTRY*GSI2)(GLenum,GLuint); GSI2 gsi=(GSI2)backend_gl_proc("glGetStringi");
     for(GLint k=0;k<n && gsi;k++){ const char* e=(const char*)gsi(GL_EXTENSIONS,(GLuint)k); if(!e) continue;
       if(!strcmp(e,"GL_KHR_parallel_shader_compile")||!strcmp(e,"GL_ARB_parallel_shader_compile")) g_par=1;
+      if(!strcmp(e,"GL_NV_texture_compression_vtc") && !getenv("SWR_NO_VTC")) g_vtc=1;
       if(!g_gles && !strcmp(e,"GL_KHR_texture_compression_astc_ldr") && getenv("SWR_ASTC_DRIVER")) g_has_astc=1;   /* desktop drivers emulate it on the GL thread */
       if(!strcmp(e,"GL_ARB_shader_viewport_layer_array")) vl|=1; if(!strcmp(e,"GL_AMD_vertex_shader_layer")) vl|=2; if(!strcmp(e,"GL_NV_viewport_array2")) vl|=4; }
     { extern int g_vs_layer_ext; g_vs_layer_ext= g_gles? 0 : (vl&1)? 1 : (vl&2)? 2 : (vl&4)? 3 : 0;
       LOG("gpu: render target layer from the vertex shader: %s\n",g_vs_layer_ext==1? "ARB_shader_viewport_layer_array" : g_vs_layer_ext==2? "AMD_vertex_shader_layer" : g_vs_layer_ext==3? "NV_viewport_array2" : "not available (drawn to layer 0)"); }
+    if(g_vtc) LOG("gpu: GL_NV_texture_compression_vtc: S3TC 3D textures are reordered into its 4x4x4 blocks\n");
     if(!g_gles) LOG("ASTC textures: %s\n",g_has_astc && !getenv("SWR_ASTC_CPU")? "decoded by the GPU (fast, with mipmaps)" : "decoded on the CPU");
     int had_par=g_par; if(getenv("SWR_SYNC_SHADERS")) g_par=0;
     /* NVIDIA on Windows (driver 617, RTX 4060 Ti, MEASURED 2026-11-03): glMaxShaderCompilerThreads from any context left
@@ -4091,7 +4463,16 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
 #ifdef _WIN32
     { const char* ven=(const char*)glGetString(GL_VENDOR); g_nv_win= ven && strstr(ven,"NVIDIA") && !getenv("SWR_NV_WORKERS"); }
 #endif
-    if(g_par && !g_nv_win){ typedef void (APIENTRY*MSCT)(GLuint); MSCT f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsKHR"); if(!f) f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsARB"); if(f) f(0xFFFFFFFFu); }
+    { /* NVIDIA on Windows: its own compile threads, a third of the CPU's (2-8). With its default it compiled inside
+         glLinkProgram on the GL thread: 145 links, 202 s, freezes up to 33 s in a 23-minute session in new areas. The call
+         hung SwapBuffers only together with compile threads of ours, which it doesn't start (worker_start). A draw that
+         must have its shader now compiles that one directly instead of waiting behind the queue (sh_sep_ready).
+         SWR_NV_MAXCT=n sets the count, 0 leaves the driver's default */
+      const char* mc=getenv("SWR_NV_MAXCT"); int nvn=0;
+      if(g_nv_win){ extern int plat_ncpu(void); nvn= mc? atoi(mc) : plat_ncpu()/3; if(!mc){ if(nvn<2) nvn=2; if(nvn>8) nvn=8; } }
+      if(g_par && (!g_nv_win || nvn>0)){ typedef void (APIENTRY*MSCT)(GLuint); MSCT f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsKHR"); if(!f) f=(MSCT)backend_gl_proc("glMaxShaderCompilerThreadsARB");
+        if(f) f(g_nv_win? (GLuint)nvn : 0xFFFFFFFFu);
+        if(g_nv_win) LOG("shaders: NVIDIA compiles on %d threads of its own (glMaxShaderCompilerThreads)\n",nvn); } }
     if(g_nv_win) LOG("shaders: NVIDIA on Windows: the driver compiles new shaders itself, no compile threads of ours\n");
     LOG("shaders: parallel compilation %s\n",g_par? "enabled (no stutter: anything still compiling is drawn as soon as it is ready)"
         : had_par? "off: wait_for_shaders=1 makes each draw wait for its new shader (the driver has it)" : "not available in this driver"); }
@@ -4142,6 +4523,8 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
             LOG("performance: %.1f FPS, GPU thread CPU busy %d%% (host rendering-thread CPU time; not hardware GPU utilization)\n",
               (double)(g_frame-last_frames)*1e9/(double)dt,(int)((cpu_now-last_cpu)*100/dt));
             if(g_par_built){ static u32 said; if(g_par_built!=said){ said=g_par_built; LOG("shaders: %u built by the driver in the background so far (longest %.0f ms, drawn when ready)\n",g_par_built,g_par_max/1e6); } }
+            { extern volatile unsigned g_sh_loops_structured; static unsigned said; if(g_sh_loops_structured!=said){ said=g_sh_loops_structured; LOG("shaders: %u shaders with loops translated as plain loops (no jump dispatcher)\n",said); } }
+            if(st_lf_waits){ static u64 said; if(st_lf_waits!=said){ said=st_lf_waits; LOG("shaders: %llu draws on loading/fade frames waited for their shaders instead of being skipped (%.0f ms in all)\n",(unsigned long long)st_lf_waits,st_lf_wait_ns/1e6); } }
             if(g_workers_up){ char wb[160]; int o=0; for(int i=0;i<g_wid_next && i<8;i++) o+=snprintf(wb+o,sizeof wb-o," #%d step %d jobs %u",i,g_wph[i],g_wjobs[i]);
               LOG("shaders: compile threads:%s\n",wb); } }
           last_t=now; last_cpu=cpu_now; last_frames=g_frame; }
@@ -4201,9 +4584,9 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
       case WK_SUBMIT: g_submit_epoch++; ww_poll(); { extern volatile u64 g_gpu_sub_ns; static u32 fr=~0u; if(fr!=g_frame || !g_gpu_sub_ns){ fr=g_frame; g_gpu_sub_ns=w.sub_ns; } }   /* stamp the whole frame with the time of its first submit */ { extern u64 guest_ns(void); u64 q0=guest_ns(), p0=plat_ns(); gpu_submit_now(w.ent,w.n,w.syncpt); u64 pd=plat_ns()-p0; static int said;
         if(said<60 && (q0-w.sub_ns>30000000ull || pd>30000000ull)){ said++; LOG("gpu: submit on syncpoint %u waited %.1f ms in the queue, took %.1f ms (%u entries)\n",w.syncpt,(q0-w.sub_ns)/1e6,pd/1e6,w.n); } }
         cs_kick_async(); free(w.ent); cs_submit_done(w.syncpt,w.incs); break;
-      case WK_PRESENT_CPU: trace_note("PRESENT CPU image %dx%d\n",w.w,w.h); present_cpu(w.px,w.w,w.h); free(w.px); g_frame++; aj_drain(); gw_sync(); gw_writeback(); oq_poll(); bp_trim(); gpu_evict_step(); frame_stats(); trace_frame(); break;
+      case WK_PRESENT_CPU: trace_note("PRESENT CPU image %dx%d\n",w.w,w.h); present_cpu(w.px,w.w,w.h); free(w.px); g_frame++; pc_step(); job_grave_step(); aj_drain(); gw_sync(); gw_writeback(); oq_poll(); bp_trim(); gpu_evict_step(); frame_stats(); trace_frame(); break;
       case WK_PRESENT_ADDR: if(!present_addr(w.addr,w.w,w.h)){ extern void vi_convert_cpu(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt, u32* out);
-          u32* px=malloc((size_t)w.w*w.h*4); vi_convert_cpu(w.addr,w.w,w.h,w.n,(w.fmt>>8)&15,(w.fmt>>12)&15,w.fmt&0xFF,px); present_cpu(px,w.w,w.h); free(px); } g_frame++; dlg_frame(); aj_drain(); gw_sync(); gw_writeback(); oq_poll(); bp_trim(); gpu_evict_step(); frame_stats(); trace_frame(); break;
+          u32* px=malloc((size_t)w.w*w.h*4); vi_convert_cpu(w.addr,w.w,w.h,w.n,(w.fmt>>8)&15,(w.fmt>>12)&15,w.fmt&0xFF,px); present_cpu(px,w.w,w.h); free(px); } g_frame++; pc_step(); job_grave_step(); dlg_frame(); aj_drain(); gw_sync(); gw_writeback(); oq_poll(); bp_trim(); gpu_evict_step(); frame_stats(); trace_frame(); break;
       case WK_SYNC: pm_lock(&g_ql);__atomic_store_n(w.done,1,__ATOMIC_RELEASE);pc_broadcast(&g_frame_consumed_cv);pm_unlock(&g_ql);break;
       case WK_DUMP: dump_rts(); g_tr_arm=1; break;
       case WK_SHOT: do_screenshot(w.path[0]? w.path : NULL); __atomic_store_n(&g_shot_done,w.n,__ATOMIC_SEQ_CST); break;
@@ -4284,6 +4667,18 @@ static void cs_apply(const u8* tmp, const CsPend* p, int n){
   g_cs_busy=0; }
 
 static u8* cs_tmp(u32 n){ static u8* tmp; static u32 cap; if(cap<n){ tmp=realloc(tmp,n); cap=n; } return tmp; }
+void cs_flush_pending(void);
+/* a GPU-written range (transform feedback) handled like a compute result: copied into the staging buffer, pending */
+static void cs_stage_add(GLuint src, u64 addr, u32 size){
+  if(g_cs_npend>=256 || g_cs_stage_used+size>(32u<<20)) cs_flush_pending();
+  u32 need=g_cs_stage_used+size;
+  if(!g_cs_stage || need>g_cs_stage_cap){ cs_flush_pending(); u32 nc=g_cs_stage_cap? g_cs_stage_cap*2 : (1u<<20); while(nc<size) nc*=2;
+    if(!g_cs_stage) glGenBuffers(1,&g_cs_stage); glBindBuffer(GL_COPY_WRITE_BUFFER,g_cs_stage); glBufferData(GL_COPY_WRITE_BUFFER,nc,NULL,GL_DYNAMIC_READ); g_cs_stage_cap=nc; }
+  glBindBuffer(GL_COPY_READ_BUFFER,src); glBindBuffer(GL_COPY_WRITE_BUFFER,g_cs_stage);
+  glCopyBufferSubData(GL_COPY_READ_BUFFER,GL_COPY_WRITE_BUFFER,0,g_cs_stage_used,size);
+  g_cs_pend[g_cs_npend].addr=addr; g_cs_pend[g_cs_npend].off=g_cs_stage_used; g_cs_pend[g_cs_npend].size=size; g_cs_npend++; g_cs_any=1;
+  if(addr<g_cs_lo) g_cs_lo=addr; if(addr+size>g_cs_hi) g_cs_hi=addr+size;
+  g_cs_stage_used=(g_cs_stage_used+size+255)&~255u; }
 
 /* wait=0: only if the GPU is already done */
 static void cs_complete(int wait){

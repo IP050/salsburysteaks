@@ -215,14 +215,17 @@ int backend_hdr_peak_nits(void){
   return cached; }
 int snxvk_pacing(void){ extern int g_opt_fps; return g_snxvk_on && !getenv("SWR_SNXVK_NO_PACING") && (g_opt_fps==1 || (g_opt_fps>=60 && g_opt_fps<=240)); }
 void snxvk_present(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt){
-  static const i32 crop[4]={0,0,0,0};
+  /* the frame's crop and transform as the game queued it (svc_vi.c): Prime 4 asks for transform 2 (flip vertically: its
+     targets are bottom-up, NVN's lower-left origin), and passed as 0 every frame was shown upside down */
+  extern volatile i32 g_vi_crop[4]; extern volatile u32 g_vi_transform;
+  i32 crop[4]; for(int i=0;i<4;i++) crop[i]=g_vi_crop[i]; u32 xform=g_vi_transform;
   static u64 st_n, st_wait, st_pres, st_gap, last_out;   /* SWR_SNXVK_TRACE: averages every 600 presents */
   u64 t_in=plat_ns(), t_w=t_in;
   if(snxvk_pacing()){ extern volatile int g_pace_fps; static u64 deadline; int pf=g_pace_fps;   /* g_opt_fps, or 60 during slow motion */
     u64 per= pf>=30 && pf<=240? 1000000000ull/(u64)pf : 16666667ull;   /* 30: cinematics (main.c pace_update) */
     u64 next=deadline+per; if(deadline) wait_deadline(next);
     u64 now=plat_ns(); t_w=now; deadline= deadline && (i64)(now-next)<(i64)(per/2)? next : now; }
-  { static u64 last_in; u64 t0=plat_ns(); snxv_vk_renderer.present_buffer(a,w,h,pitch,layout,bhl,fmt,crop,0); u64 t1=plat_ns();
+  { static u64 last_in; u64 t0=plat_ns(); snxv_vk_renderer.present_buffer(a,w,h,pitch,layout,bhl,fmt,crop,xform); u64 t1=plat_ns();
     static int tr=-1; if(tr<0) tr=getenv("SWR_SNXVK_TRACE")!=NULL;
     if(t1-t0>250000000ull) LOG("vulkan_native: present_buffer took %.0f ms\n",(t1-t0)/1e6);
     if(tr && last_in && (t0-last_in>30000000ull || t1-t0>12000000ull)) LOG("vulkan_native: slow frame: game arrived %.1f ms after the last present, present took %.1f ms\n",(t0-last_in)/1e6,(t1-t0)/1e6);

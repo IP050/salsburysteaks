@@ -417,6 +417,33 @@ static void pring_flush(int final){
 static void pring_dump(void){ pring_flush(1); }
 static void pring_atexit(void){ pring_dump(); }
 
+/* F5 thread window (profile=1): every thread sampled with host time for a few seconds into the trace's folder,
+   so one slow stretch (the map screen's steady 45 ms frames) shows which thread is doing what. Guest threads are
+   named by plat_prof_guest at their start (host thread id -> guest id and name). */
+static volatile u64 g_pwin_end; static int g_pring_env; static char g_pwin_path[300];
+static struct { DWORD tid; u64 gid; char name[32]; } g_pgn[256]; static volatile LONG g_npgn;
+void plat_prof_guest(u64 gid, const char* name){ LONG i=InterlockedIncrement(&g_npgn)-1; if(i>=256) return;
+  g_pgn[i].gid=gid; snprintf(g_pgn[i].name,sizeof g_pgn[i].name,"%s",name? name : ""); g_pgn[i].tid=GetCurrentThreadId(); }
+int plat_prof_window(const char* path, int ms){
+  if(!g_pe || g_pring_env) return 0;   /* needs profile=1 (the sampling thread); not with SWR_PROFILE_RING */
+  if(g_pwin_end) return 0;             /* one window at a time */
+  while(InterlockedExchange(&g_pring_wr,1)) Sleep(1);
+  if(!g_pring){ g_pring_cap=262144u; g_pring=calloc(g_pring_cap,sizeof(PRingEnt)); }
+  if(!g_pring){ InterlockedExchange(&g_pring_wr,0); return 0; }
+  if(!g_rexe_lo){ extern char __ImageBase; g_rexe_lo=(u64)(uintptr_t)&__ImageBase;
+    IMAGE_NT_HEADERS* nt=(IMAGE_NT_HEADERS*)(g_rexe_lo+(u64)((IMAGE_DOS_HEADER*)g_rexe_lo)->e_lfanew); g_rexe_hi=g_rexe_lo+nt->OptionalHeader.SizeOfImage;
+    pring_mod_range(g_plo,&g_rdll_lo,&g_rdll_hi); }
+  snprintf(g_pwin_path,sizeof g_pwin_path,"%s",path); g_pring_path=g_pwin_path;
+  FILE* f=fopen(g_pwin_path,"w");
+  if(f){ fprintf(f,"# every thread sampled about once a millisecond for %d ms; exe_base=%llx dll_base=%llx\n",ms,(unsigned long long)g_rexe_lo,(unsigned long long)g_rdll_lo);
+    fprintf(f,"# G:guest_entry+host_offset  X:exe_offset  M:module+offset. frames = call-preceded stack words, innermost first\n");
+    LONG ng=g_npgn; if(ng>256) ng=256; for(LONG i=0;i<ng;i++) fprintf(f,"# guest thread %llu '%s' = host tid %lu\n",(unsigned long long)g_pgn[i].gid,g_pgn[i].name,(unsigned long)g_pgn[i].tid);
+    fprintf(f,"# host tid %lu = guest main thread, %lu = GPU thread\n",(unsigned long)g_prof_main_tid,(unsigned long)g_prof_gpu_tid);
+    fprintf(f,"t_ns,tid,rip,frames\n"); fclose(f); }
+  g_pring_n=0; g_pring_done=0; g_pring_lost=0; g_pring_stop=0;
+  InterlockedExchange(&g_pring_wr,0);
+  g_pwin_end=plat_ns()+(u64)ms*1000000ull; return 1; }
+
 static unsigned __stdcall prof_thread(void* a){ (void)a;
   u64 last=GetTickCount64(); DWORD me=GetCurrentThreadId();
   u64 start=last;int main_only=getenv("SWR_PROFILE_MAIN_ONLY")!=NULL; int ring_host=getenv("SWR_PROFILE_RING_HOST")!=NULL, ring_all=getenv("SWR_PROFILE_RING_ALL")!=NULL;
@@ -426,11 +453,12 @@ static unsigned __stdcall prof_thread(void* a){ (void)a;
     u64 elapsed=GetTickCount64()-start;
     if(elapsed<delay)continue;
     if(duration && elapsed>=delay+duration){prof_write();pring_dump();break;}
+    int win= g_pwin_end!=0; if(win && plat_ns()>=g_pwin_end){ pring_flush(1); g_pwin_end=0; win=0; LOG("profile: thread window written to %s\n",g_pwin_path); }
     LONG n=g_npth; if(n>256) n=256;
     for(LONG i=0;i<n;i++){ HANDLE h=g_pth[i]; if(!h || GetThreadId(h)==me) continue; if(main_only && GetThreadId(h)!=__atomic_load_n(&g_prof_main_tid,__ATOMIC_ACQUIRE))continue;
-      DWORD tid=GetThreadId(h); int ring=g_pring && tid==__atomic_load_n(&g_prof_main_tid,__ATOMIC_ACQUIRE);
+      DWORD tid=GetThreadId(h); int ring=g_pring && (win || (g_pring_env && tid==__atomic_load_n(&g_prof_main_tid,__ATOMIC_ACQUIRE)));
       if(SuspendThread(h)==(DWORD)-1) continue; CONTEXT cx; memset(&cx,0,sizeof cx); cx.ContextFlags=CONTEXT_CONTROL;
-      if(GetThreadContext(h,&cx)){ if(g_pring && !ring && (ring_all || (ring_host && tid==__atomic_load_n(&g_prof_gpu_tid,__ATOMIC_ACQUIRE)))) ring=1;   /* SWR_PROFILE_RING_HOST: the native Vulkan GPU thread too */
+      if(GetThreadContext(h,&cx)){ if(g_pring && g_pring_env && !ring && (ring_all || (ring_host && tid==__atomic_load_n(&g_prof_gpu_tid,__ATOMIC_ACQUIRE)))) ring=1;   /* SWR_PROFILE_RING_HOST: the native Vulkan GPU thread too */
         if(ring) pring_grab(&cx); ResumeThread(h); prof_note(cx.Rip); if(ring) pring_add(&cx,tid); } else ResumeThread(h); }
     if(g_pring && !g_pring_stop && g_pring_n-g_pring_done>=2000) pring_flush(0);
     if(GetTickCount64()-last>=(g_pboot? 5000u : 10000u)){ last=GetTickCount64(); prof_write(); }
@@ -445,7 +473,7 @@ void plat_prof_start(int boot){
   qsort(g_pe,g_npe,sizeof(PEnt),pe_cmp);
   { const char* rp=getenv("SWR_PROFILE_RING"); if(rp && rp[0]){ const char* mx=getenv("SWR_PROFILE_RING_MAX");
       g_pring_cap= mx? (u32)strtoul(mx,NULL,10) : 262144u; g_pring=calloc(g_pring_cap,sizeof(PRingEnt));
-      if(g_pring){ extern char __ImageBase; g_pring_path=rp; g_rexe_lo=(u64)(uintptr_t)&__ImageBase;
+      if(g_pring){ extern char __ImageBase; g_pring_env=1; g_pring_path=rp; g_rexe_lo=(u64)(uintptr_t)&__ImageBase;
         { IMAGE_NT_HEADERS* nt=(IMAGE_NT_HEADERS*)(g_rexe_lo+(u64)((IMAGE_DOS_HEADER*)g_rexe_lo)->e_lfanew); g_rexe_hi=g_rexe_lo+nt->OptionalHeader.SizeOfImage; }
         pring_mod_range(g_plo,&g_rdll_lo,&g_rdll_hi); atexit(pring_atexit);
         { FILE* f=fopen(rp,"w"); if(f){
@@ -603,6 +631,8 @@ void plat_install_crash_handler(void){
 #endif
 #ifndef _WIN32
 void plat_prof_start(int boot){ (void)boot; }
+void plat_prof_guest(u64 gid, const char* name){ (void)gid; (void)name; }
+int plat_prof_window(const char* path, int ms){ (void)path; (void)ms; return 0; }
 void plat_prof_mark_main(void){}
 void plat_prof_mark_gpu(void){}
 #endif
