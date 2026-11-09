@@ -567,6 +567,10 @@ volatile int g_pace_fps=1;
 static void pace_update(void){ g_pace_fps=g_opt_fps; }
 
 void vi_show_buffer(u32 nvmap_id, u32 offset, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt){
+#ifdef _WIN32
+  /* the splash ends at the game's first picture with every renderer: native Vulkan never calls backend_gl_swap, so it stayed on top of the game */
+  { extern void splash_first_swap(void) __attribute__((weak)); static int said; if(!said){ said=1; if(splash_first_swap) splash_first_swap(); } }
+#endif
   pace_update();
   static int trace_configured;static FILE*limiter_trace;static unsigned trace_rows;
   if(!trace_configured){trace_configured=1;const char*path=getenv("SWR_TRACE_LIMITER");if(path&&path[0]){limiter_trace=fopen(path,"w");if(limiter_trace)fprintf(limiter_trace,"frame,thread,enter_ns,enqueued_ns,limit_begin_ns,end_ns,requested_sleep_ms,actual_sleep_ms,deadline_ns\n");}}
