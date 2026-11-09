@@ -4318,13 +4318,18 @@ static PackEnt* wq; static u32 wq_n, wq_i, wq_done;
 typedef struct { GLuint p, a, b; u64 key; } WarmJob;
 static WarmJob wj[6]; static int wj_n;
 
+extern void splash_progress(int phase, float frac) __attribute__((weak));   /* splash_win32.c; absent elsewhere */
 static void warm_load(void){
   pcache_init();translated_load();
   /* the helpers start first: shaders in the pack without a binary for this driver go straight to them (below) */
   if(g_nv_win && g_par>0 && g_pcache>0 && g_helper<0){ g_helper= !getenv("SWR_NO_SHADER_HELPER") && backend_shader_helper_start(g_pc_tag); }
   FILE* f=fopen(PACK_PATH,"rb"); if(!f) return; u32 cap=0;
   GLuint* wp=NULL; int wp_n=0, wp_cap=0;   /* programs loaded from binaries: their uniforms are looked up at boot (glq_uloc_prime) */
-  for(;;){ u32 mg,a,b; u64 key; if(fread(&mg,4,1,f)!=1 || (mg!=0x4B435053 && mg!=0x33504853) || fread(&key,8,1,f)!=1) break;
+  /* the splash's progress bar: this loop is most of the wait between Play and the first frame (16 s of 18 for 7626
+     programs, MEASURED 2026-11-09), so how far it is through the file is how far the launch is */
+  long pk_size=0; if(!fseek(f,0,SEEK_END)) pk_size=ftell(f); fseek(f,0,SEEK_SET); u32 pk_seen=0;
+  for(;;){ u32 mg,a,b; u64 key; if(!(++pk_seen&63) && pk_size>0 && splash_progress) splash_progress(0,(float)ftell(f)/(float)pk_size);
+    if(fread(&mg,4,1,f)!=1 || (mg!=0x4B435053 && mg!=0x33504853) || fread(&key,8,1,f)!=1) break;
     if(mg==0x33504853){ u32 st=0; if(fread(&st,4,1,f)!=1 || fread(&a,4,1,f)!=1 || a>(8u<<20)) break;
       char* src=malloc(a+1); if(fread(src,1,a,f)!=a){ free(src); break; } src[a]=0;
       if(pk_has(key)){free(src);continue;}pk_put(key);
@@ -4821,7 +4826,7 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
   gl_selftest(); state_dirty(); mb_reset();
   LOG("gpu: native 0..1 depth %s, texture views %s\n",p_clip? "yes" : "no",p_tview? "yes" : "no");
   LOG("gpu: texture multi-bind %s, persistent constant ring %s\n",p_bt? "yes" : "no",g_ur_ptr? "yes" : "no");
-  warm_load();
+  warm_load(); if(splash_progress) splash_progress(1,1.0f);   /* shaders ready: the game boots */
   prebuild_shaders();
   FILE*work_trace=NULL;const char*work_path=getenv("SWR_TRACE_GPU_WORK");
   if(work_path&&work_path[0]){work_trace=fopen(work_path,"w");if(work_trace)fprintf(work_trace,"kind,frame,queued_ns,dequeued_ns,finished_ns,queue_ms,execute_ms,cpu_ms\n");}

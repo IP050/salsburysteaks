@@ -6,10 +6,34 @@
 #include <windows.h>
 #include <objbase.h>
 #include <wincodec.h>
+#include <stdio.h>
+#include <math.h>
 #include "rt.h"
 
 int g_opt_splash=1;
 static volatile LONG g_stop;
+/* progress, from the runtime: phase 0 = shader programs being prepared (frac = how far through the pack file, most of
+   the launch), phase 1 = done, the game is booting (about 1.5 s more). -1: nothing reported (no pack yet, or a renderer
+   that doesn't report), the bar then only creeps by time */
+static volatile LONG g_phase=-1; static volatile float g_frac; static volatile LONGLONG g_t_boot;
+void splash_progress(int phase, float frac){ if(frac<0) frac=0; if(frac>1) frac=1; g_frac=frac;
+  if(phase==1 && g_phase!=1) g_t_boot=(LONGLONG)plat_ns(); InterlockedExchange(&g_phase,phase); }
+static u32 mix(u32 a, u32 b, double t){ u32 r=0; for(int s=0;s<24;s+=8){ double x=((a>>s)&255)*(1-t)+((b>>s)&255)*t; r|=(u32)(x+0.5)<<s; } return r; }
+/* the bar, its glow and the label, over the saved logo image (base) */
+static void draw_bar(u32* d, const u32* base, HDC mem, HFONT font, int w, int h, int by, double p){
+  int bw=w*34/100, bh= h/300>3? h/300 : 3, bx=(w-bw)/2, gl= bh*2, y0=by-gl, y1=by+bh+gl+h/14; if(y1>h) y1=h; if(y0<0) y0=0;
+  for(int y=y0;y<y1;y++) memcpy(d+(size_t)y*w,base+(size_t)y*w,(size_t)w*4);
+  int fill=(int)(bw*p+0.5);
+  for(int y=by-gl;y<by+bh+gl;y++){ if(y<0 || y>=h) continue; int in= y>=by && y<by+bh; int dy= y<by? by-y : y-(by+bh-1); double gk= in? 1 : 0.28*(1.0-(double)dy/(gl+1));
+    for(int x=bx-gl;x<bx+bw+gl;x++){ if(x<0 || x>=w) continue; u32 c;
+      if(in && x>=bx && x<bx+bw){ c= x<bx+fill? mix(0x7B4DFF,0xD2B4FF,(double)(x-bx)/(bw>1? bw-1 : 1)) : 0x2A2340; }
+      else if(x>=bx && x<bx+fill){ c=mix(0x000000,0x9A70FF,gk); }   /* glow around the filled part only */
+      else continue;
+      d[(size_t)y*w+x]=0xFF000000u|c; } }
+  if(font){ char lab[64]; LONG ph=g_phase; snprintf(lab,sizeof lab,"%s  %d%%", ph==0? "Preparing shaders" : ph==1 || g_stop? "Starting the game" : "Loading",(int)(p*100+0.5));
+    GdiFlush(); HGDIOBJ of=SelectObject(mem,font); SetBkMode(mem,TRANSPARENT); SetTextColor(mem,RGB(178,166,214));
+    RECT r={0,by+bh+h/60,w,y1}; DrawTextA(mem,lab,-1,&r,DT_CENTER|DT_TOP|DT_SINGLELINE|DT_NOPREFIX); SelectObject(mem,of); GdiFlush();
+    for(int y=r.top;y<r.bottom && y<h;y++) for(int x=0;x<w;x++) d[(size_t)y*w+x]|=0xFF000000u; } }   /* GDI text leaves alpha 0 */
 static const GUID S_CLSID_Factory={0xcacaf262,0x9370,0x4615,{0xa1,0x3b,0x9f,0x55,0x39,0xda,0x4c,0x0a}};
 static const GUID S_IID_Factory={0xec5ec8a9,0xc395,0x4314,{0x9c,0x77,0x54,0xd7,0xa9,0x35,0xff,0x70}};
 static const GUID S_PBGRA={0x6fddc324,0x4e03,0x4bfe,{0xb1,0x85,0x3d,0x77,0x76,0x8d,0xc9,0x10}};
@@ -55,6 +79,10 @@ static DWORD WINAPI splash_thread(void* p){
   { u32* d=(u32*)bits; for(int i=0;i<w*h;i++) d[i]=0xFF000000u; int ox=(w-(int)lw)/2, oy=(h-(int)lh)/2;
     for(UINT y=0;y<lh;y++) for(UINT x=0;x<lw;x++){ const BYTE* s=logo+((size_t)y*lw+x)*4; d[(size_t)(y+oy)*w+x+ox]=0xFF000000u|((u32)s[2]<<16)|((u32)s[1]<<8)|s[0]; } }
   free(logo);
+  int by=(h+(int)lh)/2+h*4/100; if(by>h*88/100) by=h*88/100;
+  u32* base=(u32*)malloc((size_t)w*h*4); if(base) memcpy(base,bits,(size_t)w*h*4);
+  HFONT font=CreateFontA(-(h*2/100>12? h*2/100 : 12),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,"Segoe UI");
+  double shown_p=0;
   WNDCLASSA wc; memset(&wc,0,sizeof wc); wc.lpfnWndProc=DefWindowProcA; wc.hInstance=GetModuleHandle(NULL); wc.lpszClassName="MetroidPrime4Splash"; wc.hIcon=LoadIcon(wc.hInstance,MAKEINTRESOURCE(1)); RegisterClassA(&wc);
   HWND hw=CreateWindowExA(WS_EX_LAYERED|WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT,"MetroidPrime4Splash","Metroid Prime 4 Beyond",WS_POPUP,a.r.left,a.r.top,w,h,NULL,NULL,wc.hInstance,NULL);
   if(hw){
@@ -66,9 +94,17 @@ static DWORD WINAPI splash_thread(void* p){
       double t=(plat_ns()-t0)/1e9;
       if(!tstop && (g_stop || t>60.0) && t>=1.2){ tstop=plat_ns(); LOG("splash: shown %.1f s, the game has its first frame%s\n",t,g_stop? "" : " (not seen: gave up waiting)"); }   /* never just a flash */
       double a1= t>=fade? 1.0 : t/fade; if(tstop){ out=(plat_ns()-tstop)/1e9/fade; if(out>=1.0) break; a1*=1.0-out; }
+      if(base){ LONG ph=g_phase; double tg;
+        if(g_stop) tg=1.0;
+        else if(ph==0) tg=0.04+0.84*g_frac;
+        else if(ph==1) tg=0.88+0.11*(1.0-exp(-((double)plat_ns()-(double)g_t_boot)/1e9/0.8));
+        else tg=0.9*(1.0-exp(-t/5.0));
+        if(tg>shown_p) shown_p+= (tg-shown_p)*(g_stop? 0.35 : 0.15);   /* never goes back */
+        draw_bar((u32*)bits,base,mem,font,w,h,by,shown_p); }
       S_PUT(a1*255.0); if(!shown){ shown=1; LOG("splash: on (%dx%d)\n",w,h); }
       Sleep(16); }
     DestroyWindow(hw); }
+  free(base); if(font) DeleteObject(font);
   SelectObject(mem,old); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(NULL,scr);
   return 0; }
 
