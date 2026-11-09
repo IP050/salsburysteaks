@@ -4,6 +4,21 @@ Fixes and changes per release. Found a problem? Please use the
 [bug report form](../../issues/new?template=bug_report.yml) and attach `Metroid Prime 4 Beyond.log`: it holds the
 timings and errors needed to trace most issues, and one report per problem keeps each one easy to track.
 
+## 2026.11.13
+
+### Native Vulkan starts again after a crash
+On some AMD cards (RX 9070 XT, Ryzen Z1 / Legion Go) Native Vulkan crashes during the opening cutscene, and after
+that the game stayed on "Loading" at every start until the `vulkan_native` folder was deleted by hand. After a run
+that did not close properly, Native Vulkan now sets its shader cache aside (as `vulkan_native\shader_cache.crashed`)
+and builds a new one, so the game opens again by itself. The first start after a crash builds shaders again.
+
+The cutscene crash itself is not fixed yet. To find it:
+- The game now keeps its own crash reporter in place when a driver installs another one over it, and the log names
+  the file that did.
+- A program exit asked for by a driver is now written to the log too.
+
+If the game crashes for you, please attach the log from this version.
+
 ## 2026.11.12
 
 ### The game stays at console speed

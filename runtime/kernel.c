@@ -204,6 +204,7 @@ void kernel_run_main(u64 entry, u64 stack_size, int prio, int core){
 
 void process_exit(int code){
   g_exiting=1; LOG("The game exited (code %d)\n",code);
+  { extern void snxvk_closed(void); snxvk_closed(); }   /* the game's own exit is a proper close too */
   log_flush(); fflush(NULL); { extern void launcher_on_exit(void); launcher_on_exit(); } exit(code);
 }
 

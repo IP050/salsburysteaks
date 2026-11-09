@@ -319,7 +319,10 @@ static __attribute__((noinline)) size_t crash_test_call(const char* bad){
   size_t r=sl? sl(bad) : 0; __asm__ volatile("" ::: "memory"); return r+1; }
 static unsigned __stdcall crash_test_thread(void* a){ (void)a; plat_diag_role("crash-test");
   logf_(0,"crash test: strlen on a bad pointer from crash_test_call\n"); return (unsigned)crash_test_call((const char*)(size_t)0x1001b); }
-void plat_crash_test(void){ if(!getenv("SWR_CRASH_TEST")) return;
+static LONG WINAPI crash_test_other_filter(EXCEPTION_POINTERS* e){ (void)e; return EXCEPTION_EXECUTE_HANDLER; }   /* a stand-in for a driver's filter */
+void plat_crash_handler_check(void);
+void plat_crash_test(void){ const char* t=getenv("SWR_CRASH_TEST"); if(!t) return;
+  if(!strcmp(t,"2")){ SetUnhandledExceptionFilter(crash_test_other_filter); plat_crash_handler_check(); }   /* 2: replaced, then put back */
   uintptr_t h=_beginthreadex(NULL,0,crash_test_thread,NULL,0,NULL); if(h) WaitForSingleObject((HANDLE)h,INFINITE); }
 
 static LONG WINAPI veh_fatal(EXCEPTION_POINTERS* e){
@@ -333,7 +336,17 @@ static LONG WINAPI veh_fatal(EXCEPTION_POINTERS* e){
 
 static void on_abort(int s){ logf_(0,"\n*** Shutdown: abort() (signal %d), probably the video driver or out of memory ***\n",s); log_flush(); }
 
-static void on_exit_log(void){ logf_(0,"program shutdown\n"); }
+static void on_exit_log(void){ logf_(0,"program shutdown\n"); log_flush(); }   /* exit() from anywhere (a driver too) still says so */
+
+/* A DLL can install its own unhandled-exception filter over ours (graphics drivers and their crash reporters do), and
+   a crash then never reaches the log: 2026-11-09, native Vulkan on AMD (RX 9070 XT) twice ended at the same point after
+   the intro video with no line at all, while the OpenGL driver's crashes were caught. Called once a second from the
+   frontend loop: ours goes back, and the module that replaced it is named once */
+void plat_crash_handler_check(void){
+  LPTOP_LEVEL_EXCEPTION_FILTER prev=SetUnhandledExceptionFilter(crash_filter);
+  if(prev && prev!=crash_filter){ static int said; if(said<4){ said++; extern int plat_module_of(const void*, char*, int, u64*); char mn[260]; u64 mo=0;
+      if(plat_module_of((const void*)prev,mn,sizeof mn,&mo)) logf_(0,"crash handler: %s+%llx had replaced it; ours is back\n",mn,(unsigned long long)mo);
+      else logf_(0,"crash handler: replaced by code at %p; ours is back\n",(void*)prev); } } }
 
 static void inv_param(const wchar_t* e, const wchar_t* f, const wchar_t* fi, unsigned l, uintptr_t r){ (void)e;(void)f;(void)fi;(void)l;(void)r; logf_(0,"warning: invalid parameter in the C library\n"); }
 

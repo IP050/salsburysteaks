@@ -49,3 +49,6 @@ RomFS/
 mods/
 runtime/fsr1_glsl.inc
 runtime/local/
+
+# editor/assistant local settings (can hold PC paths)
+.claude/

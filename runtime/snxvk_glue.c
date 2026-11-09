@@ -141,11 +141,30 @@ void snxvk_ini(const char* v){
 void snxvk_gpu_init(void){ if(g_snxvk_want) snxv_gpu_init(); }
 
 /* the window is up (backend_win32): start Vulkan; 0 = it can't, the caller falls back to OpenGL */
+/* A run that ended without snxvk_exit (a crash) leaves vulkan_native/running.txt. 2026-11-09, AMD (RX 9070 XT, Legion
+   Go): native Vulkan died while making the opening cutscene's new pipelines, and from then on the game didn't open at
+   all until the player deleted vulkan_native, as its cache made the same pipelines again at startup. So after such a
+   run the shader cache is set aside as shader_cache.crashed (one kept, for a bug report) and made again from nothing */
+static void snxvk_rmtree(const char* p){ PDir d; if(plat_dir_open(&d,p)) return;
+  while(plat_dir_next(&d)){ char c[1200]; snprintf(c,sizeof c,"%s/%s",p,d.name); if(d.is_dir) snxvk_rmtree(c); else remove(c); }
+  plat_dir_close(&d); RemoveDirectoryA(p); }
+static char g_snxvk_marker[1100];
+static void snxvk_crash_guard(void){
+  snprintf(g_snxvk_marker,sizeof g_snxvk_marker,"%srunning.txt",g_cachedir);
+  FILE* f=fopen(g_snxvk_marker,"rb");
+  if(f){ char was[200]={0}; size_t n=fread(was,1,sizeof was-1,f); was[n]=0; fclose(f);
+    char sc[1100], bk[1100]; snprintf(sc,sizeof sc,"%sshader_cache",g_cachedir); snprintf(bk,sizeof bk,"%sshader_cache.crashed",g_cachedir);
+    snxvk_rmtree(bk);
+    if(MoveFileA(sc,bk)) WARN("vulkan_native: the last run (%s) ended without closing: its shader cache is set aside as shader_cache.crashed and made again\n",was[0]? was : "?");
+    else WARN("vulkan_native: the last run ended without closing; its shader cache could not be set aside (error %lu)\n",(unsigned long)GetLastError()); }
+  f=fopen(g_snxvk_marker,"wb"); if(f){ fprintf(f,"process %lu, build %s %s",(unsigned long)GetCurrentProcessId(),__DATE__,__TIME__); fclose(f); } }
+
 int snxvk_start(void){
   if(!g_snxvk_want) return 0;
   extern int g_ww_ok;
   if(!g_ww_ok){ WARN("vulkan_native: guest memory has no write tracking: using OpenGL\n"); return 0; }
   snprintf(g_cachedir,sizeof g_cachedir,"%svulkan_native/",g_exedir); plat_mkdir(g_cachedir);
+  snxvk_crash_guard();
   { extern int g_opt_vsync; snxvk_opt_vsync=g_opt_vsync; }
   { /* our .ini into their g_settings (swr_settings.c). Their recording thread records the frame's commands; DLSS and
        HDR output record directly into the frame's command buffer, so with either on it stays off (both need a restart) */
@@ -236,7 +255,8 @@ u64 snxvk_screenshot(const char* path){ return g_snxvk_on && snxv_vk_renderer.sc
 void snxvk_tick(int tick){   /* frontend loop, 60 Hz */
   if(!g_snxvk_on) return;
   if(tick%300==0 && snxv_vk_renderer.save) snxv_vk_renderer.save(0); }   /* it writes after a quiet stretch */
-void snxvk_exit(void){ if(g_snxvk_on && snxv_vk_renderer.save) snxv_vk_renderer.save(1); }
+void snxvk_closed(void){ if(g_snxvk_marker[0]) remove(g_snxvk_marker); }   /* closed properly: no crash guard next time */
+void snxvk_exit(void){ if(g_snxvk_on && snxv_vk_renderer.save) snxv_vk_renderer.save(1); snxvk_closed(); }
 
 #else   /* built without the library: the option is ignored */
 void snxvk_ini(const char* v){ if(!strcmp(v,"vulkan_native")) WARN("renderer=vulkan_native: this build has no native Vulkan renderer (runtime/snxvk/libsnxvk.a): using OpenGL\n"); }
@@ -254,4 +274,5 @@ int snxvk_pacing(void){ return 0; }
 u64 snxvk_screenshot(const char* p){ (void)p; return 0; }
 void snxvk_tick(int t){ (void)t; }
 void snxvk_exit(void){}
+void snxvk_closed(void){}
 #endif

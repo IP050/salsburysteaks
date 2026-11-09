@@ -840,7 +840,11 @@ int swr_main(int argc, char** argv){
   u64 next=plat_ns(); int tick=0;
   while(!g_quit){
     video_poll(); hid_update(); vsync_tick_vt(); ff_poll(); settings_test_hook(); settings_drain();
-    if(tick%60==0) ini_poll();
+    if(tick%60==0){ ini_poll();
+#ifdef _WIN32
+      extern void plat_crash_handler_check(void); plat_crash_handler_check();
+#endif
+    }
     { extern void kernel_heal_mutexes(void); kernel_heal_mutexes(); }
     /* bail out of the slow clock if nothing was presented for 3s */
     { static int lf=-1, still; if(g_vt_on){ if(g_frames!=lf){ lf=g_frames; still=0; } else if(++still==180){ vt_set(0); WARN("smooth recording: the game stopped presenting images; back to the normal clock (recording continues)\n"); } } else { lf=-1; still=0; } }
