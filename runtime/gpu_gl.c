@@ -2113,7 +2113,25 @@ static void rt_flush_depth(Tex* t, u64 gva){
   int sub= !whole && t->bl && g_dma_rect[2] && g_dma_rect[4]==w*bp && !(g_dma_rect[0]%bp) && !(g_dma_rect[2]%bp) && rw && rh && rx+rw<=w && ry+rh<=h;
   u64 t0=plat_ns(); u8* px=malloc(sub? (size_t)rw*rh*bp : (size_t)w*h*bp); if(!px) return;
   GLuint tmp=0;
-  if(g_scale!=1.0f){ glGenTextures(1,&tmp); glBindTexture(GL_TEXTURE_2D,tmp); glTexStorage2D(GL_TEXTURE_2D,1,t->f.ifmt,w,h);
+  /* scaled resolution, part of the target: read that part straight from the scaled depth-stencil and take the nearest
+     pixel for each one the game reads. The scaled-down depth-stencil blit before the read took 600-770 ms a copy on
+     NVIDIA (MEASURED 2026-11-09, resolution=2, scan visor: 1.5 FPS); the read alone is a few ms */
+  if(sub && g_scale!=1.0f){
+    u32 sw=SC(w), sh=SC(h), x0=(u32)(rx*g_scale), y0=(u32)(ry*g_scale), x1=SC(rx+rw), y1=SC(ry+rh);
+    if(x1>sw) x1=sw; if(y1>sh) y1=sh; if(x0>=x1) x0= x1? x1-1 : 0; if(y0>=y1) y0= y1? y1-1 : 0;
+    u32 bw=x1-x0, bh=y1-y0; u8* big=malloc((size_t)bw*bh*bp); if(!big){ free(px); return; }
+    glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,t->id,0);
+    glReadBuffer(GL_NONE); glReadPixels((GLint)x0,(GLint)y0,(GLsizei)bw,(GLsizei)bh,GL_DEPTH_STENCIL,t->f.type,big); glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0);
+    glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); state_dirty();
+    for(u32 y=0;y<rh;y++){ u32 sy=(u32)((ry+y+0.5f)*g_scale); sy= sy<y0? 0 : sy-y0; if(sy>=bh) sy=bh-1;
+      for(u32 x=0;x<rw;x++){ u32 sx=(u32)((rx+x+0.5f)*g_scale); sx= sx<x0? 0 : sx-x0; if(sx>=bw) sx=bw-1;
+        memcpy(px+((size_t)y*rw+x)*bp,big+((size_t)sy*bw+sx)*bp,bp); } }
+    free(big);
+  }
+  else if(g_scale!=1.0f){ glGenTextures(1,&tmp); glBindTexture(GL_TEXTURE_2D,tmp); glTexStorage2D(GL_TEXTURE_2D,1,t->f.ifmt,w,h);
     glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,t->id,0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER,g_dfbo); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
@@ -2122,7 +2140,8 @@ static void rt_flush_depth(Tex* t, u64 gva){
     glBlitFramebuffer(0,0,(GLint)SC(w),(GLint)SC(h),0,0,(GLint)w,(GLint)h,GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT,GL_NEAREST);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0); }
   glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
-  if(sub){ glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
+  if(sub && g_scale!=1.0f){}   /* read above */
+  else if(sub){ glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,tmp? tmp : t->id,0);
     glReadBuffer(GL_NONE); glReadPixels((GLint)rx,(GLint)ry,(GLsizei)rw,(GLsizei)rh,GL_DEPTH_STENCIL,t->f.type,px); glReadBuffer(GL_COLOR_ATTACHMENT0);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0); }
