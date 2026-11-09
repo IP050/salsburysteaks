@@ -445,6 +445,8 @@ static const IniOpt INI_LAUNCHER[]={
   {"launcher_nav","1","1 = navigate the Play screen and menus with a controller"},
   {"launcher_prompts","auto","Button prompts: auto, xbox, playstation, nintendo, positions"},
   {"launcher_bindings","1,0,6,7,10","Menu buttons by position (confirm, back, previous page, next page, play):\n;   0 right, 1 bottom, 2 top, 3 left face button, 6 L, 7 R, 10 +, 11 -"},
+  {"discord","1","1 = show the game as your Discord status while Discord is open (Windows, applies on the next start)"},
+  {"discord_app_id","","The Application ID from discord.com/developers/applications; empty = no Discord status"},
   {"migrated_from","","Where settings and saves were imported from on the first start (informational)"},
   {"setup_base","","The game folder used by the last setup (for Check game files and rebuild)"},
   {"setup_update","","The separate update folder used by the last setup, if any"},

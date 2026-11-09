@@ -33,7 +33,9 @@ extern int g_opt_fps;
 
 static int g_ls_mode=0; static char g_ls_path[1024];
 
+extern void discord_ini(const char* k, const char* v); extern void discord_start(void);   /* discord_win32.c */
 void backend_ini(const char* k, const char* v){
+  discord_ini(k,v);
   if(!strcmp(k,"fullscreen")) g_want_fs=atoi(v);
   else if(!strcmp(k,"lossless_scaling")) g_ls_mode=atoi(v);
   else if(!strcmp(k,"lossless_path")) strncpy(g_ls_path,v,1023);
@@ -409,6 +411,7 @@ void video_init(const char* title){
   else SetEvent(g_video_go);   /* the front end ran in the window: continue there */
   WaitForSingleObject(g_ready,INFINITE);
   g_start=plat_ns(); if(getenv("SWR_REC")) g_rec_toggle=1;
+  if(!getenv("SWR_TEST_SCRIPT") && !getenv("SWR_TEST_EXIT_FRAME") && !getenv("SWR_TEST_RECORD")) discord_start();
   { /* under Proton the driver is Mesa; glthread has to be enabled from the Steam launch options */
     HMODULE nt=GetModuleHandleA("ntdll.dll"); if(nt && GetProcAddress(nt,"wine_get_version"))
       LOG("Proton/Wine detected: for more FPS put   mesa_glthread=true %%command%%   in the game's Steam launch options (moves the OpenGL driver work to another core)\n"); }
