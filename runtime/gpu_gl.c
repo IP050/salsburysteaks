@@ -1354,6 +1354,7 @@ static GLuint warm_stage_take(u64 key,GLint*uloc){
   for(WarmStage*w=warm_stages[h];w;w=w->next)if(w->key==key&&w->program){GLuint p=w->program;*uloc=w->uloc;w->program=0;warm_stage_used++;return p;}
   return 0;
 }
+static GLuint warm_stage_peek(u64 key){ u32 h=(u32)(key^(key>>32))&511; for(WarmStage*w=warm_stages[h];w;w=w->next) if(w->key==key && w->program) return w->program; return 0; }
 /* Shared by synchronous and background paths: metrics must count both. */
 static GLuint binary_load(const char*path,int separable){
   u64 start=plat_ns();FILE*f=fopen(path,"rb");if(!f)return 0;
@@ -1527,6 +1528,54 @@ static void worker_start(void){
   if(g_worker==1) LOG("shaders: %d compiler thread%s active (%s)\n",g_workers_up,g_workers_up==1? "" : "s",
                       g_sync_draws? "draws wait for their new shaders; the threads precompile the shader pack" : "shaders compile in the background without freezing the game");
   else LOG("shaders: compiler thread not available (shaders compile on the GPU thread)\n"); }
+/* ============================================================ background program loader (ini shader_loader, NVIDIA on Windows)
+   Loading a finished program binary on the GL thread froze it: runs of 200-730 ms a program, one after another, 7.8 s at
+   an area load (MEASURED 2026-11-08, driver 621). This thread loads them on a shared context and hands them to the first
+   draw through warm_stage_put; until then that draw is skipped. It never compiles: compile threads of ours hung on NVIDIA
+   (driver 617, see gpu_thread). If one load takes over LD_DEAD_NS the loader is given up and loads return to the GL thread */
+int g_opt_shader_loader=1, g_opt_blit_nosync=1, g_opt_slab_min_mb=16, g_opt_oq_sync=1;
+#define LD_Q 8192u
+#define LD_MAP 32768u
+#define LD_DEAD_NS 8000000000ull
+static u64 g_ld_req[LD_Q]; static volatile u32 g_ld_rh, g_ld_rt;
+static struct { u64 key; GLuint prog; u32 ms; } g_ld_res[LD_Q]; static volatile u32 g_ld_dh, g_ld_dt;
+static volatile int g_ld_state;            /* 0 not started, 1 running, -1 given up or unavailable */
+static volatile u64 g_ld_busy;             /* when the load in progress began, 0 idle */
+static u64 g_ld_map[LD_MAP]; static unsigned char g_ld_st[LD_MAP]; static u32 g_ld_n, g_ld_ok, g_ld_miss, g_ld_slow; static u64 g_ld_ms;
+static void ld_thread(void* arg){ (void)arg; plat_diag_role("shader-loader");
+  if(!backend_gl_worker_current()){ LOG("shaders: background loader: no shared context, programs load on the GL thread\n"); __atomic_store_n(&g_ld_state,-1,__ATOMIC_RELEASE); return; }
+  __atomic_store_n(&g_ld_state,1,__ATOMIC_RELEASE);
+  for(;;){ u32 t=__atomic_load_n(&g_ld_rt,__ATOMIC_ACQUIRE);
+    if(t==__atomic_load_n(&g_ld_rh,__ATOMIC_ACQUIRE)){ plat_sleep_ns(500000); continue; }
+    u64 key=g_ld_req[t%LD_Q], t0=plat_ns(); __atomic_store_n(&g_ld_busy,t0,__ATOMIC_RELEASE);
+    char path[160]; snprintf(path,sizeof path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
+    GLuint p=binary_load(path,1); if(p) glFinish();
+    u32 ms=(u32)((plat_ns()-t0)/1000000ull); __atomic_store_n(&g_ld_busy,0,__ATOMIC_RELEASE); __atomic_store_n(&g_ld_rt,t+1,__ATOMIC_RELEASE);
+    u32 h=__atomic_load_n(&g_ld_dh,__ATOMIC_ACQUIRE); while(h-__atomic_load_n(&g_ld_dt,__ATOMIC_ACQUIRE)>=LD_Q) plat_sleep_ns(1000000);
+    g_ld_res[h%LD_Q].key=key; g_ld_res[h%LD_Q].prog=p; g_ld_res[h%LD_Q].ms=ms; __atomic_store_n(&g_ld_dh,h+1,__ATOMIC_RELEASE); } }
+/* what the loader did with a key: 0 never asked, 1 with the loader, 2 answered (the program went to the warm list, was
+   taken from it, or the file was no good: the draw then does what it did without the loader). Only the GPU thread touches it */
+static int ld_slot(u64 key){ for(u32 i=(u32)(key^(key>>29))&(LD_MAP-1),n=0;n<LD_MAP;i=(i+1)&(LD_MAP-1),n++) if(!g_ld_st[i] || g_ld_map[i]==key) return (int)i; return -1; }
+static int ld_state(u64 key){ int i=ld_slot(key); return i<0? 2 : g_ld_st[i]; }
+static int ld_on(void){
+  if(g_ld_state==0 && g_opt_shader_loader && g_nv_win && g_pcache>0 && !g_sync_draws && !getenv("SWR_NO_SHADER_LOADER")){
+    static int started; if(!started){ started=1; if(plat_thread(ld_thread,NULL,4u<<20)){ g_ld_state=-1; return 0; }
+      u64 t0=plat_ns(); while(!__atomic_load_n(&g_ld_state,__ATOMIC_ACQUIRE) && plat_ns()-t0<2000000000ull) plat_sleep_ns(1000000);
+      if(__atomic_load_n(&g_ld_state,__ATOMIC_ACQUIRE)!=1){ g_ld_state=-1; return 0; } LOG("shaders: background loader on: program binaries load without holding up the GL thread\n"); } }
+  return __atomic_load_n(&g_ld_state,__ATOMIC_ACQUIRE)==1; }
+static int ld_request(u64 key){ if(!ld_on()) return 0; int i=ld_slot(key); if(i<0 || g_ld_st[i]) return 0;
+  u32 h=__atomic_load_n(&g_ld_rh,__ATOMIC_ACQUIRE); if(h-__atomic_load_n(&g_ld_rt,__ATOMIC_ACQUIRE)>=LD_Q) return 0;
+  g_ld_map[i]=key; g_ld_st[i]=1; g_ld_req[h%LD_Q]=key; __atomic_store_n(&g_ld_rh,h+1,__ATOMIC_RELEASE); g_ld_n++; return 1; }
+static void ld_drain(void){ if(g_ld_state==0) return;
+  u32 t=__atomic_load_n(&g_ld_dt,__ATOMIC_ACQUIRE), h=__atomic_load_n(&g_ld_dh,__ATOMIC_ACQUIRE);
+  for(;t!=h;t++){ u64 key=g_ld_res[t%LD_Q].key; GLuint p=g_ld_res[t%LD_Q].prog; u32 ms=g_ld_res[t%LD_Q].ms; g_ld_ms+=ms;
+    if(p){ warm_stage_put(key,p,-2 /* ULOC_LAZY */); g_ld_ok++; } else g_ld_miss++;
+    if(ms>50){ g_ld_slow++; if(g_ld_slow<=60) LOG("shaders: background loader: a program took %u ms\n",ms); }
+    int i=ld_slot(key); if(i>=0) g_ld_st[i]=2; }
+  __atomic_store_n(&g_ld_dt,t,__ATOMIC_RELEASE);
+  u64 b=__atomic_load_n(&g_ld_busy,__ATOMIC_ACQUIRE);
+  if(g_ld_state==1 && b && plat_ns()-b>LD_DEAD_NS){ __atomic_store_n(&g_ld_state,-1,__ATOMIC_RELEASE); memset(g_ld_st,0,sizeof g_ld_st); LOG("shaders: background loader stuck on one program for over 8 s: given up, programs load on the GL thread\n"); }
+  static u32 next; if(g_ld_n>=next){ next=g_ld_n+500; LOG("shaders: background loader: %u asked, %u loaded, %u had no usable file, %u over 50 ms, %llu ms in all\n",g_ld_n,g_ld_ok,g_ld_miss,g_ld_slow,(unsigned long long)g_ld_ms); } }
 /* ============================================================ separable programs
    one program per shader stage, compiled once; draws just bind the stages instead of linking every
    vs+fs combination */
@@ -1628,6 +1677,9 @@ static int sh_sep_ready(Sh* s){
     if(wr_push(&wq_hi,j)){ s->sj=j; s->sps=1; return 0; }
     free(j); }
   if(g_pcache>0 && !tsi){char path[160];snprintf(path,sizeof path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
+    /* the background loader has it, or takes it now: this draw is skipped, a later one finds it in the warm list */
+    if(!g_must_wait && ld_on()){ int st=ld_state(key); if(st==1){ s->sps=0; return 0; }
+      if(!st && backend_file_exists(path) && ld_request(key)){ pack_add_sh(key,s); s->sps=0; return 0; } }
     GLuint p=binary_load(path,1);if(p){s->sp=p;s->sps=2;sh_uloc(s);pack_add_sh(key,s);return 1;}}
   /* A shader with an indirect branch (BRX) takes its jump table from a constant buffer, which the pre-build doesn't have:
      it builds a version that can jump to any instruction instead, and the draw translates the real one with the table and
