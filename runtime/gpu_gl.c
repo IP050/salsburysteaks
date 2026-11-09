@@ -190,7 +190,9 @@ static GlFmt tic_format(u32 w0, int srgb){
     case 0x42: r=FASTC(6,6); break; case 0x55: r=FASTC(8,5); break; case 0x52: r=FASTC(8,6); break; case 0x44: r=FASTC(8,8); break;
     case 0x56: r=FASTC(10,5); break; case 0x57: r=FASTC(10,6); break; case 0x53: r=FASTC(10,8); break; case 0x45: r=FASTC(10,10); break;
     case 0x54: r=FASTC(12,10); break; case 0x46: r=FASTC(12,12); break;
-    case 0x29: case 0x2A: case 0x2B: r= FD(GL_DEPTH24_STENCIL8,GL_DEPTH_STENCIL,GL_UNSIGNED_INT_24_8,4); break;
+    /* 0x0E G24R8: the same depth-stencil data with the stencil in red (a stencil read, tic_stencil_read). Unknown here, it
+       bound nothing and the fog pass got stencil 0 everywhere: the Ice Belt lake disappeared in fog (fix from linuxopt/mp4-recomp) */
+    case 0x0E: case 0x29: case 0x2A: case 0x2B: r= FD(GL_DEPTH24_STENCIL8,GL_DEPTH_STENCIL,GL_UNSIGNED_INT_24_8,4); break;
     case 0x2F: r= FD(GL_DEPTH_COMPONENT32F,GL_DEPTH_COMPONENT,GL_FLOAT,4); break;
     case 0x30: r= FD(GL_DEPTH32F_STENCIL8,GL_DEPTH_STENCIL,GL_FLOAT_32_UNSIGNED_INT_24_8_REV,8); break;   /* ZF32_X24S8 */
     case 0x3A: r= FD(GL_DEPTH_COMPONENT16,GL_DEPTH_COMPONENT,GL_UNSIGNED_SHORT,2); break;
@@ -547,18 +549,25 @@ static void tex_upload_(Tex* t){ if(!g_upl_t0) g_upl_t0=plat_ns(); st_tex_up+=t-
       else { for(u32 y=0;y<th;y++) memcpy(lin+(u64)y*rowb,src+(u64)y*t->pitch,rowb); }
       upload_unpack_ns+=plat_ns()-upload_stage; upload_stage=plat_ns();
       const u8* up=lin; u8* dec=NULL;
-      if((f->astc||f->dec) && !(dec=upload_buffer(&upload_decoded,(u64)lw*lh*4+64))){ upload_release(&upload_linear,lin); if(!direct) upload_release(&upload_source,src); off+= t->bl? lsz : (u64)t->pitch*th; continue; }
+      if((f->astc||f->dec) && !(dec=upload_buffer(&upload_decoded,(u64)lw*lh*(t->target==GL_TEXTURE_3D? ld : 1)*4+64))){ upload_release(&upload_linear,lin); if(!direct) upload_release(&upload_source,src); off+= t->bl? lsz : (u64)t->pitch*th; continue; }
       if((f->astc && t->target==GL_TEXTURE_2D && layers==1 && l+1<t->levels && a_async==(int)l && (u64)lw*lh>128u*128u && aj_on()) || (int)l<a_arr){
         aj_push(t,l,layer,lw,lh,f->bw,f->bh,lin,(size_t)rowb*th); if(!a_arr) a_async++;
         upload_release(&upload_decoded,dec); upload_release(&upload_linear,lin); if(!direct) upload_release(&upload_source,src); off+= t->bl? lsz : (u64)t->pitch*th; continue; }
-      if(f->astc){ astc_decode_par(lin,lw,lh,f->bw,f->bh,dec); up=dec; }
-      else if(f->dec){ u32* o=(u32*)dec;
-        if(f->dec<10){ swr_bc_decode(f->dec,lin,lw,lh,o); }
-        else { const u16* q=(const u16*)lin; for(u32 y=0;y<lh;y++) for(u32 x=0;x<lw;x++){ u32 v=q[(size_t)y*(rowb/2)+x], rr,gg,bb,aa;
+      /* a 3D ASTC texture is 2D blocks per slice. Only slice 0 was decoded (into a buffer for one slice) while the upload below
+         takes ld slices: the rest was whatever followed in memory. Prime 4's hologram and fog noise volumes are 3D ASTC: the
+         tram hologram was cut into chunks, the fog blocky (2026-11-08) */
+      if(f->astc && t->target==GL_TEXTURE_3D){ for(u32 z=0;z<ld;z++) astc_decode_par(lin+(u64)z*rowb*th,lw,lh,f->bw,f->bh,dec+(u64)z*lw*lh*4); up=dec;
+        { static int said; if(!said){ said=1; LOG("gpu: 3D ASTC texture %ux%ux%u: every slice decoded\n",lw,lh,ld); } } }
+      else if(f->astc){ astc_decode_par(lin,lw,lh,f->bw,f->bh,dec); up=dec; }
+      /* every slice of a 3D texture, not only the first (the rest came from past the end of the buffer, so the fog noise of
+         the Ice Belt lake was garbage: fix from linuxopt/mp4-recomp) */
+      else if(f->dec){ u32 nzd= t->target==GL_TEXTURE_3D? ld : 1; for(u32 z=0;z<nzd;z++){ u32* o=(u32*)dec+(u64)z*lw*lh; const u8* sl=lin+(u64)z*rowb*th;
+        if(f->dec<10){ swr_bc_decode(f->dec,sl,lw,lh,o); }
+        else { const u16* q=(const u16*)sl; for(u32 y=0;y<lh;y++) for(u32 x=0;x<lw;x++){ u32 v=q[(size_t)y*(rowb/2)+x], rr,gg,bb,aa;
             if(f->dec==10){ rr=(v&15)*17; gg=((v>>4)&15)*17; bb=((v>>8)&15)*17; aa=((v>>12)&15)*17; }
             else if(f->dec==11){ rr=(v&31)*255/31; gg=((v>>5)&31)*255/31; bb=((v>>10)&31)*255/31; aa=(v>>15)? 255 : 0; }
             else { rr=(v&31)*255/31; gg=((v>>5)&63)*255/63; bb=((v>>11)&31)*255/31; aa=255; }
-            o[(size_t)y*lw+x]=rr|(gg<<8)|(bb<<16)|(aa<<24); } }
+            o[(size_t)y*lw+x]=rr|(gg<<8)|(bb<<16)|(aa<<24); } } }
         up=dec; }
       upload_decode_ns+=plat_ns()-upload_stage;
       { static int dmp=-1, nd; if(dmp<0) dmp=getenv("SWR_DUMP_TEX")!=NULL;
@@ -1061,6 +1070,14 @@ static int dsa_copy(Tex* st, u64 dst, u32 w, u32 h){
 static Tex* tex_from_tic_(u32* tic){
   u64 gva=((u64)(tic[2]&0xFFFF)<<32)|tic[1];
   if(g_ndsa){ u32 ff=tic[0]&0x7F; if(ff==0x0D || ff==0x0E || ff==0x29 || ff==0x2A){ Tex* da=dsa_find(gva); if(da){ da->last_used=g_frame; return da; } } }   /* depth-stencil copied by the 2D engine */
+  /* the same formats aimed straight at a depth-stencil target: the fog composite reads the scene's stencil this way (bit 0 =
+     the pixel skips the per-pixel volumetric lights). NULL read as 0, so every pixel took the heavy path: the scene's average
+     went from (31,20,18) to (194,157,91) in that one draw, washed out where the game is dark (2026-11-08). tex_int_mask
+     and tic_stencil_read then bind it as a stencil view */
+  { u32 ff=tic[0]&0x7F; if(ff==0x0D || ff==0x0E){ Tex* zr=tex_find_rt(gva);
+      if(zr && zr->f.depth && zr->f.fmt==GL_DEPTH_STENCIL && zr->target==GL_TEXTURE_2D){ zr->last_used=g_frame;
+        static int said; if(!said){ said=1; LOG("gpu: TIC format %x reads the stencil of the depth target at %llx directly\n",ff,(unsigned long long)gva); }
+        return zr; } } }
   u32 hv=(tic[2]>>21)&7; int bl= hv==3||hv==4;
   u32 w=(tic[4]&0xFFFF)+1, h=(tic[5]&0xFFFF)+1, d=((tic[5]>>16)&0x3FFF)+1; u32 type=(tic[4]>>23)&0xF;
   int srgb=(tic[4]>>22)&1; u32 levels=((tic[3]>>28)&0xF)+1;
