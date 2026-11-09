@@ -2280,9 +2280,19 @@ static void bind_imgs(GpuChannel* ch, int stage, Sh* s){
    material reads); each draw used to get a fresh copy from guest memory, which never sees GPU writes, so materials read
    stale light data (the arm cannon one flat colour that changed from run to run). A buffer is refilled from guest
    memory only when the CPU changed it (hash); later reads inside its range bind it at an offset. SWR_NO_GPU_SSBO=1: off */
-typedef struct { u64 addr; u32 size; GLuint id; u64 hash; GLuint rb; u8* rb_ptr; u32 rb_size; GLsync rb_fence; int written, atomic_now; u32* last; } GwBuf;
-static GwBuf g_gw[32]; static int g_gw_sync; static int g_ngw, g_gw_pending, g_gw_off=-1; static GLint g_ssbo_align;
-static GwBuf* gw_find(u64 a){ for(int i=0;i<g_ngw;i++) if(a>=g_gw[i].addr && a<g_gw[i].addr+g_gw[i].size) return &g_gw[i]; return NULL; }
+typedef struct { u64 addr; u32 size; GLuint id; u64 hash; GLuint rb; u8* rb_ptr; u32 rb_size; GLsync rb_fence; int written, atomic_now; u32* last; u32 used; } GwBuf;
+/* Every level or save load puts these at new addresses, and old ones were never dropped: with the table full (32) a new
+   light list wasn't kept on the GPU, and the materials reading it drew black (marines and crates after loading a second
+   save, 2026-11-09: traces 462 and 468, the writer's "kept on the GPU" missing). Now the longest unused one makes room */
+#define GW_MAX 128
+static GwBuf g_gw[GW_MAX]; static int g_gw_sync; static int g_ngw, g_gw_pending, g_gw_off=-1; static GLint g_ssbo_align;
+static GwBuf* gw_find(u64 a){ for(int i=0;i<g_ngw;i++) if(a>=g_gw[i].addr && a<g_gw[i].addr+g_gw[i].size){ g_gw[i].used=g_frame; return &g_gw[i]; } return NULL; }
+static void gw_drop(int i){ GwBuf* g=&g_gw[i]; if(g->id) glDeleteBuffers(1,&g->id); if(g->rb) glDeleteBuffers(1,&g->rb); if(g->rb_fence) p_rbds(g->rb_fence); free(g->last); *g=g_gw[--g_ngw]; }
+/* a new buffer: one unused for 10 s or more that overlaps it is an old level's, it would answer reads meant for the new one */
+static void gw_make_room(u64 a, u32 n){
+  for(int i=0;i<g_ngw;){ if(g_frame-g_gw[i].used>600u && a<g_gw[i].addr+g_gw[i].size && g_gw[i].addr<a+n) gw_drop(i); else i++; }
+  if(g_ngw>=GW_MAX){ int o=0; for(int i=1;i<g_ngw;i++) if(g_frame-g_gw[i].used>g_frame-g_gw[o].used) o=i;
+    static int said; if(said<20){ said++; LOG("gpu: shader-written buffers: dropped %llx, unused for %u frames, to make room\n",(unsigned long long)g_gw[o].addr,g_frame-g_gw[o].used); } gw_drop(o); } }
 /* scan-visor diagnostics: which counter words changed, GPU (atomics) or CPU (the game resetting/reading them) */
 static void gw_diff(const char* who, GwBuf* g, const u8* now, u32 n){
   static int lines; if(!g->last || lines>=600 || g->size<1024 || g->size>16384) return; u32 cnt=0; char buf[600]; int o=0;
@@ -2292,8 +2302,9 @@ static GwBuf* gw_get(u64 a, u32 n){
   static u8* tmp; static size_t cap; if(cap<n){ tmp=realloc(tmp,n); cap=n; } if(!tmp) return NULL;
   gmem_read(a,tmp,n); u64 h=fast_hash(tmp,n,3);
   GwBuf* g=NULL; for(int i=0;i<g_ngw;i++) if(g_gw[i].addr==a){ g=&g_gw[i]; break; }
-  if(!g){ if(g_ngw>=32) return NULL; g=&g_gw[g_ngw++]; memset(g,0,sizeof *g); g->addr=a; glGenBuffers(1,&g->id);
+  if(!g){ gw_make_room(a,n); g=&g_gw[g_ngw++]; memset(g,0,sizeof *g); g->addr=a; glGenBuffers(1,&g->id);
     static int said; if(said<8){ said++; LOG("gpu: global buffer %llx (%u bytes) is written by shaders: kept on the GPU between draws\n",(unsigned long long)a,n); } }
+  g->used=g_frame;
   if(g->size<n){ g->size=n; glBindBuffer(GL_SHADER_STORAGE_BUFFER,g->id); glBufferData(GL_SHADER_STORAGE_BUFFER,n,tmp,GL_DYNAMIC_COPY); g->hash=h;
     free(g->last); g->last=malloc(n); if(g->last) memcpy(g->last,tmp,n); }   /* the shadow follows the GPU copy */
   else if(g->hash!=h){ gw_diff("CPU",g,tmp,n); if(g->last) memcpy(g->last,tmp,n<g->size? n : g->size);
