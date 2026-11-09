@@ -359,9 +359,11 @@ static void win_thread(void* arg){
   RECT r={0,0,1280,720}; AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
   g_hwnd=CreateWindowA("MetroidPrime4RecompWnd",g_title,WS_OVERLAPPEDWINDOW|(arg? 0 : WS_VISIBLE),CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,NULL,NULL,hi,NULL);
   if(arg){   /* front end first, in this window; the game continues in it after Play */
+    /* the Play screen, the game and the EXE all use icon 1, the game's logo: it comes from the window class */
     g_fe_mode=1; g_fe_result=fe_run(g_hwnd); g_fe_mode=0;
     if(g_fe_result){ SetEvent(g_fe_done); return; }   /* the process ends */
     if(g_fullscreen) ShowCursor(FALSE);   /* the front end kept the cursor visible in fullscreen */
+    { extern void splash_start(int,int,int,int); RECT cr; POINT tl={0,0}; if(GetClientRect(g_hwnd,&cr) && ClientToScreen(g_hwnd,&tl)) splash_start(tl.x,tl.y,tl.x+cr.right,tl.y+cr.bottom); }   /* splash_win32.c, until the first swap */
     SetEvent(g_fe_done); WaitForSingleObject(g_video_go,INFINITE);
     { /* The front end drew with a D3D11 flip-model swapchain. Once DXGI has had such a swapchain on a window, OpenGL
          and Vulkan presents to that window never reach the screen (MEASURED 2026-10-22: after Play the Play screen
@@ -489,7 +491,7 @@ void* backend_gl_proc(const char* n){
   return backend_gl_proc_raw(n); }
 
 void backend_gl_vsync(int on){ SWI si=(SWI)wglGetProcAddress("wglSwapIntervalEXT"); if(si) si(on?1:0); }   /* GL thread */
-void backend_gl_swap(void){ if(vkp.on) vkp_swap(); else SwapBuffers(g_hdc); }
+void backend_gl_swap(void){ if(vkp.on) vkp_swap(); else SwapBuffers(g_hdc); { static int said; if(!said){ said=1; extern void splash_first_swap(void); splash_first_swap(); } } }
 
 int backend_gl_worker_current(void){ int i=__atomic_fetch_add(&g_wnext,1,__ATOMIC_ACQ_REL); return i<g_nwctx && wglMakeCurrent(g_wdc[i]? g_wdc[i] : g_hdc,g_wctx[i]); }
 

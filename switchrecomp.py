@@ -294,7 +294,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
         if os.path.isfile(spvc): srcs += [os.path.join(RT, 'lsfg.c'), os.path.join(RT, 'lsfg_spvc.cpp')]
         else: spvc = None
     if gl and not spvc: srcs += [os.path.join(RT, 'lsfg_stub.c')]
-    if target_win and backend == 'win32': srcs += [os.path.join(RT, 'rec_win32.c'), os.path.join(RT, 'cursor_win32.c')]   # F7 recorder (Media Foundation), the game's mouse pointer
+    if target_win and backend == 'win32': srcs += [os.path.join(RT, 'rec_win32.c'), os.path.join(RT, 'cursor_win32.c'), os.path.join(RT, 'discord_win32.c'), os.path.join(RT, 'splash_win32.c')]   # F7 recorder (Media Foundation), the game's mouse pointer, Discord presence
     if target_win and backend == 'win32' and os.path.isfile(os.path.join(RT, 'app.rc')):   # the EXE's icon (runtime/app.ico)
         wr = os.path.join(os.path.dirname(cc) if os.path.dirname(cc) else '', 'windres.exe')
         if not os.path.isfile(wr): wr = shutil.which('windres') or ''
