@@ -4,6 +4,17 @@ Fixes and changes per release. Found a problem? Please use the
 [bug report form](../../issues/new?template=bug_report.yml) and attach `Metroid Prime 4 Beyond.log`: it holds the
 timings and errors needed to trace most issues, and one report per problem keeps each one easy to track.
 
+## 2026.11.14
+
+### AMD Radeon, Native Vulkan: a possible fix for the cutscene crash, and a way to find it if not
+- The threads that build shaders now have 16 times the stack space (16 MiB, was 1 MiB). The game's larger shaders may
+  have run AMD's shader compiler out of stack, which ends the game without a crash report. This is not confirmed as
+  the cause: if you had this crash, please report whether it is gone.
+- Before the graphics driver builds a pipeline or shader, the game now notes which one in
+  `vulkan_native\building.txt`. If the game ends there, the next start writes that note into the log
+  ("the last run ended while the driver was making this"). If it still crashes for you, start the game once more
+  and attach the log from that second start.
+
 ## 2026.11.13
 
 ### Native Vulkan starts again after a crash

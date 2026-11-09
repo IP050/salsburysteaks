@@ -244,7 +244,8 @@ void crash_report(void* host_pc, void* fault, int sig){
       else { extern int plat_module_of(const void*, char*, int, u64*); char mn[260]; u64 mo=0;
         if(plat_module_of(host_pc,mn,sizeof mn,&mo)) logf_(0,"  in %s (+%llx), a thread %s\n",mn,(unsigned long long)mo, kthread_cur()? "of the game" : "of the runtime (GPU, audio, video or window): a graphics driver's DLL here points at the driver");
         else logf_(0,"  in no loaded module, a thread %s\n", kthread_cur()? "of the game" : "of the runtime"); }
-      extern void plat_crash_chain(void); plat_crash_chain(); }
+      extern void plat_crash_chain(void); plat_crash_chain();
+      { extern void snxvk_crumbs_log(void); snxvk_crumbs_log(); } }
 #endif
     if(ga && ga<0x1000000ull) logf_(0,"  the address is a null pointer plus an offset: the game probably got NULL from its allocator (out of memory?). Try memory_gb=6 in the .ini\n"); }
   if(g_mod){ /* closest recompiled fn below host pc */

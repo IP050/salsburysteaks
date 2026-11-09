@@ -580,7 +580,12 @@ static CsPipe* cs_pipe(const u8* code, u32 lx, u32 ly, u32 lz, u32 shm, CsKey k)
     VkShaderModuleCreateInfo mi = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = spv};
     VkShaderModule m;
+    /* noted in vulkan_native/building.txt while the driver works on it (pipeline.c, snxvk_glue.c) */
+    extern void snx_crumb(const char* fmt, ...);
+    extern void snx_crumb_done(void);
+    snx_crumb("compute program %016llx: shader module, %u SPIR-V words", (unsigned long long)key, (u32)nw);
     int ok = VK_OK(vkCreateShaderModule(g_vk.dev, &mi, NULL, &m));
+    snx_crumb_done();
     free(spv);
     if (!ok) {
         p->failed = 1;
@@ -592,7 +597,9 @@ static CsPipe* cs_pipe(const u8* code, u32 lx, u32 ly, u32 lz, u32 shm, CsKey k)
                                                 .module = m,
                                                 .pName = "main"},
                                       .layout = g_vk_playout};
+    snx_crumb("compute program %016llx: pipeline, %u SPIR-V words", (unsigned long long)key, (u32)nw);
     if (!VK_OK(vkCreateComputePipelines(g_vk.dev, vk_pipeline_cache(), 1, &ci, NULL, &p->p))) p->failed = 1;
+    snx_crumb_done();
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     if (!p->failed)
         LOG_LIMIT(12, "vulkan: compute %016llx ready: block %ux%ux%u, %d global buffers, %d textures, %d images\n",

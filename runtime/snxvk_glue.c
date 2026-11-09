@@ -149,9 +149,45 @@ static void snxvk_rmtree(const char* p){ PDir d; if(plat_dir_open(&d,p)) return;
   while(plat_dir_next(&d)){ char c[1200]; snprintf(c,sizeof c,"%s/%s",p,d.name); if(d.is_dir) snxvk_rmtree(c); else remove(c); }
   plat_dir_close(&d); RemoveDirectoryA(p); }
 static char g_snxvk_marker[1100];
+/* What each thread is asking the driver to make (a pipeline, a shader module), in vulkan_native/building.txt: one
+   fixed line per thread, written straight to the file before the call and blanked after. The log is written by its own
+   thread and a driver that ends the process takes its last lines along; this file is in the OS's hands by then. The
+   next start prints what was left in it */
+#define CRUMB_N 16
+#define CRUMB_LEN 512
+static HANDLE g_crumb_file=INVALID_HANDLE_VALUE;
+static volatile LONG g_crumb_tid[CRUMB_N];
+static char g_crumb[CRUMB_N][CRUMB_LEN];
+static int crumb_slot(void){ LONG me=(LONG)GetCurrentThreadId();
+  for(int i=0;i<CRUMB_N;i++) if(g_crumb_tid[i]==me) return i;
+  for(int i=0;i<CRUMB_N;i++) if(!InterlockedCompareExchange(&g_crumb_tid[i],me,0)) return i;
+  return -1; }
+static void crumb_write(int i){ if(g_crumb_file==INVALID_HANDLE_VALUE) return;
+  OVERLAPPED o; memset(&o,0,sizeof o); o.Offset=(DWORD)i*CRUMB_LEN; DWORD w; WriteFile(g_crumb_file,g_crumb[i],CRUMB_LEN,&w,&o); }
+void snx_crumb(const char* fmt, ...){ int i=crumb_slot(); if(i<0) return;
+  char t[CRUMB_LEN]; va_list ap; va_start(ap,fmt); int n=vsnprintf(t,sizeof t-1,fmt,ap); va_end(ap);
+  if(n<0) n=0; if(n>CRUMB_LEN-2) n=CRUMB_LEN-2;
+  memset(g_crumb[i],' ',CRUMB_LEN); memcpy(g_crumb[i],t,(size_t)n); g_crumb[i][CRUMB_LEN-1]='\n'; crumb_write(i); }
+void snx_crumb_done(void){ int i=crumb_slot(); if(i<0) return;
+  memset(g_crumb[i],' ',CRUMB_LEN); g_crumb[i][CRUMB_LEN-1]='\n'; crumb_write(i); }
+/* a crash report: what the threads were in the middle of */
+void snxvk_crumbs_log(void){
+  for(int i=0;i<CRUMB_N;i++){ if(!g_crumb_tid[i]) continue; char t[CRUMB_LEN]; memcpy(t,g_crumb[i],CRUMB_LEN); int n=CRUMB_LEN-1;
+    while(n>0 && (t[n-1]==' '||t[n-1]==0)) n--; t[n]=0;
+    if(n) logf_(0,"  native Vulkan thread %lu was making: %s\n",(unsigned long)g_crumb_tid[i],t); } }
+static void crumbs_start(int crashed){ char p[1100]; snprintf(p,sizeof p,"%sbuilding.txt",g_cachedir);
+  if(crashed){ FILE* f=fopen(p,"rb"); int any=0;
+    if(f){ char t[CRUMB_LEN];
+      while(fread(t,1,CRUMB_LEN,f)==CRUMB_LEN){ int n=CRUMB_LEN-1; while(n>0 && (t[n-1]==' '||t[n-1]==0)) n--; t[n]=0;
+        if(n){ any=1; WARN("vulkan_native: the last run ended while the driver was making this: %s\n",t); } }
+      fclose(f);
+      if(!any) WARN("vulkan_native: the last run ended with no pipeline or shader being made at that moment\n"); } }
+  g_crumb_file=CreateFileA(p,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+  for(int i=0;i<CRUMB_N;i++){ memset(g_crumb[i],' ',CRUMB_LEN); g_crumb[i][CRUMB_LEN-1]='\n'; crumb_write(i); } }
 static void snxvk_crash_guard(void){
   snprintf(g_snxvk_marker,sizeof g_snxvk_marker,"%srunning.txt",g_cachedir);
   FILE* f=fopen(g_snxvk_marker,"rb");
+  crumbs_start(f!=NULL);
   if(f){ char was[200]={0}; size_t n=fread(was,1,sizeof was-1,f); was[n]=0; fclose(f);
     char sc[1100], bk[1100]; snprintf(sc,sizeof sc,"%sshader_cache",g_cachedir); snprintf(bk,sizeof bk,"%sshader_cache.crashed",g_cachedir);
     snxvk_rmtree(bk);
@@ -275,4 +311,5 @@ u64 snxvk_screenshot(const char* p){ (void)p; return 0; }
 void snxvk_tick(int t){ (void)t; }
 void snxvk_exit(void){}
 void snxvk_closed(void){}
+void snxvk_crumbs_log(void){}
 #endif

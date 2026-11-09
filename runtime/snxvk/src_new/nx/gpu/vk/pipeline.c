@@ -434,6 +434,8 @@ static u32* sh_spirv(VkSh* s, const u8* code, u64 h, int stage, const u32 mask[2
 }
 /* A draw's shader (sh_spirv's arguments): translated, its module made, kept in the shader file. One that couldn't be
    translated comes back failed; NULL when out of memory */
+void snx_crumb(const char* fmt, ...); /* vulkan_native/building.txt: see pipe_create */
+void snx_crumb_done(void);
 static VkSh* sh_make(const u8* code, u64 h, int stage, const u32 mask[20], u32 len, u64 qh, u32 len_a, u64 qh_a,
                      const ShXfb* xfb, VkCbReader read) {
     size_t nw;
@@ -443,7 +445,10 @@ static VkSh* sh_make(const u8* code, u64 h, int stage, const u32 mask[20], u32 l
     if (spv) {
         VkShaderModuleCreateInfo mi = {
             .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = spv};
-        if (!VK_OK(vkCreateShaderModule(g_vk.dev, &mi, NULL, &s->mod))) {
+        snx_crumb("shader module: stage %d, shader %016llx, %u SPIR-V words", stage, (unsigned long long)h, (u32)nw);
+        VkResult made = vkCreateShaderModule(g_vk.dev, &mi, NULL, &s->mod);
+        snx_crumb_done();
+        if (!VK_OK(made)) {
             s->failed = 1;
             snprintf(s->si.first_unsupported, sizeof s->si.first_unsupported, "vkCreateShaderModule failed");
         } else
@@ -696,6 +701,20 @@ static struct {
 } g_pf;
 static void pf_pipe_record(const PipeKey* k);
 
+/* What a thread is asking the driver to make is noted in vulkan_native/building.txt first and cleared after
+   (snxvk_glue.c): a driver that ends the process in there leaves no log line, and the next start reads the note.
+   2026-11-09, AMD RX 9070 XT and Legion Go: the game ends without a line while the opening cutscene's pipelines are
+   made. The shader of a module, by its hash: 0 for none or one not in the tables */
+void snx_crumb(const char* fmt, ...);
+void snx_crumb_done(void);
+static u64 mod_hash(VkShaderModule m) {
+    u32 steps = 0;
+    if (!m) return 0;
+    for (u32 i = 0; i < 1024; i++)
+        for (const VkSh* s = g_shh[i]; s && steps < 200000; s = s->next, steps++)
+            if (s->mod == m) return s->hash;
+    return 0;
+}
 static VkPipeline pipe_create(const Pipe* e) {
     const PipeKey* k = &e->k;
     VkPipelineShaderStageCreateInfo st[5];
@@ -862,7 +881,16 @@ static VkPipeline pipe_create(const Pipe* e) {
                                        .pDynamicState = &dy,
                                        .layout = e->layout};
     VkPipeline p = VK_NULL_HANDLE;
+    snx_crumb("pipeline %016llx (%s): shaders vs %016llx tcs %016llx tes %016llx gs %016llx fs %016llx; %u color "
+              "targets, formats %u %u %u %u, depth %u, stencil %u; %u attributes, %u bindings, topology class %u, "
+              "feedback %u, logic op %u",
+              (unsigned long long)e->h, e->prewarm ? "from the shader cache" : "asked for by a draw",
+              (unsigned long long)mod_hash(k->vs), (unsigned long long)mod_hash(k->tcs),
+              (unsigned long long)mod_hash(k->tes), (unsigned long long)mod_hash(k->gs),
+              (unsigned long long)mod_hash(k->fs), k->ncolor, k->color[0], k->color[1], k->color[2], k->color[3],
+              k->depth, k->stencil, k->nattr, k->nbind, k->topo_class, k->feedback, k->logic_op);
     VK_OK(vkCreateGraphicsPipelines(g_vk.dev, g_pcache, 1, &gi, NULL, &p));
+    snx_crumb_done();
     if (made.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT)
         __atomic_add_fetch(e->prewarm ? &g_pf.hits : &g_pipe_hits, 1, __ATOMIC_RELAXED);
     return p;
@@ -932,7 +960,10 @@ static int pipe_workers(void) {
         pc_init(&g_pj_work);
         pc_init(&g_pj_done);
         for (int i = 0; i < n; i++)
-            if (!plat_thread(pipe_worker, NULL, (size_t)1 << 20)) g_pj_threads++;
+            /* the driver compiles on this thread's stack. 1 MiB until 2026.11.13: the translated shaders are one
+               function with blocks of up to 12,800 instructions, and AMD's compiler (LLVM) runs on the caller's
+               stack, where an overflow ends the process with no report. The GPU thread's size, reserved only */
+            if (!plat_thread(pipe_worker, NULL, (size_t)16 << 20)) g_pj_threads++;
     }
     return g_pj_threads;
 }
