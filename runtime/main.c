@@ -322,6 +322,19 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"sharpening")){ extern int g_opt_sharp; g_opt_sharp=atoi(v); if(g_opt_sharp<0) g_opt_sharp=0; if(g_opt_sharp>100) g_opt_sharp=100; }   /* gpu_gl.c present pass, snxvk hdr.c */   /* FXAA: gpu_gl.c present pass, snxvk hdr.c */
     else if(!strcmp(k,"show_fps")) g_opt_show_fps=atoi(v)!=0;   /* FPS counter, live */
     else if(!strcmp(k,"cheats")){ extern int g_opt_cheats; g_opt_cheats=atoi(v)!=0; }   /* cheats.c, live */
+    else if(!strncmp(k,"cheat_",6)){ extern int cheats_nat_opt(const char*,const char*); cheats_nat_opt(k,v); }   /* cheats.c, live */
+    else if(!strcmp(k,"green_energy_10x")){ extern int g_opt_green10; g_opt_green10=atoi(v)!=0; }   /* kernel.c swr_svc, live */
+    else if(!strcmp(k,"z_nudge")){ extern int g_opt_z_nudge; g_opt_z_nudge=atoi(v); }   /* gpu_gl.c raster state, an experiment, live */
+    else if(!strcmp(k,"dbg_tex")){ extern int g_opt_dbg_tex; g_opt_dbg_tex=atoi(v); }   /* gpu_gl.c bind_textures, an experiment, live */
+    else if(!strcmp(k,"shader_loader")){ extern int g_opt_shader_loader; g_opt_shader_loader=atoi(v); }   /* gpu_gl.c background program loader, restart */
+    else if(!strcmp(k,"oq_sync")){ extern int g_opt_oq_sync; g_opt_oq_sync=atoi(v); }   /* gpu_gl.c oq_poll, live */
+    else if(!strcmp(k,"slab_min_mb")){ extern int g_opt_slab_min_mb; g_opt_slab_min_mb=atoi(v); }   /* gpu_gl.c slab_setup; 32 = as before */
+    else if(!strcmp(k,"splash")){ extern int g_opt_splash; g_opt_splash=atoi(v); }   /* splash_win32.c, next launch */
+    else if(!strcmp(k,"amiibo")){ extern int g_opt_amiibo; g_opt_amiibo=atoi(v); }   /* svc_core.c virtual amiibo, restart */
+    else if(!strcmp(k,"blit_nosync")){ extern int g_opt_blit_nosync; g_opt_blit_nosync=atoi(v); }   /* gpu_gl.c lvl_blit, restart */
+    else if(!strcmp(k,"worker_finish")){ extern int g_opt_worker_finish; g_opt_worker_finish=atoi(v); }   /* gpu_gl.c shader_worker, an experiment, live */
+    else if(!strcmp(k,"dbg_patch")){ extern int g_opt_dbg_patch; g_opt_dbg_patch=atoi(v); }   /* gpu_gl.c sh_view, debug views, restart */
+    else if(!strcmp(k,"dbg_view")){ extern int g_opt_dbg_view; g_opt_dbg_view=atoi(v); }   /* gpu_gl.c sh_view, debug views, live */
     else if(!strcmp(k,"fov")){ extern int g_opt_fov; g_opt_fov=atoi(v); if(g_opt_fov<60) g_opt_fov=60; if(g_opt_fov>160) g_opt_fov=160; }   /* cheats.c FOV hook, live */
     else if(!strcmp(k,"anisotropy")){ g_opt_aniso=atoi(v); if(g_opt_aniso<0) g_opt_aniso=0; if(g_opt_aniso>16) g_opt_aniso=16; }
     else if(!strcmp(k,"dlss")){ extern int snxvk_dlss_mode; snxvk_dlss_mode=atoi(v); }   /* native Vulkan: snxvk dlss.c; OpenGL: dlss_gl.c + gpu_gl.c dlg_* */
