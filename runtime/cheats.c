@@ -95,7 +95,31 @@ static int ok_range(u64 a, u64 n, int write){
   return !write || (b.perm&PERM_W); }
 static int rd(u64 a, int w, u64* v){ if(!ok_range(a,(u64)w,0)) return 0; u64 x=0; memcpy(&x,GP(a),(size_t)w); *v=x; return 1; }
 static void wr(u64 a, int w, u64 v){ if(ok_range(a,(u64)w,1)) memcpy(GP(a),&v,(size_t)w); }
-static u64 region(int m){ return m==0? g_main_base : m==1? HEAP_BASE : m==2? ALIAS_BASE : g_aslr_base; }
+/* Region 4: Metroid Prime 4's player attribute table, which moves between runs, so it is found by its shape. Entries are
+   a tag 3 followed by 5 floats: current, three maximums, upgrade limit; several saved copies exist, but only the live one has
+   the second float set. Base = the missiles' current value; energy is at +0x1C8, shot ammo at +0x240. Until it is found the
+   region answers with an address outside guest memory, which rd() and wr() refuse, so a cheat using it does nothing. */
+#define PL_NOWHERE (1ull<<62)
+static volatile u64 g_pl_base; static volatile int g_pl_want, g_pl_thread;
+static int pl_entry(u64 a, u32 limit){ u64 t0,t1,l,c0,c1,c2;
+  if(!rd(a-4,4,&t0)||!rd(a+0x14,4,&t1)||!rd(a+0x10,4,&l)||!rd(a+4,4,&c0)||!rd(a+8,4,&c1)||!rd(a+12,4,&c2)) return 0;
+  return t0==3 && t1==3 && l==limit && c0 && c0==c1 && c1==c2; }
+static int pl_valid(u64 b){ return pl_entry(b,0x437A0000u) && pl_entry(b+0x1C8,0x44BB6000u) && pl_entry(b+0x240,0x44048000u); }   /* limits 250, 1499, 530 */
+static void pl_scan(void){ u64 found=0; int n=0;
+  for(u64 a=HEAP_BASE;a<ALIAS_BASE;){ MemBlock b; mem_query(a,&b); if(!b.size) break; u64 end=b.addr+b.size; if(end<=a) break;
+    if((b.perm&PERM_R)&&(b.perm&PERM_W)){ u64 p=(a+3)&~3ull;
+      for(u64 o=p;o+4<=end;o+=4){ if(*(const u32*)GP(o)==0x44BB6000u && o>=0x1D8+HEAP_BASE && pl_valid(o-0x10-0x1C8)){ found=o-0x10-0x1C8; n++; }
+        if(!(o&0xFFFFF)) plat_sleep_ns(100000); } }   /* a breath per MB: this runs beside the game */
+    a=end; }
+  if(found){ g_pl_base=found; LOG("cheats: player table at %llx (%d match%s)\n",(unsigned long long)found,n,n==1?"":"es"); } }
+static void pl_thread(void* arg){ (void)arg; plat_thread_low_priority();
+  /* a failed look takes a third of a core (MEASURED 2026-11-09, the intro: its limits don't match, so it never finds one):
+     wait longer after each, up to a minute */
+  long long wait=5;
+  for(;;){ if(g_pl_want && !g_pl_base){ g_pl_want=0; pl_scan(); wait= g_pl_base? 5 : wait<60? wait*2 : 60; } plat_sleep_ns(wait*1000000000ll); } }
+static u64 region(int m){
+  if(m==4){ if(g_pl_base) return g_pl_base; g_pl_want=1; if(!g_pl_thread){ g_pl_thread=1; plat_thread(pl_thread,NULL,1<<20); } return PL_NOWHERE; }
+  return m==0? g_main_base : m==1? HEAP_BASE : m==2? ALIAS_BASE : g_aslr_base; }
 static u64 mask(int w, u64 v){ return w>=8? v : v&((1ull<<(w*8))-1); }
 static int cmp(int c, u64 a, u64 b){ switch(c){ case 1: return a>b; case 2: return a>=b; case 3: return a<b; case 4: return a<=b; case 5: return a==b; case 6: return a!=b; } return 0; }
 static u64 arith(int op, u64 a, u64 b){ switch(op){ case 0: return a+b; case 1: return a-b; case 2: return a*b; case 3: return a<<(b&63); case 4: return a>>(b&63);
@@ -206,6 +230,7 @@ void cheats_tick(void){
   if(g_opt_cheats){
     static u32 n; if((++n&63)==0 && (mtime(g_path)!=g_mt_txt || mtime(g_en_path)!=g_mt_en)) load();   /* edited while playing */
     else if(n==1) load();
+    if(g_pl_base && !pl_valid(g_pl_base)){ g_pl_base=0; LOG("cheats: player table gone, looking again\n"); }   /* a level load can move it */
     for(u32 i=0;i<g_nch;i++) if(g_ch[i].on && g_ch[i].n){ memset(g_reg,0,sizeof g_reg); run(g_words+g_ch[i].off,g_ch[i].n); } }
   fov_tick();
   unlock(); }

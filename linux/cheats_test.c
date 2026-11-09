@@ -8,6 +8,9 @@ u8* g_mem; const SwrModule* g_mod; char g_datadir[1024], g_exename[256], g_exedi
 void logf_(int l, const char* f, ...){ (void)l; va_list a; va_start(a,f); vprintf(f,a); va_end(a); }
 void pm_init(PMutex* m){ (void)m; } void pm_lock(PMutex* m){ (void)m; } void pm_unlock(PMutex* m){ (void)m; }
 int plat_mkdir(const char* p){ return mkdir(p,0755); }
+int plat_thread(PThreadFn fn, void* arg, size_t stack){ (void)fn; (void)arg; (void)stack; return 0; }   /* the region 4 search, not used here */
+void plat_thread_low_priority(void){}
+void plat_sleep_ns(i64 ns){ (void)ns; }
 void mem_query(u64 a, MemBlock* b){ memset(b,0,sizeof *b);
   if(a>=0x8000000 && a<0x9000000){ b->addr=0x8000000; b->size=0x1000000; b->perm=PERM_RW; }
   else if(a>=HEAP_BASE && a<HEAP_BASE+0x100000){ b->addr=HEAP_BASE; b->size=0x100000; b->perm=PERM_RW; } }
