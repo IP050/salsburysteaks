@@ -52,7 +52,8 @@ static void backend_status_win(const char* s){ if(!g_hwnd) return; char* c=NULL;
 void backend_ff_status(int on, int speed){ if(g_hwnd) PostMessageA(g_hwnd,WM_APP+9,(WPARAM)on,(LPARAM)speed); }
 int video_has_gl(void){ return 1; }
 
-void win_fatal_box(const char* msg){ MessageBoxA(g_hwnd,msg,"Metroid Prime 4 Beyond",MB_OK|MB_ICONERROR); }
+void win_fatal_box(const char* msg){ if(getenv("SWR_CRASH_TEST")) return;   /* plat_crash_test: logged, no box to click */
+  MessageBoxA(g_hwnd,msg,"Metroid Prime 4 Beyond",MB_OK|MB_ICONERROR); }
 
 /* ---------------------------------------------------------------- XInput, loaded dynamically */
 typedef struct { WORD wButtons; BYTE bLeftTrigger, bRightTrigger; SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY; } XGP;
@@ -466,7 +467,10 @@ int backend_gl_create(void){
   for(int i=0;i<4 && !g_ctx && cca;i++){ int ca[]={0x2091,vers[i][0],0x2092,vers[i][1],0x9126,0x00000001,0x2094,getenv("SWR_GL_DRIVER_DEBUG")?1:0,0}; g_ctx=cca(g_hdc,NULL,ca);
     if(g_ctx){ SYSTEM_INFO si; GetSystemInfo(&si); int nc=(int)si.dwNumberOfProcessors;
       int want=g_opt_shader_threads>0? g_opt_shader_threads : nc/4;
-      if(want<2 && g_opt_shader_threads<=0) want=2; if(want>8) want=8;
+      if(want<2 && g_opt_shader_threads==0) want=2; if(want>8) want=8;
+      /* -1: no compile threads, every shader program is made and used on the GL thread. 2026-11-09, two RX 9070 XT
+         (driver 26.10.1) crashed in atio6axx.dll 2 s in, right after compile threads handed over loaded programs */
+      if(g_opt_shader_threads<0) want=0;
       for(g_nwctx=0;g_nwctx<want;g_nwctx++){ g_wctx[g_nwctx]=cca(g_hdc,g_ctx,ca); if(!g_wctx[g_nwctx]) break; }
       { extern int g_gl_workers; g_gl_workers= g_nwctx? g_nwctx : 1; } } }
   wglMakeCurrent(NULL,NULL); wglDeleteContext(tmp);

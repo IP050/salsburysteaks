@@ -237,13 +237,14 @@ void crash_report(void* host_pc, void* fault, int sig){
   KThread* t=kthread_cur();
   u64 ga=(u64)((u8*)fault-g_mem);
   logf_(0,"\n*** Crash (signal %d) at host pc=%p, access to %p (game address %llx) ***\n",sig,host_pc,fault,(unsigned long long)ga);
-  { extern void mem_report(char*,int); char mr[200]; mem_report(mr,sizeof mr); logf_(0,"  memory: %s\n",mr);
+  { extern void mem_report(char*,int); char mr[200]; if(g_mem){ mem_report(mr,sizeof mr); logf_(0,"  memory: %s\n",mr); }   /* none yet before mem_init */
 #ifdef _WIN32
     { extern char __ImageBase; u64 b=(u64)(size_t)&__ImageBase, p=(u64)(size_t)host_pc; if(p>=b && p<b+0x10000000ull) logf_(0,"  in the runtime itself (exe offset +%llx), thread %s\n",(unsigned long long)(p-b), kthread_cur()? "of the game" : "of the runtime (GPU, audio or window)");
       /* elsewhere: which DLL (a graphics driver's, a system one, the game code's) */
       else { extern int plat_module_of(const void*, char*, int, u64*); char mn[260]; u64 mo=0;
         if(plat_module_of(host_pc,mn,sizeof mn,&mo)) logf_(0,"  in %s (+%llx), a thread %s\n",mn,(unsigned long long)mo, kthread_cur()? "of the game" : "of the runtime (GPU, audio, video or window): a graphics driver's DLL here points at the driver");
-        else logf_(0,"  in no loaded module, a thread %s\n", kthread_cur()? "of the game" : "of the runtime"); } }
+        else logf_(0,"  in no loaded module, a thread %s\n", kthread_cur()? "of the game" : "of the runtime"); }
+      extern void plat_crash_chain(void); plat_crash_chain(); }
 #endif
     if(ga && ga<0x1000000ull) logf_(0,"  the address is a null pointer plus an offset: the game probably got NULL from its allocator (out of memory?). Try memory_gb=6 in the .ini\n"); }
   if(g_mod){ /* closest recompiled fn below host pc */
@@ -303,7 +304,7 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"profile")) g_opt_prof=atoi(v);
     else if(!strcmp(k,"low_priority_shader_compiler")) g_opt_cmp_low=atoi(v);
 #if !defined(__ANDROID__)
-    else if(!strcmp(k,"shader_threads")){ extern int g_opt_shader_threads; g_opt_shader_threads=atoi(v); if(g_opt_shader_threads<0) g_opt_shader_threads=0; if(g_opt_shader_threads>8) g_opt_shader_threads=8; }   /* backend_x11.c, backend_win32.c */
+    else if(!strcmp(k,"shader_threads")){ extern int g_opt_shader_threads; g_opt_shader_threads=atoi(v); if(g_opt_shader_threads<-1) g_opt_shader_threads=-1;   /* -1: none (backend_win32.c) */ if(g_opt_shader_threads>8) g_opt_shader_threads=8; }   /* backend_x11.c, backend_win32.c */
 #endif
     else if(!strcmp(k,"dynamic_resolution")) g_opt_resdyn=atoi(v);
     else if(!strcmp(k,"dynamic_resolution_min")){ g_opt_resmin=(float)atof(v); if(g_opt_resmin<0.25f) g_opt_resmin=0.25f; if(g_opt_resmin>1) g_opt_resmin=1; }
@@ -405,7 +406,7 @@ static const IniOpt INI_PERF[]={
   {"cheat_two_hit","0","1 = cheat: Two-hit kills, not bosses (a hook of the GBAtemp code for this game build)"},
   {"green_energy_10x","0","1 = Green Energy awards are worth 10 times as much (after the mod by melos444)"},
   {"fov","100","Field of view in percent of the game's own (60-160, applies live). Needs a FOV hook for this game\n;   build (beyond/fov_hooks.txt)"},
-  {"fps_limit","1","1 = 60 FPS (the speed of a Switch), 0 = unlimited (the game runs faster). Values under 60 are treated as 60: the game advances one step per image, so 30 meant half speed. F4 changes it in game"},
+  {"fps_limit","1","1 = 60 FPS (the speed of a Switch), 0 = unlimited (the game runs faster). Other values are treated as 60: the game advances one step per image, so 30 meant half speed and 144 2.4 times the speed. F4 changes it in game"},
   {"video_async_retire","0","1 = retire obsolete video pictures on a bounded worker (experimental; restart required)"},
   {"video_avx2","1","1 = AVX2 video color conversion when the CPU has it (same result as the plain conversion, faster; restart required)"},
   {"video_block_copy","1","1 = video pictures written to tiled memory 64 bytes at a time (same result, faster; restart required)"},
@@ -416,7 +417,7 @@ static const IniOpt INI_PERF[]={
 #endif
   {"memory_gb","0","Memory the game sees: 0 = automatic (3.2 GB like the console, more for games that need it,\n;   e.g. Tears of the Kingdom), 4 = console (3.2 GB), 6 or 8 = extended (like yuzu's extended memory layout)"},
   {"low_priority_shader_compiler","1","1 = compile shaders at low priority (less stutter on weak CPUs)"},
-  {"shader_threads","0","threads that compile new shaders at the same time, 0 = automatic (a quarter of the CPU\n;   threads, 2 to 8), 1 = one like older versions (restart)"},
+  {"shader_threads","0","threads that compile new shaders at the same time, 0 = automatic (a quarter of the CPU\n;   threads, 2 to 8), 1 = one like older versions, -1 = none: everything on the GL thread (try this if an AMD card\n;   crashes in atio6axx.dll right after the game starts; restart)"},
   {"fast_forward","0","1 = Tab (or both stick clicks, L3+R3) toggles fast forward: the game clock runs faster, e.g. to\n;   shorten elevator and train rides (their animations follow the clock). Turn it off again before playing"},
   {"fast_forward_speed","3","Fast forward speed, 2-8 times"},
   {"sleep_waits","1","1 = threads waiting on the OpenGL thread sleep instead of spinning (frees CPU on 2-4 core\n;   PCs and laptops); 0 = spin like older versions"},
@@ -566,9 +567,14 @@ void vi_convert_cpu(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt
   free(lin);
 }
 
-/* the frame cap the pacers use */
+/* the frame cap the pacers use. Prime 4 advances one game step per image, so a cap above 60 only ran the game faster:
+   2026-11-09, fps_limit=144 (the Play screen's pick for 144 Hz screens) on native Vulkan, whose present pacing lets the
+   game make an image per present: 6.94 ms per intro-video picture instead of 16.7, audio updated 144 times a second (2.4x
+   speed). OpenGL stayed at 60 there only because the game also waits for the 60 Hz vsync event. Above 60 counts as 60;
+   smoother output above 60 has to come from generated frames, not more game steps. 0 (unlimited) keeps its documented
+   "the game runs faster" */
 volatile int g_pace_fps=1;
-static void pace_update(void){ g_pace_fps=g_opt_fps; }
+static void pace_update(void){ g_pace_fps= g_opt_fps>60? 60 : g_opt_fps; }
 
 void vi_show_buffer(u32 nvmap_id, u32 offset, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt){
 #ifdef _WIN32
@@ -601,7 +607,7 @@ void vi_show_buffer(u32 nvmap_id, u32 offset, u32 w, u32 h, u32 pitch, u32 layou
   /* fps_limit: 1 = 60, otherwise N fps */
   /* in smooth recording the limiter has to count guest time, not real time.
      games that tick once per frame would otherwise run sped up in the video */
-  if(g_vt_on){ u64 per= g_opt_fps>=60 && g_opt_fps<=240? 1000000000ull/(u64)g_opt_fps : 16666667ull;
+  if(g_vt_on){ u64 per= g_pace_fps>=60 && g_pace_fps<=240? 1000000000ull/(u64)g_pace_fps : 16666667ull;
     static u64 last_g; u64 g=guest_ns(), next=last_g+per, t0=plat_ns();
     if(last_g && g<next && next-g<per*2){ while(g<next && plat_ns()-t0<1000000000ull){ plat_sleep_ns(500000); g=guest_ns(); } }
     g=guest_ns(); last_g= (last_g && g-last_g<2*per)? next : g; g_last_present=plat_ns(); return; }
@@ -780,6 +786,9 @@ int swr_main(int argc, char** argv){
   /* setup's game-file reader (nxextract.c): an .xci / .nsp to exefs + romfs folders, then exit */
   if(argc>1 && !strcmp(argv[1],"--nx-extract")){ extern int nx_extract_main(int,char**); return nx_extract_main(argc-1,argv+1); }
   split_path(argv[0]);
+#ifdef _WIN32
+  { extern void plat_crash_test(void); if(getenv("SWR_CRASH_TEST")){ plat_install_crash_handler(); plat_crash_test(); } }
+#endif
   char ini[1400];
   snprintf(ini,sizeof ini,"%s%s.ini",g_exedir,g_exename);
   pm_init(&g_setq_lock); g_setq_init=1;
@@ -793,6 +802,8 @@ int swr_main(int argc, char** argv){
 #endif
 #endif
   ini_open(ini);
+  if(g_opt_fps>60){ LOG("settings: fps_limit=%d ran the game faster than the console (one game step per frame): set to 60\n",g_opt_fps);   /* 120/144/240 from older Play screens (pace_update) */
+    g_opt_fps=1; extern void ini_set(const char*, const char*); ini_set("fps_limit","1"); }
 #if !defined(_WIN32)
   { /* no Play screen here (Linux; on Windows the Play screen sets them, or the old Python launcher does): the [Launcher] choices the game reads as switches, as fe.cpp sets them on Windows.
        A switch already in the environment (tests, a launch script) is left as it is */

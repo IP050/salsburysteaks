@@ -259,30 +259,79 @@ void plat_battery(int* pct, int* chg){ SYSTEM_POWER_STATUS s; *pct=100; *chg=1;
   if(!GetSystemPowerStatus(&s) || (s.BatteryFlag&128) || s.BatteryLifePercent>100) return;
   *pct=s.BatteryLifePercent; *chg= s.ACLineStatus==1; }
 
-/* a crash inside a system DLL (memcpy in msvcrt, the video driver) says nothing by itself: log the
-   return addresses into the runtime found on the stack, they name the code that called it */
-static void log_runtime_callers(CONTEXT* c){
-  extern char __ImageBase; u64 b=(u64)(size_t)&__ImageBase;
-  IMAGE_NT_HEADERS* nt=(IMAGE_NT_HEADERS*)(b+(u64)((IMAGE_DOS_HEADER*)b)->e_lfanew); u64 end=b+nt->OptionalHeader.SizeOfImage;
-  if(c->Rip>=b && c->Rip<end) return;
-  u64* sp=(u64*)(size_t)c->Rsp; u64* top=(u64*)((NT_TIB*)NtCurrentTeb())->StackBase;
-  int n=0; for(; sp<top && n<8; sp++) if(*sp>b+0x1000 && *sp<end){ if(!n) logf_(0,"  called from the runtime at"); logf_(0," +%llx",(unsigned long long)(*sp-b)); n++; }
-  if(n) logf_(0," (exe offsets)\n"); }
+/* A crash inside a DLL (the video driver, memcpy in the C library) says nothing by itself. The report names the thread
+   and walks its real call chain with the unwind tables every x64 module carries (graphics drivers too): each frame is
+   an exe offset (+N, read against the EXE of that build) or module+offset, and the first exe frame under the DLL's
+   frames is the runtime code that called into it. 2026.11.11 only scanned the stack for any word inside the EXE: on two
+   AMD driver crashes those were data pointers and stale words, not callers, so the calling function stayed unknown.
+   The scan stays as a backup when the walk is cut short, keeping only words that come right after a call. */
+static CONTEXT g_crash_ctx; static volatile int g_crash_have;
+static u64 g_xb, g_xend, g_tlo, g_thi;   /* EXE image and .text, filled by crash_bounds */
+static void crash_bounds(void){ extern char __ImageBase; g_xb=(u64)(size_t)&__ImageBase;
+  IMAGE_NT_HEADERS* nt=(IMAGE_NT_HEADERS*)(g_xb+(u64)((IMAGE_DOS_HEADER*)g_xb)->e_lfanew);
+  g_xend=g_xb+nt->OptionalHeader.SizeOfImage; g_tlo=g_xb+nt->OptionalHeader.BaseOfCode; g_thi=g_tlo+nt->OptionalHeader.SizeOfCode; }
+/* the bytes before r are a call: e8 rel32, or ff /2 with a register, [reg], [reg+d8] or [rip/reg+d32] operand (with or
+   without a SIB byte or a REX prefix) */
+static int after_call(u64 r){ const u8* p=(const u8*)(size_t)r;
+  if(p[-5]==0xE8) return 1;
+  for(int len=2; len<=7; len++){ const u8* q=p-len; if(q[0]!=0xFF || ((q[1]>>3)&7)!=2) continue;
+    int mod=q[1]>>6, rm=q[1]&7, n=2+(mod!=3 && rm==4);
+    if(mod==0) n+= rm==5? 4 : (rm==4 && (q[2]&7)==5)? 4 : 0; else if(mod==1) n+=1; else if(mod==2) n+=4;
+    if(n==len) return 1; }
+  return 0; }
+static void crash_frame(int i, u64 pc){
+  if(pc>=g_xb && pc<g_xend){ logf_(0,"    #%-2d +%llx\n",i,(unsigned long long)(pc-g_xb)); return; }
+  extern int plat_module_of(const void*, char*, int, u64*); char mn[260]; u64 mo=0;
+  if(plat_module_of((void*)(size_t)pc,mn,sizeof mn,&mo)) logf_(0,"    #%-2d %s+%llx\n",i,mn,(unsigned long long)mo);
+  else logf_(0,"    #%-2d %llx (no module)\n",i,(unsigned long long)pc); }
+/* called by crash_report (main.c) after the crash line, so a fault in here can't lose that */
+void plat_crash_chain(void){
+  if(!g_crash_have) return; crash_bounds();
+  NT_TIB* tib=(NT_TIB*)NtCurrentTeb(); u64 lo=(u64)(size_t)tib->StackLimit, hi=(u64)(size_t)tib->StackBase;
+  logf_(0,"  thread %lu: %s\n",(unsigned long)GetCurrentThreadId(), td_self? td_self->role : "not named by the runtime (a driver's or the system's own thread)");
+  logf_(0,"  call chain, innermost first (+N = exe offset; the first +N under a DLL is the runtime code that called it):\n");
+  CONTEXT c=g_crash_ctx; int nf=0, first_exe=-1; u64 first_exe_pc=0, last_sp=0;
+  for(; nf<32; nf++){
+    u64 pc=c.Rip; if(pc<0x10000) break;
+    crash_frame(nf,pc); if(first_exe<0 && pc>=g_xb && pc<g_xend && nf>0){ first_exe=nf; first_exe_pc=pc; }
+    DWORD64 ib=0; PRUNTIME_FUNCTION f=RtlLookupFunctionEntry(c.Rip,&ib,NULL);
+    if(f){ void* hd=NULL; DWORD64 ef=0; RtlVirtualUnwind(UNW_FLAG_NHANDLER,ib,c.Rip,f,&c,&hd,&ef,NULL); }
+    else { if(c.Rsp<lo || c.Rsp+8>hi) break; c.Rip=*(u64*)(size_t)c.Rsp; c.Rsp+=8; }   /* a leaf: the return address is on top */
+    if(c.Rsp<lo || c.Rsp>=hi || c.Rsp<last_sp) break; last_sp=c.Rsp; }
+  if(g_crash_ctx.Rip>=g_xb && g_crash_ctx.Rip<g_xend){}   /* crashed in the runtime itself: frame #0 already names it */
+  else if(first_exe>0) logf_(0,"  called from the runtime at +%llx (frame #%d)\n",(unsigned long long)(first_exe_pc-g_xb),first_exe);
+  else { /* the walk didn't reach the EXE: words on the stack that are return addresses into its code */
+    u64* sp=(u64*)(size_t)g_crash_ctx.Rsp; int n=0;
+    for(; (u64)(size_t)sp+8<=hi && n<12; sp++){ u64 v=*sp; if(v>g_tlo+8 && v<g_thi && after_call(v)){ if(!n) logf_(0,"  return addresses into the runtime on the stack:"); logf_(0," +%llx",(unsigned long long)(v-g_xb)); n++; } }
+    if(n) logf_(0," (exe offsets)\n"); else logf_(0,"  no return address into the runtime on this stack\n"); } }
 
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS* e){
   extern void crash_report(void* host_pc, void* fault_addr, int sig);
-  log_runtime_callers(e->ContextRecord);
+  g_crash_ctx=*e->ContextRecord; g_crash_have=1;
   crash_report((void*)e->ContextRecord->Rip,(void*)e->ExceptionRecord->ExceptionInformation[1],(int)e->ExceptionRecord->ExceptionCode);
   return EXCEPTION_EXECUTE_HANDLER; }
+
+/* SWR_CRASH_TEST=1: crash on a named runtime thread inside a C library function called from here, to check the report
+   (main.c calls it before the Play screen; never set in a release). The chain must show ucrtbase.dll, then
+   crash_test_call, then crash_test_thread */
+static __attribute__((noinline)) size_t crash_test_call(const char* bad){
+  typedef size_t (__cdecl *T_sl)(const char*); T_sl sl=(T_sl)(void*)GetProcAddress(GetModuleHandleA("ucrtbase.dll"),"strlen");
+  size_t r=sl? sl(bad) : 0; __asm__ volatile("" ::: "memory"); return r+1; }
+static unsigned __stdcall crash_test_thread(void* a){ (void)a; plat_diag_role("crash-test");
+  logf_(0,"crash test: strlen on a bad pointer from crash_test_call\n"); return (unsigned)crash_test_call((const char*)(size_t)0x1001b); }
+void plat_crash_test(void){ if(!getenv("SWR_CRASH_TEST")) return;
+  uintptr_t h=_beginthreadex(NULL,0,crash_test_thread,NULL,0,NULL); if(h) WaitForSingleObject((HANDLE)h,INFINITE); }
 
 static LONG WINAPI veh_fatal(EXCEPTION_POINTERS* e){
   DWORD c=e->ExceptionRecord->ExceptionCode;
   if(c==EXCEPTION_STACK_OVERFLOW || c==0xC0000409 /* STACK_BUFFER_OVERRUN / fastfail */ || c==0xC0000374 /* heap corruption */){
-    static volatile LONG once; if(!InterlockedExchange(&once,1)){ logf_(0,"\n*** Shutdown: exception %08lx at %p (stack/heap) ***\n",(unsigned long)c,(void*)e->ContextRecord->Rip); } }
+    static volatile LONG once; if(!InterlockedExchange(&once,1)){ logf_(0,"\n*** Shutdown: exception %08lx at %p (stack/heap) ***\n",(unsigned long)c,(void*)e->ContextRecord->Rip);
+      { extern int plat_module_of(const void*, char*, int, u64*); char mn[260]; u64 mo=0; if(plat_module_of((void*)e->ContextRecord->Rip,mn,sizeof mn,&mo)) logf_(0,"  in %s+%llx\n",mn,(unsigned long long)mo); }
+      log_flush(); } }   /* the process ends right after: the log thread would not get to write it (2026-11-09: native Vulkan logs on AMD stopped mid-cutscene with no line) */
   return EXCEPTION_CONTINUE_SEARCH; }
 #include <signal.h>
 
-static void on_abort(int s){ logf_(0,"\n*** Shutdown: abort() (signal %d), probably the video driver or out of memory ***\n",s); }
+static void on_abort(int s){ logf_(0,"\n*** Shutdown: abort() (signal %d), probably the video driver or out of memory ***\n",s); log_flush(); }
 
 static void on_exit_log(void){ logf_(0,"program shutdown\n"); }
 

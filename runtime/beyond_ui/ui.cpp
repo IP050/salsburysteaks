@@ -511,8 +511,8 @@ static std::vector<Opt> build_options() {
     B("dlss", "Graphics", "Graphics", "NVIDIA DLAA", LIVE_RESTART, "0", "OpenGL or Native Vulkan, RTX cards, nvngx_dlss.dll next to the game.", false);
 #endif
     // Gameplay
-    C("fps_limit", "Performance", "Gameplay", "Frame rate", LIVE_YES, "1", {{"1", "60 FPS (console)"}, {"120", "120 FPS"}, {"144", "144 FPS"}, {"240", "240 FPS"}, {"0", "Unlimited"}},
-      "Above 60 is untested with Metroid Prime 4 Beyond: if the game runs too fast or stutters, go back to 60.");
+    C("fps_limit", "Performance", "Gameplay", "Frame rate", LIVE_YES, "1", {{"1", "60 FPS (console)"}, {"0", "Unlimited (the game runs faster)"}},
+      "The game advances one step per frame, so it runs at 60 like the console. Unlimited speeds the whole game up.");
 #ifdef _WIN32
     B("forced_vsync", "Performance", "Gameplay", "Force VSync", LIVE_YES, "0", "Can lower FPS a lot on slow PCs.");
 #else

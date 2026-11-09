@@ -185,7 +185,7 @@ static Rec recommend() {
     r.asp = ratio >= 2.2f ? "21:9" : fabsf(ratio - 1.6f) < 0.02f ? "16:10" : "16:9";
     float base = game_base_h(true, r.asp.c_str()), native = roundf(g_hw.h / base * 20) / 20;
     r.res = 1.0f;   // the game's own resolution: above it costs GPU-thread time in busy areas (measured: 50 fps at 2x vs 60 at 1x)
-    r.fps = g_hw.hz >= 230 && g_hw.tier == "high" && g_hw.cores >= 8 ? "240" : g_hw.hz >= 140 && g_hw.tier != "low" ? "144" : g_hw.hz >= 115 && g_hw.tier != "low" ? "120" : "1";
+    r.fps = "1";   // 60: the game advances one step per frame, so 120/144/240 only ran it faster (2026-11-09, 144 on native Vulkan: 2.4x speed)
     r.af = g_hw.tier != "low" ? "16" : "4";
     r.sharp = base * r.res < g_hw.h - 1 ? "25" : "0";   // the picture is stretched to the screen: a light sharpen
     // renderer: above 60 FPS on a discrete NVIDIA / AMD card native Vulkan is clearly smoother (2026-10-23, RTX 5070, 240 cap:
@@ -408,7 +408,7 @@ static void page_play() {
     std::string rn = get("renderer"); const char* rl = rn == "vulkan" ? "Vulkan output" : rn == "vulkan_native" ? "Native Vulkan" : "OpenGL";
     std::string rr = rl; if (rn != "vulkan" && getb("dlss")) rr += " + DLAA";
     float rs = (float)atof(get("resolution").c_str()); if (rs <= 0) rs = 1;
-    std::string fl = get("fps_limit"); std::string ft = fl == "0" ? "Unlimited" : (fl == "1" || fl.empty()) ? "60 FPS" : fl + " FPS";
+    std::string fl = get("fps_limit"); std::string ft = fl == "0" ? "Unlimited" : "60 FPS";   // above 60 is played at 60 (main.c pace_update)
     struct T { const char* id; const char* title; std::string value; Page page; } tiles[3] = {
         {"##t1", "RENDERER", rr, PG_GRAPHICS}, {"##t2", "RESOLUTION", res_text(rs, getb("docked"), ""), PG_GRAPHICS}, {"##t3", "FPS TARGET", ft, PG_GAMEPLAY}};
     for (int i = 0; i < 3; i++) {
