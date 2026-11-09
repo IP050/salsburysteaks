@@ -1171,7 +1171,7 @@ extern int g_glsl_version;
 struct WJob;
 typedef struct Sh { u64 hash; u32 key2; int stage; GLuint gl; ShaderInfo si; struct Sh* next; int failed; char* src;
   GLuint sp; GLint uloc; int sps; struct WJob* sj; u32 clen; u64 qh; float lu[4]; int lu_ok; u64 skey; int xfb; struct WJob* sj_up;
-  GLuint pp; u64 pkey; u64 pt0; volatile int pflag; int pidx; } Sh;   /* sp: this shader's own separable program; pp: one the driver is still compiling (sps 4) */
+  GLuint pp; u64 pkey; u64 pt0; volatile int pflag; int pidx; int nohelp; } Sh;   /* sp: this shader's own separable program; pp: one the driver is still compiling (sps 4) */
 static Sh* shh[1024];
 /* per-address cache. shader_hash walks the whole program (~50us per stage per draw on big shaders),
    within a submit a quick hash of the same range is enough */
@@ -1392,6 +1392,18 @@ static int g_lf_light, g_lf_run, g_lf_reveal; static u64 g_lf_wait_ns;   /* load
 static u64 st_lf_waits, st_lf_wait_ns;   /* draws that waited for shaders on light frames, and how long */
 /* opt-in (SWR_LOAD_WAIT=1): a draw count can't tell a loading screen from the map or a menu, which also draw little */
 volatile unsigned g_sh_loops_structured;   /* shader.c: loops emitted as do/while */
+/* shader helper process (backend_win32.c shader_helper.inc), NVIDIA on Windows */
+static int g_helper=-1; static u32 g_hp_built, g_hp_fallback, g_hp_pre; static u64 g_hp_max;
+/* worth building ahead of its first draw? Not the "could jump anywhere" dispatcher made when the jump table isn't known yet
+   (no constant buffers at pre-build): 346 of 761 queued in a run, each tens of seconds of CPU or "too many instructions",
+   and no draw ever uses one: the draw translates the shader with its real table */
+static int hp_job_worth(const char* src){ const char* p=strstr(src,"switch(pc)"); if(!p) return 1; int n=0, nl=0; const char* q=p; while((q=strchr(q,'\n'))){ nl++; q++; } while((p=strstr(p,"    case ")) && n<=1000){ n++; p+=9; } return n<=1000 && !(n>200 && n*4>nl); }   /* a case every few lines: one per instruction, the stand-in */
+#ifdef _WIN32
+extern int backend_shader_helper_start(const char* tag); extern int backend_shader_helper_alive(void); extern int backend_file_exists(const char* path);
+#else
+static int backend_shader_helper_start(const char* t){ (void)t; return 0; } static int backend_shader_helper_alive(void){ return 0; }
+static int backend_file_exists(const char* p){ FILE* f=fopen(p,"rb"); if(f){ fclose(f); return 1; } return 0; }
+#endif
 static int getenv_cached_nolw(void){ static int v=-1; if(v<0) v=getenv("SWR_LOAD_WAIT")==NULL; return v; }
 static u32 g_par_built; static u64 g_par_max; static u32 g_cpf_frame, g_cpf_n;   /* draws' new compiles this frame (sh_sep_ready) */   /* separable programs the driver built in the background (sh_sep_ready sps 4) */
 
@@ -1564,6 +1576,16 @@ static int sh_sep_ready(Sh* s){
   if(s->sps==2 || s->sps==3){ if(s->sj_up){   /* not 4: still compiling (below). As >=2 it counted as done with no program: 1 million draws skipped in a session */ int st=__atomic_load_n(&s->sj_up->state,__ATOMIC_ACQUIRE);   /* drawn with the pre-built stand-in: swap in the real one once built */
       if(st){ struct WJob* j=s->sj_up; s->sj_up=NULL; if(st==1 && j->prog){ s->sp=j->prog; s->lu_ok=0; sh_uloc(s); pack_add_sh(j->key,s); } free(j); } }
     return 1; }
+  if(s->sps==6){ /* the shader helper process is building it (shader_helper.inc): load its binary once the file is there */
+    if(!g_must_wait && ((g_frame^(u32)s->pkey)&1)) return 0;   /* look every other frame */
+    char bp[200]; snprintf(bp,sizeof bp,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)s->pkey);
+    if(backend_file_exists(bp)){ GLuint p=binary_load(bp,1);
+      if(p){ s->sp=p; s->sps=2; sh_uloc(s); pack_add_sh(s->pkey,s);
+        u64 dt=plat_ns()-s->pt0; g_hp_built++; if(dt>g_hp_max) g_hp_max=dt; return 1; }
+      g_hp_fallback++; s->nohelp=1; s->sps=0; return 0; }   /* didn't load here: compile it in the game */
+    char ep[200]; snprintf(ep,sizeof ep,"shader_cache/jobs/%016llx.err",(unsigned long long)s->pkey);
+    if(backend_file_exists(ep) || !backend_shader_helper_alive() || plat_ns()-s->pt0>120000000000ull){ g_hp_fallback++; s->nohelp=1; s->sps=0; }
+    return 0; }
   if(s->sps==4){ /* the driver is compiling it (GL_KHR_parallel_shader_compile): drawn once it is done */
     int fl=__atomic_load_n(&s->pflag,__ATOMIC_ACQUIRE);
     if(!fl && (g_must_wait || s->pidx<0)){ GLint done=0; glGetProgramiv(s->pp,0x91B1 /* GL_COMPLETION_STATUS_KHR */,&done);   /* must have it now, or not in the list */
@@ -1619,6 +1641,15 @@ static int sh_sep_ready(Sh* s){
         free(u); warm_stage_put(fk,fp,ful); } } }
   struct WJob* j=calloc(1,sizeof *j); j->vs=s->src; j->key=key; j->keep=1; j->sep=1; j->stype= s->stage==ST_VS? GL_VERTEX_SHADER : s->stage==ST_GS? GL_GEOMETRY_SHADER : GL_FRAGMENT_SHADER;
   if(g_worker==1 && !g_sync_draws && wr_push(&wq_hi,j)){ s->sj=j; s->sps=1; return 0; }
+  /* NVIDIA: the shader helper process builds it (sps 6 above); a draw that must have it now still compiles it here */
+  if(g_nv_win && g_par>0 && g_pcache>0 && !g_sync_draws && !g_must_wait && !s->nohelp && s->src){
+    if(g_helper<0){ g_helper= !getenv("SWR_NO_SHADER_HELPER") && backend_shader_helper_start(g_pc_tag); }
+    if(g_helper>0 && backend_shader_helper_alive()){
+      u32 sl=(u32)strlen(s->src), st=(u32)j->stype; u8* b=malloc((size_t)sl+20);
+      if(b){ memcpy(b,"SWRJ",4); memcpy(b+4,&st,4); memcpy(b+8,&sl,4); memcpy(b+12,s->src,sl); memcpy(b+12+sl,"SWRJOBOK",8);
+        char jp[200]; snprintf(jp,sizeof jp,"shader_cache/jobs/%016llx.job",(unsigned long long)key);
+        aw_write(jp,b,(size_t)sl+20,0); free(b);
+        s->pkey=key; s->pt0=plat_ns(); s->sps=6; free(j); return 0; } } }
   if(g_par>0 && !g_sync_draws && !g_must_wait){ /* at most g_cpf new ones a frame: NVIDIA parses each on the GL thread
        (glCompileShader 20-170 ms), and a burst of dozens at once was a 1-1.5 s freeze; the rest wait a frame or two.
        SWR_COMPILES_PER_FRAME=n, 0 = no limit */
@@ -4024,7 +4055,10 @@ typedef struct { GLuint p, a, b; u64 key; } WarmJob;
 static WarmJob wj[6]; static int wj_n;
 
 static void warm_load(void){
-  pcache_init();translated_load(); FILE* f=fopen(PACK_PATH,"rb"); if(!f) return; u32 cap=0;
+  pcache_init();translated_load();
+  /* the helpers start first: shaders in the pack without a binary for this driver go straight to them (below) */
+  if(g_nv_win && g_par>0 && g_pcache>0 && g_helper<0){ g_helper= !getenv("SWR_NO_SHADER_HELPER") && backend_shader_helper_start(g_pc_tag); }
+  FILE* f=fopen(PACK_PATH,"rb"); if(!f) return; u32 cap=0;
   GLuint* wp=NULL; int wp_n=0, wp_cap=0;   /* programs loaded from binaries: their uniforms are looked up at boot (glq_uloc_prime) */
   for(;;){ u32 mg,a,b; u64 key; if(fread(&mg,4,1,f)!=1 || (mg!=0x4B435053 && mg!=0x33504853) || fread(&key,8,1,f)!=1) break;
     if(mg==0x33504853){ u32 st=0; if(fread(&st,4,1,f)!=1 || fread(&a,4,1,f)!=1 || a>(8u<<20)) break;
@@ -4034,6 +4068,9 @@ static void warm_load(void){
         if(g_pcache>0 && (st!=ST_VS || strstr(src,"gl_Position = vec4(0.0, 0.0, 0.0, 1.0)"))){
           char path[160];snprintf(path,sizeof path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
           GLuint p=binary_load(path,1);if(p){ warm_stage_put(key,p,ULOC_LAZY); if(wp_n>=wp_cap){ wp_cap= wp_cap? wp_cap*2 : 1024; wp=realloc(wp,wp_cap*sizeof *wp); } wp[wp_n++]=p; }
+          else if(g_helper>0 && !backend_file_exists(path) && hp_job_worth(src)){ u32 sl=a, gt= st==ST_VS? GL_VERTEX_SHADER : st==ST_GS? GL_GEOMETRY_SHADER : GL_FRAGMENT_SHADER; u8* b=malloc((size_t)sl+20);
+            if(b){ memcpy(b,"SWRJ",4); memcpy(b+4,&gt,4); memcpy(b+8,&sl,4); memcpy(b+12,src,sl); memcpy(b+12+sl,"SWRJOBOK",8);
+              char jp[200]; snprintf(jp,sizeof jp,"shader_cache/jobs/%016llx.pjob",(unsigned long long)key); aw_write(jp,b,(size_t)sl+20,0); free(b); g_hp_pre++; } }
         }free(src);continue;
       }
       char path[160]; snprintf(path,sizeof path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
@@ -4271,10 +4308,14 @@ static void mp_scan_thread(void* arg){ plat_diag_role("shader-scan"); (void)arg;
     { u64 until=plat_ns()+(pass<10? 2000000000ull : 5000000000ull);   /* or sooner when a draw found a shader it had missed */
       while(plat_ns()<until){ if(__atomic_exchange_n(&g_mp_wake,0,__ATOMIC_ACQ_REL)){ woke=1; break; } plat_sleep_ns(20000000); } } } }
 static void mem_prebuild_step(void){
-  /* NVIDIA on Windows: opt-in (SWR_NV_PREBUILD=1). Tried on by default 2026-11-07, compiling only on frames with < 40 draws:
-     those include the title screen, menus and the map, glCreateProgram took 50-117 ms on the GL thread (300-390 ms frames),
-     and the driver's background builds later blocked the GL thread 100-240 ms in play, one frame 1.9 s */
-  if(g_mp_on<0){ g_mp_on= g_opt_prebuild && !g_gles && g_sep==1 && (g_worker==1 || (g_nv_win && g_par>0 && getenv("SWR_NV_PREBUILD"))) && g_pcache>0 && !getenv("SWR_NO_MEM_PREBUILD");
+  /* NVIDIA on Windows: through the shader helper process, whose compiles can't block the game (shader_helper.inc). In the
+     game's own driver (SWR_NV_PREBUILD=1, tried on by default 2026-11-07): glCreateProgram took 50-117 ms on the GL thread
+     (300-390 ms frames), and the driver's background builds later blocked the GL thread 100-240 ms in play, one frame 1.9 s.
+     Without it a cutscene's shaders only start building when it starts: 2026-11-08, a third of its draws (Samus, the
+     marines) were missing for its whole length */
+  if(g_mp_on<0 && g_nv_win && g_par>0 && g_pcache>0 && g_helper<0){ g_helper= !getenv("SWR_NO_SHADER_HELPER") && backend_shader_helper_start(g_pc_tag); }
+  ld_drain();
+  if(g_mp_on<0){ g_mp_on= g_opt_prebuild && !g_gles && g_sep==1 && (g_worker==1 || (g_nv_win && g_par>0 && (g_helper>0 || getenv("SWR_NV_PREBUILD")))) && g_pcache>0 && !getenv("SWR_NO_MEM_PREBUILD");
     if(g_mp_on){ pm_init(&g_mp_m); if(plat_thread(mp_scan_thread,NULL,512*1024)) g_mp_on=0; }
     LOG("shaders: pre-build from GPU memory %s\n",g_mp_on? "on (shaders are built as soon as the game loads them, before it draws with them)" : "off"); }
   if(!g_mp_on) return;
@@ -4291,7 +4332,9 @@ static void mem_prebuild_step(void){
   if(pb_frame!=g_frame){ pb_frame=g_frame; pb_n=0; }
   extern volatile unsigned long long g_video_last_ns;
   int pb_ok= g_lf_light && plat_ns()-g_video_last_ns>2000000000ull;   /* loading or fade, no video in the last 2 s */
-  while(g_mpj_n<63 && plat_ns()-t0<1500000ull && (g_worker==1 || (pb_ok && pb_n<(u32)pb_cpf && g_frame-g_cpf_frame>=2)) && g_pcj_n<64){   /* NVIDIA: only when the draws started none this frame or the last */   /* at most 1.5 ms of translating per loop (a slot kept for a variant) */
+  int pb_go= g_helper>0? (plat_ns()-g_video_last_ns>2000000000ull && pb_n<(u32)pb_cpf) : (pb_ok && pb_n<(u32)pb_cpf && g_frame-g_cpf_frame>=2);   /* helper: any time but during a video (translating is the only cost here) */
+  while(g_mpj_n<63 && plat_ns()-t0<1500000ull && (g_worker==1 || pb_go) && g_pcj_n<64){
+    if(g_worker!=1 && pb_n>=(u32)pb_cpf) break;   /* NVIDIA: only when the draws started none this frame or the last */   /* at most 1.5 ms of translating per loop (a slot kept for a variant) */
     pm_lock(&g_mp_m); MemProg mp= g_mp_next<g_mp_n? g_mp[g_mp_next++] : (MemProg){NULL,0,0}; pm_unlock(&g_mp_m);
     if(!mp.code) break;
     int stage=mp.stage; u32 hl; u64 h=shader_hash(mp.code,mp.avail,&hl);
@@ -4326,6 +4369,12 @@ static void mem_prebuild_step(void){
     pack_add_sh(key,&tmp);
     { static int tsi=-1; if(tsi<0) tsi=getenv("SWR_TEST_STANDIN")!=NULL; if((!c && trans_overflow) || tsi) fb_put(h,stage,key2,key); }
     char bp[200]; snprintf(bp,sizeof bp,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
+    if(g_worker!=1 && g_helper>0){ /* the helper process builds it, low priority; its first draw then finds the binary on disk */
+      if(backend_file_exists(bp)){ g_mp_had++; if(!warm_stage_peek(key)) ld_request(key); }   /* ready before its first draw, off the GL thread */
+      else if(backend_shader_helper_alive() && hp_job_worth(src)){ u32 sl=(u32)strlen(src), gt= stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER; u8* b=malloc((size_t)sl+20);
+        if(b){ memcpy(b,"SWRJ",4); memcpy(b+4,&gt,4); memcpy(b+8,&sl,4); memcpy(b+12,src,sl); memcpy(b+12+sl,"SWRJOBOK",8);
+          char jp[200]; snprintf(jp,sizeof jp,"shader_cache/jobs/%016llx.pjob",(unsigned long long)key); aw_write(jp,b,(size_t)sl+20,0); free(b); pb_n++; g_hp_pre++; } }
+      g_mp_built++; free(src); continue; }
     WJob* j=calloc(1,sizeof *j); j->vs=src; j->own_vs=src; j->key=key; j->keep=1; j->sep=1; j->stype= stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER;
     { FILE* t=fopen(bp,"rb"); if(t){ fclose(t); j->try_bin=1; snprintf(j->bin_path,sizeof j->bin_path,"%s",bp); g_mp_had++; } }   /* built before: the thread loads it */
     if(g_worker!=1){   /* NVIDIA: a binary from an earlier run loads now; else the driver builds it and pc_step reports when done */
@@ -4530,6 +4579,8 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
             LOG("performance: %.1f FPS, GPU thread CPU busy %d%% (host rendering-thread CPU time; not hardware GPU utilization)\n",
               (double)(g_frame-last_frames)*1e9/(double)dt,(int)((cpu_now-last_cpu)*100/dt));
             if(g_par_built){ static u32 said; if(g_par_built!=said){ said=g_par_built; LOG("shaders: %u built by the driver in the background so far (longest %.0f ms, drawn when ready)\n",g_par_built,g_par_max/1e6); } }
+            if(g_hp_built||g_hp_fallback){ static u32 said; if(g_hp_built+g_hp_fallback!=said){ said=g_hp_built+g_hp_fallback; LOG("shaders: %u built by the helper process when first drawn (longest wait %.0f ms), %u compiled in the game instead\n",g_hp_built,g_hp_max/1e6,g_hp_fallback); } }
+            if(g_hp_pre){ static u32 said; if(g_hp_pre!=said){ said=g_hp_pre; LOG("shaders: %u sent to the helper process ahead of their first draw\n",g_hp_pre); } }
             { extern volatile unsigned g_sh_loops_structured; static unsigned said; if(g_sh_loops_structured!=said){ said=g_sh_loops_structured; LOG("shaders: %u shaders with loops translated as plain loops (no jump dispatcher)\n",said); } }
             if(st_lf_waits){ static u64 said; if(st_lf_waits!=said){ said=st_lf_waits; LOG("shaders: %llu draws on loading/fade frames waited for their shaders instead of being skipped (%.0f ms in all)\n",(unsigned long long)st_lf_waits,st_lf_wait_ns/1e6); } }
             if(g_workers_up){ char wb[160]; int o=0; for(int i=0;i<g_wid_next && i<8;i++) o+=snprintf(wb+o,sizeof wb-o," #%d step %d jobs %u",i,g_wph[i],g_wjobs[i]);

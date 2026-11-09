@@ -656,3 +656,5 @@ void frontend_frame(void){
 }
 
 int backend_glq_ok(void){ return 1; }   /* GL calls go through glq */
+
+#include "shader_helper.inc"
