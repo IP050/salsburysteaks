@@ -964,7 +964,10 @@ static u64 slab_hash(Tex* t, u32 i){ u64 a=t->gva+(u64)i*t->slb; u8* p=gmem_ptr(
 static u64 g_slab_bud; static u32 g_slab_bud_frame; static int g_slab_fill=-1;
 static int slab_setup(Tex* t, int fill){
   static int off=-1; if(off<0) off=getenv("SWR_NO_SLABS")!=NULL;
-  if(off || t->slh || t->target!=GL_TEXTURE_3D || t->levels!=1 || !t->bl || t->size<(32u<<20) || t->f.astc || t->f.dec) return 0;
+  /* ini slab_min_mb: 19 MB volumes, re-uploaded whole five in a row at a door, were 250-350 ms freezes (MEASURED
+     2026-11-09, 47 uploads of 50-70 ms in the intro). Was 32 MB, which they just missed */
+  extern int g_opt_slab_min_mb;
+  if(off || t->slh || t->target!=GL_TEXTURE_3D || t->levels!=1 || !t->bl || t->size<((u64)g_opt_slab_min_mb<<20) || t->f.astc || t->f.dec) return 0;
   const GlFmt* f=&t->f; u32 tw=(t->w+f->bw-1)/f->bw, th=(t->h+f->bh-1)/f->bh, rowb=tw*f->bpp, lbh=0;
   u64 lsz=bl_level_size(t->w,t->h,t->d,f,t->bh,t->bd,0,&lbh);
   u32 lbd=t->bd; while(lbd>0 && t->d<=(1u<<(lbd-1))) lbd--;
@@ -1128,10 +1131,13 @@ static Tex* tex_from_tic_(u32* tic){
      sampler) made the GPU allocate and upload it: seconds of freeze and half of an 8 GB card. The game's largest real
      textures are its lighting volumes, 173-363 MB: anything over 1 GB is read as missing */
   if(sz>(1ull<<30)){ static int said; if(said<4){ said++; LOG("gpu: texture %ux%ux%u at %llx would be %llu MB: not made (a stale or wrong descriptor)\n",w,h,d,(unsigned long long)gva,(unsigned long long)(sz>>20)); } return NULL; }
-  Tex* t=tex_create(gva,w,h,d,levels,target,f,fkey,bl,bh,bd,pitch,0);
-  t->size=sz; t->hash=mem_hash(gva,sz); t->frame_checked=g_frame; t->last_used=g_frame; t->dgen=g_dma_gen;
+  u64 ct0=plat_ns(); Tex* t=tex_create(gva,w,h,d,levels,target,f,fkey,bl,bh,bd,pitch,0); u64 ct1=plat_ns();
+  t->size=sz; t->frame_checked=g_frame; t->last_used=g_frame; t->dgen=g_dma_gen;
   if(g_slab_fill<0){ const char* e=getenv("SWR_SLAB_FILL"); g_slab_fill= e? atoi(e)!=0 : g_nv_win; }
-  if(!(g_slab_fill && slab_setup(t,1))){ tex_upload(t); slab_setup(t,0); }   /* a big volume fills in slab by slab (slab_setup) */
+  /* a big volume fills in slab by slab (slab_setup) and keeps a hash per slab: the whole-texture hash isn't used for it */
+  int slf= g_slab_fill && slab_setup(t,1); u64 ct2=plat_ns();
+  if(!slf){ t->hash=mem_hash(gva,sz); tex_upload(t); slab_setup(t,0); }
+  { u64 ct3=plat_ns(); if(ct3-ct0>20000000ull){ static int said; if(said<60){ said++; LOG("gpu: new texture %ux%ux%u at %llx (%llu MB) took %.1f ms: made %.1f, slabs %.1f, hash and upload %.1f\n",w,h,d,(unsigned long long)gva,(unsigned long long)(sz>>20),(ct3-ct0)/1e6,(ct1-ct0)/1e6,(ct2-ct1)/1e6,(ct3-ct2)/1e6); } } }
   t->video_gen=video_surface_generation(gmem_ptr(gva,1),sz);
   return t; }
 
@@ -4374,7 +4380,8 @@ static void mp_scan_thread(void* arg){ plat_diag_role("shader-scan"); (void)arg;
       const u8* buf=GP(a); u64 fp=mp_fingerprint(buf,n);
       if(!full && !b_had[h] && b_addr[h]==a && b_size[h]==n && b_fp[h]==fp){ skipped+=n; continue; }
       b_addr[h]=a; b_size[h]=n; b_fp[h]=fp; bytes+=n; nbuf++;
-      for(u64 o=0;o+128<=n;o+=4){ u32 w0; memcpy(&w0,buf+o,4); if(((w0>>5)&31)!=3 || ((w0&31)!=1 && (w0&31)!=2)) continue;
+      for(u64 o=0;o+128<=n;o+=4){ if(!(o&0x7FFFFF)) plat_sleep_ns(1000000);   /* a breath per 8 MB: it took 30-50% of a core in play */
+        u32 w0; memcpy(&w0,buf+o,4); if(((w0>>5)&31)!=3 || ((w0&31)!=1 && (w0&31)!=2)) continue;
         u32 avail= n-o>0x10000? 0x10000 : (u32)(n-o), len=0; int ty=0; if(!shader_program_check(buf+o,avail,&len,&ty)) continue;
         int stage= ty==1? ST_VS : ty==5? ST_FS : -1; if(stage<0) continue; b_had[h]=1;
         u32 hl; u64 hh=shader_hash(buf+o,avail,&hl); u64 k=(hh^(u64)(stage+1))|1; u32 i=(u32)(k^(k>>31))&0x1FFFF;
