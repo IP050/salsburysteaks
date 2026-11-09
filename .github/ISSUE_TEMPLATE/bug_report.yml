@@ -1,17 +1,45 @@
 name: Bug report
-description: A crash, a setup error, a graphics or sound problem, or stutter
+description: A crash, a setup error, a graphics or sound problem, low FPS or stutter
 labels: [bug]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting. Please attach the log files: without them most problems can't be found.
-        Never attach game files, keys or saves from someone else.
+        Thanks for reporting. One problem per report, please: it keeps each one easy to track and close.
+
+        **The log file finds most problems.** It is `Metroid Prime 4 Beyond.log` in the game folder, written fresh
+        each time you play (the one before is `Metroid Prime 4 Beyond.previous.log`). Attach it to this report. It shows
+        your Windows user name in file paths; you may blank that out. Never attach game files, keys or saves.
+
+        For something you can see in game, press **F5** (records the frame and 10 s of timings) and **F8** (a
+        screenshot) right when it happens, then attach the newest folder from `captures\traces` (zipped) and the
+        screenshot from `captures`.
   - type: textarea
-    id: what
+    id: summary
     attributes:
-      label: What happened?
-      description: What you did, what you expected, and what happened instead. Screenshots help.
+      label: Summary
+      description: Like a log line, what happened and where. One or two sentences.
+      placeholder: "Scan visor drops to 2 FPS while a target is under the reticle, everywhere I tried."
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, step by step, from starting the game.
+      placeholder: |
+        1. Load a save in the Volt Forge
+        2. Switch to the scan visor
+        3. Aim at any scannable object
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual result
+      placeholder: |
+        Expected: 60 FPS while scanning, as in normal play
+        Actual: about 2 FPS until the scan visor is closed
     validations:
       required: true
   - type: dropdown
@@ -27,12 +55,23 @@ body:
         - Other
     validations:
       required: true
+  - type: dropdown
+    id: often
+    attributes:
+      label: How often?
+      options:
+        - Every time
+        - Only the first time (then it is fine)
+        - Sometimes
+        - Happened once
+    validations:
+      required: true
   - type: input
     id: version
     attributes:
       label: Version
-      description: Play screen > Updates, or the "version" line of update.txt in the game folder
-      placeholder: "0.2.1"
+      description: The release you downloaded, or the "version" line of update.txt in the game folder
+      placeholder: "2026.11.10"
     validations:
       required: true
   - type: dropdown
@@ -47,24 +86,25 @@ body:
     validations:
       required: true
   - type: input
-    id: cpu
+    id: graphics
     attributes:
-      label: CPU
-      placeholder: "e.g. Ryzen 5 5600X / Core i5-1135G7"
+      label: Graphics settings
+      description: From `Metroid Prime 4 Beyond.ini` in the game folder, the lines resolution=, docked=, upscaler= and your window or screen size
+      placeholder: "resolution=2, docked=1, upscaler=fsr, 3840x2160 fullscreen"
     validations:
       required: true
   - type: input
     id: gpu
     attributes:
       label: GPU and driver version
-      placeholder: "e.g. RTX 3060, driver 566.36 / Intel Iris Xe"
+      placeholder: "e.g. RTX 4070, driver 621.01 / Radeon RX 7800 XT, Adrenalin 25.10.1"
     validations:
       required: true
   - type: input
-    id: ram
+    id: cpu
     attributes:
-      label: RAM
-      placeholder: "e.g. 16 GB"
+      label: CPU and RAM
+      placeholder: "e.g. Ryzen 5 5600X, 16 GB"
     validations:
       required: true
   - type: input
@@ -74,19 +114,27 @@ body:
       placeholder: "e.g. Windows 11 24H2"
     validations:
       required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup errors only
+      description: |
+        The exact message on the setup screen, and what you chose: game as .xci / .nsp / folder, update as .nsp / folder.
+        Attach `setup.log` from the game folder.
+      placeholder: "Game: .xci, update: .nsp. Message: ..."
   - type: checkboxes
     id: game
     attributes:
       label: Game files
       options:
-        - label: My game files are my own dump of Metroid Prime 4 Beyond 2.1.0 (ExeFS and RomFS, update applied)
+        - label: My game files are my own dump of Metroid Prime 4 Beyond with the v1.1.0 update
           required: true
   - type: textarea
     id: logs
     attributes:
-      label: Logs
+      label: Logs and captures
       description: |
-        Drag in `Metroid Prime 4 Beyond.log` from the game folder. For stutter also `performance.txt`; for setup problems
-        `setup.log`. Attach the files rather than pasting them.
+        Drag in `Metroid Prime 4 Beyond.log` (and `setup.log` for setup problems; `performance.txt` for low FPS or
+        stutter). Attach the files rather than pasting them. Add the F5 trace folder (zipped) and F8 screenshot if you took them.
     validations:
       required: true
