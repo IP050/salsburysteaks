@@ -697,13 +697,19 @@ static void lvl_attach(GLenum fbt, GLuint tex, GLenum target, int level, int lay
 /* color blit src(target/level/layer) -> dst(level/layer); saves and restores scissor, srgb, color mask */
 static void lvl_blit(GLuint src, GLenum st, int sl, int slay, GLsizei sw, GLsizei sh, GLuint dst, GLenum dtg, int dl, int dlay, GLsizei dw, GLsizei dh, GLenum filt){
   /* glGetIntegerv, not glGetBooleanv: only the former goes through the GL call queue */
-  GLboolean sc=glIsEnabled(GL_SCISSOR_TEST), sr=glIsEnabled(GL_FRAMEBUFFER_SRGB); GLint cm[4]={1,1,1,1}; glGetIntegerv(GL_COLOR_WRITEMASK,cm);
-  glDisable(GL_SCISSOR_TEST); glDisable(GL_FRAMEBUFFER_SRGB); glColorMaski(0,1,1,1,1);
+  /* blit_nosync (ini, default on, 0 = off): the state save and restore are queued, no wait (8-16% of the GPU thread's time in
+     the blur chain, MEASURED 2026-11-09). Trial: the first build with it, which also had the loader's test draws, had lights
+     flickering; later builds flickered without it until the full shader-buffer table was fixed (GW_MAX) */
+  extern int g_opt_blit_nosync; int q=g_opt_blit_nosync && glq_active(); GLboolean sc=0, sr=0; GLint cm[4]={1,1,1,1};
+  if(q) glq_blit_state(0);
+  else { sc=glIsEnabled(GL_SCISSOR_TEST); sr=glIsEnabled(GL_FRAMEBUFFER_SRGB); glGetIntegerv(GL_COLOR_WRITEMASK,cm); glDisable(GL_SCISSOR_TEST); glDisable(GL_FRAMEBUFFER_SRGB); glColorMaski(0,1,1,1,1); }
   glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); lvl_attach(GL_READ_FRAMEBUFFER,src,st,sl,slay); glReadBuffer(GL_COLOR_ATTACHMENT0);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER,g_dfbo); lvl_attach(GL_DRAW_FRAMEBUFFER,dst,dtg,dl,dlay); { GLenum b=GL_COLOR_ATTACHMENT0; glDrawBuffers(1,&b); }
   glBlitFramebuffer(0,0,sw,sh,0,0,dw,dh,GL_COLOR_BUFFER_BIT,filt);
   glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
-  glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); if(sc) glEnable(GL_SCISSOR_TEST); if(sr) glEnable(GL_FRAMEBUFFER_SRGB); glColorMaski(0,cm[0]!=0,cm[1]!=0,cm[2]!=0,cm[3]!=0); }
+  glBindFramebuffer(GL_FRAMEBUFFER,g_fbo);
+  if(q) glq_blit_state(1);
+  else { if(sc) glEnable(GL_SCISSOR_TEST); if(sr) glEnable(GL_FRAMEBUFFER_SRGB); glColorMaski(0,cm[0]!=0,cm[1]!=0,cm[2]!=0,cm[3]!=0); } }
 
 /* read one texel of a level via the read fbo (glReadPixels is queued, glGetTextureSubImage isn't) */
 static void lvl_read1(GLuint tex, GLenum target, int level, int layer, GLint x, GLint y, float* out){

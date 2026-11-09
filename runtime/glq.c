@@ -228,6 +228,16 @@ void glq_swap(void){
     else for(int i=0;g_swaps_sent-__atomic_load_n(&g_swaps_done,__ATOMIC_ACQUIRE)>1;i++){if(i>200)plat_yield();}
   } }
 
+/* a blit's state save and restore, done in order on the GL thread. Asking for the state from the GPU thread waited for
+   the whole queue, three times per blit: the blur chain's copies were 16% of the GPU thread's time (MEASURED 2026-11-09) */
+extern GLboolean (APIENTRY *r_glIsEnabled)(GLenum); extern void (APIENTRY *r_glGetIntegerv)(GLenum,GLint*); extern void (APIENTRY *r_glEnable)(GLenum); extern void (APIENTRY *r_glDisable)(GLenum); extern void (APIENTRY *r_glColorMaski)(GLuint,GLboolean,GLboolean,GLboolean,GLboolean);
+static GLboolean g_bs_sc, g_bs_sr; static GLint g_bs_cm[4];
+static void e_blit_state(void* p){ int restore=*(int*)p;
+  if(!restore){ g_bs_sc=r_glIsEnabled(GL_SCISSOR_TEST); g_bs_sr=r_glIsEnabled(GL_FRAMEBUFFER_SRGB); r_glGetIntegerv(GL_COLOR_WRITEMASK,g_bs_cm);
+    r_glDisable(GL_SCISSOR_TEST); r_glDisable(GL_FRAMEBUFFER_SRGB); r_glColorMaski(0,1,1,1,1); }
+  else { if(g_bs_sc) r_glEnable(GL_SCISSOR_TEST); if(g_bs_sr) r_glEnable(GL_FRAMEBUFFER_SRGB); r_glColorMaski(0,g_bs_cm[0]!=0,g_bs_cm[1]!=0,g_bs_cm[2]!=0,g_bs_cm[3]!=0); } }
+void glq_blit_state(int restore){ int* a=glq_alloc(sizeof *a,0,e_blit_state); *a=restore; glq_commit(); }
+
 int glq_worker_current(void){ int r=backend_gl_worker_current(); if(r) t_glq_direct=1; return r; }
 
 /* ---------- proc lookup */

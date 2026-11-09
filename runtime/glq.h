@@ -10,6 +10,7 @@ void* glq_proc(const char* name);           /* like backend_gl_proc but hands ou
 void glq_swap(void);                        /* queued swap, never more than one frame in flight */
 int glq_worker_current(void);               /* worker context current + bypass the queue on this thread */
 void glq_finish_all(void);                  /* block until the GL thread drained the queue */
+void glq_blit_state(int restore);           /* queued: 0 saves scissor, sRGB and colour mask and clears them for a blit, 1 restores them */
 #include <stdint.h>
 void glq_read_pixels_pbo(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t, uintptr_t off);   /* with a pack buffer bound, never waits */
 void glq_get_tex_image_pbo(GLenum tg, GLint lv, GLenum f, GLenum t, uintptr_t off);
