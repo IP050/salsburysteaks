@@ -340,6 +340,10 @@ static void dl_run(const DlJob* j){
   gl.bindfb(GL_READ_FRAMEBUFFER,(GLuint)rfb); gl.bindfb(GL_DRAW_FRAMEBUFFER,(GLuint)dfb); if(sc) gl.en(GL_SCISSOR_TEST);
   { u64 tp7=plat_ns(); u64 ph[6]={tp1-tp0,tp2-tp1,tp4-tp3,tp5-tp4,tp6-tp5,tp7-tp6};   /* copies in, fence wait, NGX eval, submit, GL wait, blit back */
     for(int i=0;i<6;i++){ g_dlt[i]+=ph[i]; if(ph[i]>g_dltmax[i]) g_dltmax[i]=ph[i]; } g_dltn++;
+    /* watchdog: half a second of steps over 20 ms and DLAA goes off for this session. It should cost a few ms; on the map
+       the copies waited 50-60 ms a frame for the previous evaluation (2026-11-08: 17 FPS, and the audio ran dry with it) */
+    { static int slow; slow= tp7-tp0>20000000ull? slow+1 : 0;
+      if(slow>=30 && !getenv("SWR_DLSS_NO_WATCHDOG")){ fail("each frame's step keeps taking over 20 ms, which costs more than it gives"); return; } }
     if(tp7-tp0>12000000ull){ static int said; if(said<40){ said++; LOG("dlaa (OpenGL): a %.1f ms step: copies %.1f, fence wait %.1f, eval %.1f, submit %.1f, GL wait %.1f, blit %.1f ms\n",(tp7-tp0)/1e6,ph[0]/1e6,ph[1]/1e6,ph[2]/1e6,ph[3]/1e6,ph[4]/1e6,ph[5]/1e6); } }
     if(g_dltn>=600){ LOG("dlaa (OpenGL): step averages over %llu frames (worst): copies %.2f (%.1f), fence wait %.2f (%.1f), eval %.2f (%.1f), submit %.2f (%.1f), GL wait %.2f (%.1f), blit %.2f (%.1f) ms\n",(unsigned long long)g_dltn,
         g_dlt[0]/1e6/g_dltn,g_dltmax[0]/1e6,g_dlt[1]/1e6/g_dltn,g_dltmax[1]/1e6,g_dlt[2]/1e6/g_dltn,g_dltmax[2]/1e6,g_dlt[3]/1e6/g_dltn,g_dltmax[3]/1e6,g_dlt[4]/1e6/g_dltn,g_dltmax[4]/1e6,g_dlt[5]/1e6/g_dltn,g_dltmax[5]/1e6);
