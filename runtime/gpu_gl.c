@@ -1919,7 +1919,7 @@ static int rb_procs(void){ if(!p_rbmap){ p_rbmap=(PFNGLMAPBUFFERRANGEPROC)backen
    reset goes to guest memory (a frame or two late, like a hardware readback the game polls). SWR_NO_OCCLUSION=1: off */
 #define OQN 128
 typedef struct { u64 addr; int shortf, ns; u8 slots[8]; GLsync fence; } OqRep;
-static GLuint g_oq_buf; static volatile u64* g_oq_map; static int g_oq_ok=-1, g_oq_active=-1, g_oq_next, g_noqr, g_noqs; static u8 g_oqs[8]; static OqRep g_oqr[32];
+static GLuint g_oq_buf; static volatile u64* g_oq_map; static int g_oq_ok=-1, g_oq_active=-1, g_oq_next, g_noqr, g_noqs; static u8 g_oqs[8]; static OqRep g_oqr[96];
 static int rb_procs(void);
 static int oq_init(void){
   if(g_oq_ok>=0) return g_oq_ok; g_oq_ok=0;
@@ -1936,7 +1936,8 @@ void gpu_gl_oq_reset(void){
   g_noqs=0; oq_begin(); }
 /* 1: the report is handled (written when the GPU has the count) */
 int gpu_gl_oq_report(u64 addr, int shortf){
-  if(!oq_init() || g_oq_active<0 || g_noqr>=32) return 0;
+  if(g_oq_ok>0 && g_noqr>=96){ static u32 over; over++; if(over<=20 || over%600==0) LOG("gpu: occlusion: %u reports found no free slot and were answered \"all visible\" (a flare shows through walls)\n",over); }
+  if(!oq_init() || g_oq_active<0 || g_noqr>=96) return 0;
   glq_occl(1,g_oq_active,0,0); glq_occl(2,g_oq_active,g_oq_buf,(uintptr_t)g_oq_active*8);
   if(g_noqs<8) g_oqs[g_noqs++]=(u8)g_oq_active;
   OqRep* q=&g_oqr[g_noqr++]; q->addr=addr; q->shortf=shortf; q->ns=g_noqs; memcpy(q->slots,g_oqs,sizeof q->slots);
@@ -1944,6 +1945,12 @@ int gpu_gl_oq_report(u64 addr, int shortf){
      the frame's own flush at the swap sends it and the GL thread's fence poll sees it a frame later */
   oq_begin(); return 1; }
 static void oq_poll(void){
+  /* ini oq_sync: at each present wait up to 10 ms for this frame's reports. Prime 4 reads them from a ring of addresses
+     (50ae00f40.., about 2.5 a frame in the intro): landing a frame or more late, depending on how far behind the GL thread
+     is, a flare could read a stale answer: same camera, one frame the red flare, the next not (F8 032629_13 and _14). The
+     wait costs frame time when the GPU is behind, so it is logged. SUSPECTED cause, not proven: 0 turns it off */
+  if(g_opt_oq_sync && g_noqr){ u64 t0=plat_ns(), lim=t0+10000000ull; for(int i=0;i<g_noqr;i++){ u64 now=plat_ns(); if(now>=lim) break; p_rbcws(g_oqr[i].fence,GL_SYNC_FLUSH_COMMANDS_BIT,lim-now); }
+    static u64 ws, wn, wo; u64 dt=plat_ns()-t0; ws+=dt; wn++; if(dt>=10000000ull) wo++; if(wn%1800==0){ LOG("gpu: occlusion: waited %.2f ms a frame for the reports, %llu of the last 1800 frames used the whole 10 ms\n",ws/1e6/1800.0,(unsigned long long)wo); ws=0; wo=0; } }
   for(int i=0;i<g_noqr;){ OqRep* q=&g_oqr[i]; GLenum r=p_rbcws(q->fence,0,0);
     if(r!=GL_ALREADY_SIGNALED && r!=GL_CONDITION_SATISFIED){ i++; continue; }
     p_rbds(q->fence); u64 n=0; for(int k=0;k<q->ns;k++) n+=g_oq_map[q->slots[k]];
