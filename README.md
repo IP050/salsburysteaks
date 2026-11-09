@@ -137,7 +137,11 @@ The Windows build, packaging and releases in this repository were made by **Plag
 ### Everyone else
 
 - **yozander2009-stack** and contributors: the recompiled runtime and launcher this port is built from
-- **linuxopt**: the Metroid Prime 4 fork and its fixes (made with Claude as AI pair programmer too)
+- **linuxopt**: the Metroid Prime 4 fork and its fixes (made with Claude as AI pair programmer too), including the later
+  Ice Belt fog and Control Beam fixes and the built-in cheat hooks ported here from
+  [`079dfb0`](https://github.com/linuxopt/mp4-recomp/commit/079dfb0)
+- **Gamerjin**, **Luffysan** and others on GBAtemp, with pointers by **ZiT866**: the cheats behind the built-in cheat hooks
+- **melos444** (GameBanana): the mod the Green Energy 10x option is based on
 - **MZ Labs**: SwitchRecomp (Apache-2.0); "SwitchRecomp by MZ Labs" and NOTICE.txt must be kept
 - **ScarletNX**: the native Vulkan renderer (GPL-3.0)
 - **AMD**: FidelityFX Super Resolution 1 (MIT)
