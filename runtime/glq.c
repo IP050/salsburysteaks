@@ -295,7 +295,7 @@ static void gl_thread(void* arg){ plat_diag_role("GL-driver"); (void)arg; trace_
         if(dx>20000000ull){ static int said, big; if(said<60 || (dx>100000000ull && big<2000)){ if(said<60) said++; else big++; const char* nm="?"; void* fx=(void*)hd->ex;
             if(fx==(void*)q_sync_ex){ nm="sync"; QSync* qs=*(QSync**)hd->data; fx=(void*)qs->ex; }
             for(const GlqEnt* e=g_glq_tab;e->name;e++) if(e->execute==fx){ nm=e->name; break; }
-            LOG("glq: %s took %.1f ms on the GL thread (fn +%lld)\n",nm,dx/1e6,(long long)((char*)fx-(char*)(void*)glq_start));
+            { extern void gl_worker_phases(char*,int); char wp[16]; gl_worker_phases(wp,sizeof wp); LOG("glq: %s took %.1f ms on the GL thread (fn +%lld) workers %s\n",nm,dx/1e6,(long long)((char*)fx-(char*)(void*)glq_start),wp); }
             if(!strcmp(nm,"glCompressedTexSubImage3D")){   /* which upload: A_glCompressedTexSubImage3D of glq_gen.c */
               typedef struct { GLenum target; GLint level, x, y, z; GLsizei w, h, d; GLenum format; GLsizei size; const void* data; } A_cts3;
               const A_cts3* a=(const A_cts3*)hd->data; LOG("glq:   target %x level %d at z %d, %dx%dx%d, format %x, %d bytes\n",a->target,a->level,a->z,a->w,a->h,a->d,a->format,a->size); } } } }

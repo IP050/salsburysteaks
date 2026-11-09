@@ -1285,6 +1285,48 @@ static char* sh_dbg(char* src, u64 h){
   for(const char* q=eol+1;*q;){ if(!strncmp(q,"return;",7)){ k+=snprintf(o+k,n-k,"{frag_color0=dbg_v;return;}"); q+=7; } else o[k++]=*q++; if(k+64>n) break; }
   o[k]=0; LOG("SWR_DBG_FS: shader %s patched\n",hs); return o;
 }
+/* Debug views (ini dbg_patch=1 at start, dbg_view=N live): the floor and rail materials can show one value at a time instead of their colour. The patched text compiles as its own program, since the cache key is a hash of the text.
+   1 surface direction in view space, 2 in the world, 3 reflection direction, 4 reflection blur level, 5 cube colour, 6 baked light (green where it went below zero), 7 reflection strength, 8 reflection BRDF.
+   971ce27e only has 3-5; a view it lacks draws black. Each change of view saves an F8 image by itself. */
+int g_opt_dbg_patch=0, g_opt_dbg_view=0;
+static char* sv_after(char* s, const char* anchor, const char* add){ char* p=strstr(s,anchor); char* e=p? strchr(p,'\n') : NULL; if(!e){ WARN("debug view: anchor not found: %.60s\n",anchor); return s; }
+  size_t a=(size_t)(e+1-s), n=strlen(s)+strlen(add)+1; char* o=malloc(n); memcpy(o,s,a); strcpy(o+a,add); strcat(o+a,e+1); return o; }
+static char* sh_view(char* src, u64 h){
+  u32 top=(u32)(h>>32); if(!g_opt_dbg_patch || !src || (top!=0x5cb0aa72u && top!=0x971ce27eu)) return src;
+  #define UF(r) "uintBitsToFloat(" #r ")"
+  /* the same product written other ways, right where it's stored (dbg_view -6, -7, -8) */
+  if(top==0x5cb0aa72u) src=sv_after(src,"r11 = floatBitsToUint((uintBitsToFloat(r19) * (-uintBitsToFloat(r20))));",
+    "  if(swr_rs.w<-5.5 && swr_rs.w>-6.5) r11=floatBitsToUint(-(" UF(r19) "*" UF(r20) "));\n"
+    "  else if(swr_rs.w<-6.5 && swr_rs.w>-7.5) r11=floatBitsToUint(" UF(r19) "*(0.0-" UF(r20) "));\n"
+    "  else if(swr_rs.w<-7.5){ float dm11=" UF(r19) "*" UF(r20) "; r11=floatBitsToUint(0.0-dm11); }\n");
+  /* the other floor material with NVIDIA's compiler optimisations reduced: does the fault follow them? */
+  if(top==0x971ce27eu) src=sv_after(src,"#version 440 core","#pragma optionNV(fastmath off)\n#pragma optionNV(fastprecision on)\n#pragma optionNV(unroll none)\n");
+  /* dbg_view -1: normal rendering, with the reflection lookup's angle replaced by the same math written as one dot product */
+  if(top==0x5cb0aa72u) src=sv_after(src,"r13 = floatBitsToUint(fsat(fma(uintBitsToFloat(r16), (-uintBitsToFloat(r15)), uintBitsToFloat(r13))));","  if(swr_rs.w<-0.5){ int dfx=int(0.5-swr_rs.w); float dnx=" UF(r19) ", dny=" UF(r17) ", dnz=" UF(r16) ", dvx=" UF(r20) ", dvy=" UF(r18) ", dvz=" UF(r15) ", dr11=" UF(r11) ";\n"
+    "    if(dfx==1) r13=floatBitsToUint(clamp(-dot(vec3(dnx,dny,dnz),vec3(dvx,dvy,dvz)),0.0,1.0));\n"
+    "    else if(dfx==2) r13=floatBitsToUint(fsat((dnz*(-dvz))+((dny*(-dvy))+(dnx*(-dvx)))));\n"      /* no fma */
+    "    else if(dfx==3) r13=floatBitsToUint(fsat(fma(dnz,(-dvz),fma(dny,(-dvy),(dnx*(-dvx))))));\n"  /* fma, fresh product */
+    "    else if(dfx==4) r13=floatBitsToUint(fsat(fma(dnz,(-dvz),fma(dny,(-dvy),dr11))));\n"          /* fma, the stored product */
+    "    else if(dfx==5) r13=floatBitsToUint(fsat((dnz*(-dvz))+((dny*(-dvy))+dr11))); }\n");           /* no fma, the stored product */
+  src=sv_after(src,"void main(){","  vec3 dbg_n=vec3(0), dbg_w=vec3(0), dbg_r=vec3(0), dbg_c=vec3(0), dbg_b=vec3(0), dbg_v=vec3(0); float dbg_l=0.0, dbg_s=0.0, dbg_f=0.0, dbg_x=0.0, dbg_y=0.0, dbg_d=0.0; vec2 dbg_t=vec2(0), dbg_z=vec2(0); vec3 dbg_n2=vec3(0), dbg_v2=vec3(0);\n");
+  if(top==0x5cb0aa72u){
+    src=sv_after(src,"r15 = floatBitsToUint((uintBitsToFloat(r50) * uintBitsToFloat(r32)));","  dbg_v=vec3(" UF(r20) "," UF(r18) "," UF(r15) ");\n");
+    src=sv_after(src,"{ vec4 t_ = texture(tex7, vec2(uintBitsToFloat(r13),uintBitsToFloat(r14)));","    dbg_x=" UF(r13) "; dbg_y=" UF(r14) "; dbg_t=t_.xy; dbg_z=textureLod(tex7,vec2(" UF(r13) "," UF(r14) "),0.0).xy; dbg_n2=vec3(" UF(r19) "," UF(r17) "," UF(r16) "); dbg_v2=vec3(" UF(r20) "," UF(r18) "," UF(r15) ");\n");
+    src=sv_after(src,"r10 = floatBitsToUint(fma(uintBitsToFloat(r16), uintBitsToFloat(r15), uintBitsToFloat(r9)));","  dbg_d=" UF(r10) ";\n");
+    src=sv_after(src,"r16 = floatBitsToUint(fma(uintBitsToFloat(r14), uintBitsToFloat(r3), uintBitsToFloat(r9)));","  dbg_n=vec3(" UF(r19) "," UF(r17) "," UF(r16) ");\n");
+    src=sv_after(src,"{ vec4 t_ = textureLod(tex6, vec3(uintBitsToFloat(r32),uintBitsToFloat(r33),uintBitsToFloat(r34)), uintBitsToFloat(r35));","    dbg_r=vec3(" UF(r32) "," UF(r33) "," UF(r34) "); dbg_l=" UF(r35) "; dbg_c=t_.xyz;\n");
+    src=sv_after(src,"r19 = floatBitsToUint(fma(uintBitsToFloat(r16), cb3.d[21].z, uintBitsToFloat(r19)));","  dbg_w=vec3(" UF(r14) "," UF(r13) "," UF(r19) ");\n");
+    src=sv_after(src,"r17 = floatBitsToUint(fma(uintBitsToFloat(r0), cb1.d[1].x, uintBitsToFloat(r1)));","  dbg_f=" UF(r17) ";\n");
+    src=sv_after(src,"r28 = floatBitsToUint(fma(uintBitsToFloat(r30), uintBitsToFloat(r19), uintBitsToFloat(r28)));","  dbg_b=vec3(" UF(r29) "," UF(r9) "," UF(r28) ");\n");
+    src=sv_after(src,"r14 = floatBitsToUint((uintBitsToFloat(r21) * uintBitsToFloat(r11)));","  dbg_s=" UF(r14) ";\n"); }
+  else src=sv_after(src,"{ vec4 t_ = textureLod(tex4, vec3(uintBitsToFloat(r14),uintBitsToFloat(r15),uintBitsToFloat(r36)), uintBitsToFloat(r37));","    dbg_r=vec3(" UF(r14) "," UF(r15) "," UF(r36) "); dbg_l=" UF(r37) "; dbg_c=t_.xyz;\n");
+  #undef UF
+  char* last=NULL; for(char* q=strstr(src,"return;");q;q=strstr(q+1,"return;")) last=q;
+  if(!last){ WARN("debug view: no return\n"); return src; }
+  static const char blk[]="if(swr_rs.w>0.5){ int dm=int(swr_rs.w+0.5); vec3 dc=vec3(0); if(dm==1) dc=dbg_n*0.5+0.5; else if(dm==2) dc=dbg_w*0.5+0.5; else if(dm==3) dc=dbg_r*0.5+0.5; else if(dm==4) dc=vec3(dbg_l/7.0); else if(dm==5) dc=dbg_c; else if(dm==6) dc= min(dbg_b.x,min(dbg_b.y,dbg_b.z))<0.0? vec3(0,1,0) : dbg_b; else if(dm==7) dc=vec3(dbg_s*2.0); else if(dm==8) dc=vec3(dbg_f); else if(dm==9) dc=vec3(dbg_x); else if(dm==10) dc=vec3(dbg_y); else if(dm==11) dc=vec3(dbg_t,0.0); else if(dm==12) dc=vec3(dbg_z,0.0); else if(dm==13) dc=vec3(dbg_x*8.0); else if(dm==14) dc=dbg_v*0.5+0.5; else if(dm==15) dc=vec3(clamp(-dot(dbg_n,dbg_v),0.0,1.0)*8.0); else if(dm==16) dc=dbg_v2*0.5+0.5; else if(dm==17) dc=dbg_n2*0.5+0.5; else if(dm==18) dc=vec3(clamp(-dot(dbg_n2,dbg_v2),0.0,1.0)*8.0); else if(dm==19) dc=vec3(clamp(-dbg_d,0.0,1.0)*8.0); else if(dm==20){ float e=(dbg_x-clamp(-dot(dbg_n2,dbg_v2),0.0,1.0))*64.0; dc=vec3(max(e,0.0),0.05,max(-e,0.0)); } else if(dm==21) dc=vec3(length(dbg_n2)-0.5,length(dbg_v2)-0.5,0.0); frag_color0=vec4(dc,frag_color0.w); }\n  ";
+  size_t a=(size_t)(last-src), n=strlen(src)+sizeof blk+1; char* o=malloc(n); memcpy(o,src,a); strcpy(o+a,blk); strcat(o+a,last);
+  { char pth[160]; plat_mkdir("captures"); snprintf(pth,sizeof pth,"captures/running_%016llx.glsl",(unsigned long long)h); FILE* f=fopen(pth,"w"); if(f){ fputs(o,f); fclose(f); } }   /* the text the driver really gets */
+  LOG("debug view: shader %016llx patched\n",(unsigned long long)h); return o; }
 static char* sh_nan_guard(char* src){
   static int off=-1; if(off<0) off=getenv("SWR_NO_NAN_GUARD")!=NULL;
   if(off || !src) return src;
@@ -1352,6 +1394,7 @@ static Sh* shader_get(u64 gva_code, int stage, u32 attr_int, u32 attr_sint){
       LOG("shader %016llx saved to %s (send it so the missing texture can be analyzed)\n",(unsigned long long)h,fp); } }
   if(!cached){src=sh_post(src,stage);if(stage==ST_FS)src=sh_nan_guard(src);translated_save(trans_key,&s->si,src);}
   if(stage==ST_FS) src=sh_dbg(src,h);
+  if(stage==ST_FS) src=sh_view(src,h);
   GLenum ty= stage==ST_VS? GL_VERTEX_SHADER : stage==ST_FS? GL_FRAGMENT_SHADER : stage==ST_GS? GL_GEOMETRY_SHADER : stage==ST_CS? GL_COMPUTE_SHADER : stage==ST_TCS? GL_TESS_CONTROL_SHADER : GL_TESS_EVALUATION_SHADER;
   (void)ty; if(!src) s->failed=1;
   if(stage==ST_VS && g_vs_xfb) src=vs_xfb_apply(src,g_vs_xfb);   /* the game's transform feedback (its own variant) */
@@ -1502,6 +1545,9 @@ static volatile int g_workers_up, g_workers_done;
 /* each compile thread's current step and finished jobs, logged with the FPS line: on Windows they were seen to
    start and never finish a job (1 wait for a job, 2 binary load, 3 compile, 4 link, 5 status, 6 finish) */
 static volatile int g_wph[8], g_wid_next; static volatile u32 g_wjobs[8];
+int g_opt_worker_finish=1;   /* ini worker_finish, live: 1 a compile thread waits for the GPU after a program load, 0 it only flushes */
+/* what the compile threads are doing right now, for the stall log: 1 idle, 2 program load, 3 compile, 4 link, 5 status, 6 finish */
+void gl_worker_phases(char* out, int cap){ int k=0; out[0]=0; for(int i=0;i<g_gl_workers && i<8 && k+3<cap;i++) k+=snprintf(out+k,(size_t)(cap-k),"%d",g_wph[i]); }
 static void shader_worker(void* arg){ plat_diag_role("shader-worker");
   int wi=__atomic_fetch_add(&g_wid_next,1,__ATOMIC_ACQ_REL)&7;
   (void)arg; int ok=backend_gl_worker_current();
@@ -1517,7 +1563,9 @@ static void shader_worker(void* arg){ plat_diag_role("shader-worker");
     { int z=0; if(!__atomic_compare_exchange_n(&j->run,&z,1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)){ __atomic_store_n(&j->state,3,__ATOMIC_RELEASE); continue; } }   /* a draw took it */
     u64 tc0=plat_ns();
     g_wph[wi]=2;
-    if(j->try_bin){GLuint p=binary_load(j->bin_path,j->sep);if(p){g_wph[wi]=6;glFinish();j->prog=p;g_wjobs[wi]++;__atomic_store_n(&j->state,1,__ATOMIC_RELEASE);continue;}}
+    if(j->try_bin){GLuint p=binary_load(j->bin_path,j->sep);if(p){ u64 tb1=plat_ns(); g_wph[wi]=6; extern int g_opt_worker_finish; if(g_opt_worker_finish) glFinish(); else glFlush(); u64 tb2=plat_ns();
+        if(tb2-tc0>30000000ull){ static int said; if(said<400){ said++; LOG("shader worker %d: program load %.1f ms, %s %.1f ms\n",wi,(tb1-tc0)/1e6,g_opt_worker_finish? "finish" : "flush",(tb2-tb1)/1e6); } }
+        j->prog=p;g_wjobs[wi]++;__atomic_store_n(&j->state,1,__ATOMIC_RELEASE);continue;}}
     g_wph[wi]=3;
     GLuint a=glCreateShader(j->sep? j->stype : GL_VERTEX_SHADER), b= j->sep? 0 : glCreateShader(GL_FRAGMENT_SHADER);
     const char* s1=j->vs; const char* s2=j->fs; glShaderSource(a,1,&s1,NULL); glCompileShader(a); if(b){ glShaderSource(b,1,&s2,NULL); glCompileShader(b); }
@@ -2154,6 +2202,8 @@ static GLenum blend_factor(u32 v){
 
 static GLenum blend_eq(u32 v){ if(v>=0x8000) return v; switch(v){ case 1: return GL_FUNC_ADD; case 2: return GL_FUNC_SUBTRACT; case 3: return GL_FUNC_REVERSE_SUBTRACT; case 4: return GL_MIN; case 5: return GL_MAX; } return GL_FUNC_ADD; }
 
+int g_opt_z_nudge=0;   /* ini z_nudge: see the raster state */
+int g_opt_dbg_tex=0;   /* ini dbg_tex: see bind_textures */
 static GLenum cmp_func(u32 v){ if(v>=0x200 && v<=0x207) return v; if(v>=1 && v<=8) return GL_NEVER+(v-1); return GL_ALWAYS; }
 
 static GLenum stencil_op(u32 v){ switch(v){ case 1: return GL_KEEP; case 2: return GL_ZERO; case 3: return GL_REPLACE; case 4: return GL_INCR; case 5: return GL_DECR; case 6: return GL_INVERT; case 7: return GL_INCR_WRAP; case 8: return GL_DECR_WRAP; case 0: return GL_ZERO; } return v; }
@@ -2216,11 +2266,13 @@ static void apply_state(GpuChannel* ch){
     else glDisable(GL_SCISSOR_TEST); } }
   /* raster state (winding flips with the Y flip) */
   { float w=2*fabsf_(sx), h=2*fabsf_(sy); int yflip= (w<1||h<1)? 0 : (sy<0);
-    GRP(1, r[0x646],r[0x647],r[0x648],r[0x36B],r[0x372],r[0x55B],r[0x56F],(u32)yflip){
+    /* experiment (ini z_nudge, live): pull colour draws with a "less or equal" depth test toward the camera, in depth units. Tests whether speckles and the centre line are colour passes narrowly failing against their depth-only pass */
+    extern int g_opt_z_nudge; u32 znudge= (g_opt_z_nudge>0 && r[0x4B3] && (r[0x4C3]==4 || r[0x4C3]==0x203) && (r[0x680]&0xFFFF) && !r[0x372])? (u32)g_opt_z_nudge : 0u;
+    GRP(1, r[0x646],r[0x647],r[0x648],r[0x36B],r[0x372],r[0x55B],r[0x56F],(u32)yflip,znudge){
     if(r[0x646]){ glEnable(GL_CULL_FACE); glCullFace(r[0x648]==0x404? GL_FRONT : r[0x648]==0x408? GL_FRONT_AND_BACK : GL_BACK); } else glDisable(GL_CULL_FACE);
     { GLenum ff= r[0x647]==0x900? GL_CW : GL_CCW; if(yflip) ff= ff==GL_CW? GL_CCW : GL_CW; glFrontFace(ff); }
     glPolygonMode(GL_FRONT_AND_BACK, r[0x36B]==0x1B01? GL_LINE : r[0x36B]==0x1B00? GL_POINT : GL_FILL);
-    if(r[0x372]){ float fac, un; memcpy(&fac,&r[0x55B],4); memcpy(&un,&r[0x56F],4); glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(fac,un); g_dl_po[0]=1; g_dl_po[1]=fac; g_dl_po[2]=un; } else { glDisable(GL_POLYGON_OFFSET_FILL); g_dl_po[0]=0; } } }
+    if(r[0x372]){ float fac, un; memcpy(&fac,&r[0x55B],4); memcpy(&un,&r[0x56F],4); glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(fac,un); g_dl_po[0]=1; g_dl_po[1]=fac; g_dl_po[2]=un; } else if(znudge){ float un=-(float)znudge; glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(0,un); g_dl_po[0]=1; g_dl_po[1]=0; g_dl_po[2]=un; } else { glDisable(GL_POLYGON_OFFSET_FILL); g_dl_po[0]=0; } } }
   /* depth / stencil */
   { u32 z= g_zt? 1u : 0u;
     GRP(2, z,r[0x4B3],r[0x4C3],r[0x4BA],r[0x4E0],r[0x4E1],r[0x4E2],r[0x4E3],r[0x4E4],r[0x4E5],r[0x4E6],r[0x4E7],r[0x565],r[0x566],r[0x567],r[0x568],r[0x569],r[0x3D5],r[0x3D6],r[0x3D7]){
@@ -2892,6 +2944,8 @@ static void bind_textures(GpuChannel* ch, int stage, Sh* s){
     u32 tic_id=handle&0xFFFFF, tsc_id=(handle>>20)&0xFFF;
     u32 tic[8], tsc[8]; gmem_read(tic_base+tic_id*32ull,tic,32); gmem_read(tsc_base+tsc_id*32ull,tsc,32);
     u64 q0=plat_ns(); Tex* t=tex_from_tic(tic); u64 q1=plat_ns(); st_tb_lookup+=q1-q0;
+    /* experiment (ini dbg_tex, live): 1 no reflections (cube samplers read nothing), 2 no baked light (BC6H lightmap arrays read nothing), 3 neither. Shows which layer of a material holds a fault */
+    { extern int g_opt_dbg_tex; if(stage==4 && g_opt_dbg_tex && t && (((g_opt_dbg_tex&1) && st->type==3 && !st->array) || ((g_opt_dbg_tex&2) && st->array && (t->f.ifmt==0x8E8E || t->f.ifmt==0x8E8F)))) t=NULL; }
     int unit=(stage==0? 0 : stage==4? 1 : 2)*(g_gles? 16 : 32)+i; if(!mb) glActiveTexture(GL_TEXTURE0+unit);
     /* the shader's sampler type wins */
     GLenum want= st->type==2? GL_TEXTURE_3D : st->type==3? (st->array? GL_TEXTURE_CUBE_MAP_ARRAY : GL_TEXTURE_CUBE_MAP) : st->array? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
@@ -3141,10 +3195,14 @@ static void tr_thumb(Tex* t, char* out){ state_dirty();
   GLboolean sc=glIsEnabled(GL_SCISSOR_TEST), sr=glIsEnabled(GL_FRAMEBUFFER_SRGB);
   glDisable(GL_SCISSOR_TEST); glDisable(GL_FRAMEBUFFER_SRGB); glColorMaski(0,1,1,1,1);
   glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t->id,0); glReadBuffer(GL_COLOR_ATTACHMENT0);
-  glBindFramebuffer(GL_DRAW_FRAMEBUFFER,g_tr_fb); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,g_tr_tx,0); { GLenum b=GL_COLOR_ATTACHMENT0; glDrawBuffers(1,&b); }
+  /* HDR targets clipped to white in a bright scene (the whole desert), so no draw could be seen changing anything: compressed with x/(1+x) instead */
+  int thdr= t->f.ifmt==0x8C3A || t->f.ifmt==0x881A; static GLuint txf; if(thdr && !txf){ glGenTextures(1,&txf); glBindTexture(GL_TEXTURE_2D,txf); glTexStorage2D(GL_TEXTURE_2D,1,0x881A,TRW,TRH); }
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER,g_tr_fb); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,thdr? txf : g_tr_tx,0); { GLenum b=GL_COLOR_ATTACHMENT0; glDrawBuffers(1,&b); }
   glBlitFramebuffer(0,0,(GLint)SC(t->w),(GLint)SC(t->h),0,0,TRW,TRH,GL_COLOR_BUFFER_BIT,GL_LINEAR);
   static u8 px[TRW*TRH*4];
-  glBindFramebuffer(GL_READ_FRAMEBUFFER,g_tr_fb); glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT,1); glReadPixels(0,0,TRW,TRH,GL_RGBA,GL_UNSIGNED_BYTE,px);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER,g_tr_fb); glReadBuffer(GL_COLOR_ATTACHMENT0); glPixelStorei(GL_PACK_ALIGNMENT,1);
+  if(thdr){ static float fpx[TRW*TRH*4]; glReadPixels(0,0,TRW,TRH,GL_RGBA,GL_FLOAT,fpx); for(u32 pi=0;pi<TRW*TRH*4;pi++){ float fv=fpx[pi]; if(!(fv>0)) fv=0; px[pi]=(u8)(255.f*fv/(1.f+fv)+0.5f); } }
+  else glReadPixels(0,0,TRW,TRH,GL_RGBA,GL_UNSIGNED_BYTE,px);
   glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); if(sc) glEnable(GL_SCISSOR_TEST); if(sr) glEnable(GL_FRAMEBUFFER_SRGB);
   u64 h=fast_hash(px,sizeof px,0); if(h==t->tr_last){ strcpy(out,"(no change)"); return; }
   t->tr_last=h; char p[128]; snprintf(p,sizeof p,"%s/d%04d.ppm",g_tr_dir,g_tr_n); tr_save(p,px,TRW,TRH); g_tr_img++; snprintf(out,32,"d%04d.ppm",g_tr_n); }
@@ -3161,13 +3219,20 @@ static void tr_seam(Tex* t, float cx){
   glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t->id,0); glReadBuffer(GL_COLOR_ATTACHMENT0);
   glPixelStorei(GL_PACK_ALIGNMENT,4); glReadPixels(c-4,0,8,(GLsizei)H,GL_RGBA,GL_FLOAT,px);
   glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); if(sc) glEnable(GL_SCISSOR_TEST); state_dirty(); mb_reset();
-  double seam=0, lum=0;
+  double seam=0, lum=0, st=0, st_near=0; u32 st_pos=0;   /* st: the signed left/right step at the centre (a split between the halves has one sign in nearly all rows; texture detail averages out). st_near: the same 2 columns to the left, the natural slope */
+  /* The scene target isn't cleared between frames, so a draw's image still holds last frame's picture, line included.
+     new_*: the same step over only the rows where this draw changed the centre columns: the first draw with a large new_step in many rows really makes the line. */
+  static float* prev; static u32 prev_cap; static GLuint prev_id; static u32 prev_w, prev_h; static int prev_c; int have_prev= prev && prev_id==t->id && prev_w==W && prev_h==H && prev_c==c; u32 nw=0, nw_pos=0, nw_y0=~0u, nw_y1=0; double nw_st=0, nw_near=0;
   for(u32 y=0;y<H;y++){ float L[8]; for(int i=0;i<8;i++){ const float* q=px+((size_t)y*8+i)*4; L[i]=q[0]+q[1]+q[2]; if(!(L[i]==L[i])) L[i]=0; lum+=L[i]; }
+    st+=L[4]-L[3]; st_near+=L[2]-L[1]; st_pos+=L[4]>L[3];
+    if(have_prev){ const float* a=px+((size_t)y*8+3)*4; const float* p=prev+((size_t)y*8+3)*4; if(memcmp(a,p,4*sizeof(float)) && memcmp(a+4,p+4,4*sizeof(float))){ nw++; nw_st+=L[4]-L[3]; nw_near+=L[2]-L[1]; nw_pos+=L[4]>L[3]; if(y<nw_y0) nw_y0=y; nw_y1=y; } }
     float s[7]; for(int i=0;i<7;i++) s[i]=fabsf(L[i+1]-L[i]);
     float mid=s[2]; if(s[3]>mid) mid=s[3]; if(s[4]>mid) mid=s[4];
     float base=(s[0]+s[6])*0.5f; seam+= mid>base? mid-base : 0; }
   seam/=H; lum/=(double)H*8;
-  trace_note("  seam rt0 at x=%d of %u: %.4f (relative %.4f)\n",c,W,seam,lum>1e-6? seam/lum : 0.0); }
+  trace_note("  seam rt0 at x=%d of %u: %.4f (relative %.4f) step %+.4f near %+.4f brighter on the right in %u%% of rows; new rows %u: step %+.4f near %+.4f right %u%% (rows %d..%d of %u, GL order)\n",c,W,seam,lum>1e-6? seam/lum : 0.0,st/H,st_near/H,(u32)((u64)st_pos*100/H),nw,nw? nw_st/nw : 0.0,nw? nw_near/nw : 0.0,nw? (u32)((u64)nw_pos*100/nw) : 0u,nw? (int)nw_y0 : -1,nw? (int)nw_y1 : -1,H);
+  if(prev_cap<H*8*4){ free(prev); prev_cap=H*8*4; prev=malloc((size_t)prev_cap*4); if(!prev) prev_cap=0; }
+  if(prev){ memcpy(prev,px,(size_t)H*8*4*sizeof(float)); prev_id=t->id; prev_w=W; prev_h=H; prev_c=c; } }
 
 static int tr_tex_id(Tex* t){ if(!t) return -1; for(int i=0;i<g_tr_ntex;i++) if(g_tr_tex[i]==t) return i; if(g_tr_ntex<2048){ g_tr_tex[g_tr_ntex]=t; return g_tr_ntex++; } return -1; }
 
@@ -3185,6 +3250,62 @@ static void tr_shader(u64 addr, Sh* sh, int stage){
   free(b);
   trace_note("  shader %016llx %s: %d untranslated%s%s, failed=%d\n",(unsigned long long)sh->hash,stage==ST_VS?"vs":"fs",sh->si.unsupported,sh->si.unsupported?" first: ":"",sh->si.first_unsupported,sh->failed); }
 
+/* The speckled floor hunt: the bound lightmap arrays (BC6H) and the textures of the walkway's material, as the GPU holds them.
+   Each layer goes to <trace>/tex<id>_l<layer>.ppm (HDR compressed with x/(1+x), image upside down as GL stores it), with
+   counts of negative and invalid values in the trace. Once per texture per trace. */
+static void tr_dump_tex(Tex* t, int unit){
+  if(g_gles || !t || t->f.depth || t->f.is_int || t->w<2 || t->h<2 || t->w>2048 || t->h>2048) return;
+  static char seen_dir[128]; static GLuint seen[24]; static int nseen;
+  if(strcmp(seen_dir,g_tr_dir)){ snprintf(seen_dir,sizeof seen_dir,"%s",g_tr_dir); nseen=0; }
+  for(int i=0;i<nseen;i++) if(seen[i]==t->id) return;
+  if(nseen>=24) return;
+  seen[nseen++]=t->id;
+  u32 layers= (t->target==GL_TEXTURE_2D_ARRAY)? t->d : 1; if(t->target!=GL_TEXTURE_2D && t->target!=GL_TEXTURE_2D_ARRAY) return; if(layers<1 || layers>16) return;
+  size_t n=(size_t)t->w*t->h*layers*4; float* px=malloc(n*sizeof(float)); u8* line=malloc((size_t)t->w*3); if(!px||!line){ free(px); free(line); return; }
+  int hdr= t->f.ifmt==0x8E8E || t->f.ifmt==0x8E8F;
+  glBindBuffer(GL_PIXEL_PACK_BUFFER,0); glPixelStorei(GL_PACK_ALIGNMENT,4); glBindTexture(t->target,t->id); glGetTexImage(t->target,0,GL_RGBA,GL_FLOAT,px);
+  for(u32 l=0;l<layers;l++){ const float* q=px+(size_t)l*t->w*t->h*4; u64 neg=0, bad=0; float mn=1e30f, mx=-1e30f; char p[160]; snprintf(p,sizeof p,"%s/tex%u_l%u.ppm",g_tr_dir,(u32)t->id,l); FILE* f=fopen(p,"wb");
+    if(f) fprintf(f,"P6\n%u %u\n255\n",t->w,t->h);
+    for(u32 y=0;y<t->h;y++){ for(u32 x=0;x<t->w;x++){ for(int c=0;c<3;c++){ float v=q[((size_t)y*t->w+x)*4+c]; if(!(v==v) || v>1e30f || v<-1e30f){ bad++; v=0; } if(v<0) neg++; if(v<mn) mn=v; if(v>mx) mx=v; if(v<0) v=0; if(hdr) v=v/(1.f+v); if(v>1) v=1; line[x*3+c]=(u8)(v*255.f+0.5f); } }
+      if(f) fwrite(line,3,t->w,f); }
+    if(f) fclose(f);
+    trace_note("  dump tex%d #%u %ux%u layer %u ifmt %x: min %.4f max %.4f, %llu negative, %llu invalid -> tex%u_l%u.ppm\n",unit,(u32)t->id,t->w,t->h,l,t->f.ifmt,mn,mx,(unsigned long long)neg,(unsigned long long)bad,(u32)t->id,l); }
+  /* the mips, which load in stages: each one against the level above it shrunk by 2. A level that doesn't match shows up as a large difference */
+  if(t->target==GL_TEXTURE_2D && t->levels>1){
+    trace_note("  dump tex%d #%u: %u levels, async base level %d, async pending %d\n",unit,(u32)t->id,t->levels,(int)t->abase,(int)t->apend);
+    u32 pw=t->w, ph=t->h; float* up=px; float* cur=NULL;
+    for(u32 L=1;L<t->levels && L<=7;L++){ u32 lw=pw>1? pw/2:1, lh=ph>1? ph/2:1; cur=malloc((size_t)lw*lh*4*sizeof(float)); if(!cur) break;
+      glGetTexImage(GL_TEXTURE_2D,(GLint)L,GL_RGBA,GL_FLOAT,cur); double diff=0, worst=0; u64 far_off=0;
+      if(pw==lw*2 && ph==lh*2) for(u32 y=0;y<lh;y++) for(u32 x=0;x<lw;x++){ double d=0; for(int c=0;c<3;c++){ const float* a=up+(((size_t)y*2)*pw+x*2)*4+c; double av=(a[0]+a[4]+a[(size_t)pw*4]+a[(size_t)pw*4+4])*0.25; d+=fabs(av-cur[((size_t)y*lw+x)*4+c]); } d/=3; diff+=d; if(d>worst) worst=d; if(d>0.15) far_off++; }
+      trace_note("  dump tex%d #%u level %u %ux%u: mean difference from the level above %.4f, worst %.3f, %llu texels over 0.15 -> tex%u_m%u.ppm\n",unit,(u32)t->id,L,lw,lh,diff/((double)lw*lh),worst,(unsigned long long)far_off,(u32)t->id,L);
+      char p[160]; snprintf(p,sizeof p,"%s/tex%u_m%u.ppm",g_tr_dir,(u32)t->id,L); FILE* f=fopen(p,"wb"); u8* ml8=malloc((size_t)lw*3);
+      if(f && ml8){ fprintf(f,"P6\n%u %u\n255\n",lw,lh); for(u32 y=0;y<lh;y++){ for(u32 x=0;x<lw;x++) for(int c=0;c<3;c++){ float v=cur[((size_t)y*lw+x)*4+c]; if(!(v>0)) v=0; if(v>1) v=1; ml8[x*3+c]=(u8)(v*255.f+0.5f); } fwrite(ml8,3,lw,f); } }
+      if(f) fclose(f);
+      free(ml8);
+      if(up!=px) free(up);
+      up=cur; pw=lw; ph=lh; }
+    if(up!=px) free(up); }
+  free(px); free(line); state_dirty(); mb_reset(); }
+
+/* Cube maps lit by the game's probe blend, as the GPU holds them: per face and level, the mean brightness and the two halves of
+   the face, which a split would show. The faces of level 0 go to <trace>/cube<id>_f<face>.ppm. Once per cube per trace. */
+static void tr_dump_cube(Tex* t, int unit){
+  if(g_gles || !t || t->target!=GL_TEXTURE_CUBE_MAP || t->w<2 || t->w>512) return;
+  static char seen_dir[128]; static GLuint seen[8]; static int nseen;
+  if(strcmp(seen_dir,g_tr_dir)){ snprintf(seen_dir,sizeof seen_dir,"%s",g_tr_dir); nseen=0; }
+  for(int i=0;i<nseen;i++) if(seen[i]==t->id) return;
+  if(nseen>=8) return;
+  seen[nseen++]=t->id;
+  glBindBuffer(GL_PIXEL_PACK_BUFFER,0); glPixelStorei(GL_PACK_ALIGNMENT,4); glBindTexture(GL_TEXTURE_CUBE_MAP,t->id);
+  for(u32 L=0;L<t->levels && L<8;L++){ u32 w=t->w>>L, h=t->h>>L; if(!w) w=1; if(!h) h=1; float* px=malloc((size_t)w*h*4*sizeof(float)); if(!px) break;
+    for(int fa=0;fa<6;fa++){ glGetTexImage(GL_TEXTURE_CUBE_MAP_POSITIVE_X+fa,(GLint)L,GL_RGBA,GL_FLOAT,px); double le=0, ri=0, mx=0; u64 bad=0;
+      for(u32 y=0;y<h;y++) for(u32 x=0;x<w;x++){ for(int c=0;c<3;c++){ float v=px[((size_t)y*w+x)*4+c]; if(!(v==v)){ bad++; continue; } if(x<w/2 || w==1) le+=v; else ri+=v; if(v>mx) mx=v; } }
+      double nl=(double)(w==1? 1 : w/2)*h*3, nr=(double)(w==1? 1 : w-w/2)*h*3;
+      trace_note("  dump cube tex%d #%u level %u face %d %ux%u: left half %.4f, right half %.4f, max %.3f, %llu invalid\n",unit,(u32)t->id,L,fa,w,h,le/nl,w==1? 0.0 : ri/nr,mx,(unsigned long long)bad);
+      if(L==0){ char p[160]; snprintf(p,sizeof p,"%s/cube%u_f%d.ppm",g_tr_dir,(u32)t->id,fa); FILE* f=fopen(p,"wb"); if(f){ fprintf(f,"P6\n%u %u\n255\n",w,h); for(size_t i=0;i<(size_t)w*h;i++) for(int c=0;c<3;c++){ float v=px[i*4+c]; if(!(v>0)) v=0; v=v/(1.f+v); fputc((int)(v*255.f+0.5f),f); } fclose(f); } } }
+    free(px); }
+  state_dirty(); mb_reset(); }
+
 static void tr_textures(GpuChannel* ch, int stage, Sh* sh){
   u32* r=ch->r3d; u32 tcb=r[0x982];
   u64 tic_base=((u64)r[0x55D]<<32)|r[0x55E], tsc_base=((u64)r[0x557]<<32)|r[0x558];
@@ -3194,7 +3315,10 @@ static void tr_textures(GpuChannel* ch, int stage, Sh* sh){
     Tex* t=tex_from_tic(tic);
     trace_note("  %s tex%d: sampler type%u%s%s  tic fmt=%05x %ux%ux%u type=%u levels=%u srgb=%u addr=%llx swz=%03x -> %s #%d %ux%u  tsc %08x %08x %08x  tic3..7 %08x %08x %08x %08x %08x\n",stage==0?"vs":"fs",i,
       st->type,st->array?" array":"",st->shadow?" shadow":"",tic[0]&0x7FFFF,(tic[4]&0xFFFF)+1,(tic[5]&0xFFFF)+1,((tic[5]>>16)&0x3FFF)+1,(tic[4]>>23)&0xF,((tic[3]>>28)&0xF)+1,(tic[4]>>22)&1,
-      (unsigned long long)(((u64)(tic[2]&0xFFFF)<<32)|tic[1]),(tic[0]>>19)&0xFFF,t? (t->is_rt? "RT" : "tex") : "NULL",tr_tex_id(t),t?t->w:0,t?t->h:0,tsc[0],tsc[1],tsc[2],tic[3],tic[4],tic[5],tic[6],tic[7]); } }
+      (unsigned long long)(((u64)(tic[2]&0xFFFF)<<32)|tic[1]),(tic[0]>>19)&0xFFF,t? (t->is_rt? "RT" : "tex") : "NULL",tr_tex_id(t),t?t->w:0,t?t->h:0,tsc[0],tsc[1],tsc[2],tic[3],tic[4],tic[5],tic[6],tic[7]);
+    { static int dump=-1; if(dump<0) dump=getenv("SWR_TRACE_DUMP_TEX")!=NULL;   /* off by default: reading textures back cost F5 over a second */
+      if(dump && t && !t->is_rt && ((st->array && (t->f.ifmt==0x8E8E || t->f.ifmt==0x8E8F)) || (u32)(sh->hash>>32)==0x5cb0aa72u)) tr_dump_tex(t,i);
+      if(dump && t && t->target==GL_TEXTURE_CUBE_MAP && stage!=0) tr_dump_cube(t,i); } } }
 
 /* GPU time per draw in a traced frame (the map hunt: its frames waited on the GPU inside DLAA). A timestamp before and
    after each draw, on the GL thread through custom queue entries; read back at the end of the frame into
@@ -3233,6 +3357,10 @@ static void tr_draw(GpuChannel* ch, Sh* vs, Sh* fs, u64 vsa, u64 fsa, int indexe
   if(r[0x380]&1) trace_note("  scissor x=%u..%u y=%u..%u\n",r[0x381]&0xFFFF,r[0x381]>>16,r[0x382]&0xFFFF,r[0x382]>>16);
   tr_shader(vsa,vs,ST_VS); if(fsa) tr_shader(fsa,fs,ST_FS);
   tr_textures(ch,0,vs); if(fsa) tr_textures(ch,4,fs);
+  /* the reflection hunt: what aims this material's reflection (cb3 19-21) next to the view rows (4-6), and the vertex shader's material block */
+  if(fsa && fs){ u32 fh=(u32)(fs->hash>>32); if(fh==0x5cb0aa72u || fh==0x971ce27eu || fh==0x786ef1fau){ u64 ca=g_cb.cb[4][3]; if(ca){ float v[96]; gmem_read(ca,v,sizeof v);
+      trace_note("  reflection cb3 @%llx:",(unsigned long long)ca); static const int rows[]={4,5,6,19,20,21}; for(int k=0;k<6;k++){ const float* q=v+rows[k]*4; trace_note(" d[%d]=(%.6g,%.6g,%.6g,%.6g)",rows[k],q[0],q[1],q[2],q[3]); } trace_note("\n"); }
+    u64 cv=g_cb.cb[0][4]; if(cv){ float v[32]; gmem_read(cv,v,sizeof v); trace_note("  vs cb4 @%llx:",(unsigned long long)cv); for(int k=0;k<8;k++) trace_note(" d[%d]=(%.6g,%.6g,%.6g,%.6g)",k,v[k*4],v[k*4+1],v[k*4+2],v[k*4+3]); trace_note("\n"); } } }
   { static int all=-1; if(all<0) all=getenv("SWR_TRACE_CB_ALL")!=NULL;   /* test only: constants of every draw (camera matrices) */
   if(count<=6 || all){ /* fullscreen passes (tonemap, fog, lighting): dump their constants */
     int nv= all? 32 : 16;
@@ -3242,8 +3370,10 @@ static void tr_draw(GpuChannel* ch, Sh* vs, Sh* fs, u64 vsa, u64 fsa, int indexe
   /* the centre split hunt: a material's light-grid constants (tile scale, stride, mask) are in its cb7 */
   if(count>6 && fs && fsa && (fs->si.cbuf_mask&(1u<<7)) && g_cb.cb[4][7]){ u32 v[12]; gmem_read(g_cb.cb[4][7],v,sizeof v); float fv[12]; memcpy(fv,v,sizeof v);
     trace_note("  fs cb7 @%llx: d[0]=(%.6g,%.6g,%.6g,%.6g) d[1]=(%.6g,%.6g,%.6g,%.6g) d[2]=(%08x,%08x,%08x,%08x)\n",(unsigned long long)g_cb.cb[4][7],fv[0],fv[1],fv[2],fv[3],fv[4],fv[5],fv[6],fv[7],v[8],v[9],v[10],v[11]); }
+  /* the purple armour hunt: every material constant block of a mesh draw (tint, rim, emissive) and the colours of the dynamic lights in its list */
+  if(count>6 && fs && fsa){ for(int ci=1;ci<18;ci++){ if(ci==3 || !(fs->si.cbuf_mask&(1u<<ci))) continue; u64 ca=g_cb.cb[4][ci]; if(!ca) continue; float cv[16]; u32 cu[16]; gmem_read(ca,cv,sizeof cv); memcpy(cu,cv,sizeof cu); trace_note("  mat cb%d @%llx:",ci,(unsigned long long)ca); for(int k=0;k<4;k++) trace_note(" (%.5g,%.5g,%.5g,%.5g)",cv[k*4],cv[k*4+1],cv[k*4+2],cv[k*4+3]); trace_note("\n"); if(cv[0]>0.02f && cv[0]<0.022f && cu[10]){ for(u32 li=0;li<32;li++) if(cu[10]>>li&1){ float lv[4]; gmem_read(ca+48+80*(u64)li,lv,sizeof lv); trace_note("  light %u colour (%.5g,%.5g,%.5g,%.5g)\n",li,lv[0],lv[1],lv[2],lv[3]); } } } }
   char nm[40]; tr_thumb(g_rt[0],nm); trace_note("  result rt0: %s\n",nm);
-  if(strcmp(nm,"(no change)") && strcmp(nm,"-")) tr_seam(g_rt[0],vt[3]); }
+  if(strcmp(nm,"-")) tr_seam(g_rt[0],vt[3]); }   /* also when the thumbnail didn't change: a small draw doesn't reach it, and new rows would pile up on the next draw measured */
 
 static void trace_frame(void){
   if(g_tr_on){
@@ -3286,8 +3416,9 @@ static void trace_frame(void){
     g_tr_on= g_tr!=NULL; g_tr_n=0; g_tr_img=0; g_tr_ntex=0; g_tr_nsh=0; g_ts_n=0;
     for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) t->tr_last=0;
     /* the traced frame starts from magenta on the scene target (1400..1500 wide): with a still camera every draw only
-       repeats last frame's pixels, so nothing showed which draw paints what. Still magenta at the end = never painted */
-    { GLuint mf=0; glGenFramebuffers(1,&mf); glBindFramebuffer(GL_DRAW_FRAMEBUFFER,mf); glDisable(GL_SCISSOR_TEST); glColorMaski(0,1,1,1,1); { GLenum bb=GL_COLOR_ATTACHMENT0; glDrawBuffers(1,&bb); }
+       repeats last frame's pixels, so nothing showed which draw paints what. Still magenta at the end = never painted.
+       Opt-in (SWR_TRACE_MAGENTA=1): it shows on screen for that frame and bleeds into the bloom and temporal passes */
+    if(getenv("SWR_TRACE_MAGENTA")){ GLuint mf=0; glGenFramebuffers(1,&mf); glBindFramebuffer(GL_DRAW_FRAMEBUFFER,mf); glDisable(GL_SCISSOR_TEST); glColorMaski(0,1,1,1,1); { GLenum bb=GL_COLOR_ATTACHMENT0; glDrawBuffers(1,&bb); }
       for(int k=0;k<TEXH;k++) for(Tex* t=texh[k];t;t=t->next) if(t->is_rt && !t->f.depth && !t->f.is_int && t->target==GL_TEXTURE_2D && t->w>=1400 && t->w<1500 && t->gva!=~0ull){
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t->id,0);
         if(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE){ glClearColor(1.f,0.f,1.f,1.f); glClear(GL_COLOR_BUFFER_BIT); LOG("trace: scene target %llx %ux%u cleared to magenta\n",(unsigned long long)t->gva,t->w,t->h); } }
@@ -3771,6 +3902,7 @@ static int g_blit_rt;   /* shown image is an RT, i.e. scaled by the res scale */
 static void shot8_capture(GLuint tex, const float* xf, int tw, int th){
   shot8_poll();
   { static int tf; if(!tf){ tf= getenv("SWR_SHOT8_TEST")? 1 : -1; } if(tf>0 && ++tf==40) g_shot8_req=1; }   /* automated test hook */
+  { static int last_view, wait; if(g_opt_dbg_view!=last_view){ last_view=g_opt_dbg_view; rs_update(); wait=60; LOG("debug view %d\n",last_view); } if(wait>0 && --wait==0) g_shot8_req=1; }   /* each view saves its own image once it is on screen */
   if(!g_shot8_req || g_s8_sync) return;
   g_shot8_req=0;
   if(!p_s8map){ p_s8map=(PFNGLMAPBUFFERRANGEPROC)backend_gl_proc("glMapBufferRange"); p_s8unmap=(PFNGLUNMAPBUFFERPROC)backend_gl_proc("glUnmapBuffer");
@@ -4513,7 +4645,7 @@ static GLuint g_rs_ubo;
 
 static void rs_update(void){ extern int g_rs_binding;
   if(!g_rs_ubo){ GLint mx=84; glGetIntegerv(GL_MAX_UNIFORM_BUFFER_BINDINGS,&mx); if(mx<2) return; g_rs_binding=mx-1; glGenBuffers(1,&g_rs_ubo); glBindBuffer(GL_UNIFORM_BUFFER,g_rs_ubo); glBufferData(GL_UNIFORM_BUFFER,32,NULL,GL_DYNAMIC_DRAW); }
-  float v[8]={1.0f/g_scale,1.0f/g_scale,g_scale,0}; memcpy(&v[4],g_rs_mask,8); glBindBuffer(GL_UNIFORM_BUFFER,g_rs_ubo); glBufferSubData(GL_UNIFORM_BUFFER,0,32,v); glBindBufferBase(GL_UNIFORM_BUFFER,(GLuint)g_rs_binding,g_rs_ubo); }
+  float v[8]={1.0f/g_scale,1.0f/g_scale,g_scale,(float)g_opt_dbg_view}; memcpy(&v[4],g_rs_mask,8); glBindBuffer(GL_UNIFORM_BUFFER,g_rs_ubo); glBufferSubData(GL_UNIFORM_BUFFER,0,32,v); glBindBufferBase(GL_UNIFORM_BUFFER,(GLuint)g_rs_binding,g_rs_ubo); }
 
 static void rt_rescale(float ns){
   float old=g_scale; if(ns==old) return;
