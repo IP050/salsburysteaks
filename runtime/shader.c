@@ -459,8 +459,11 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     setrf(c,d,fsat(T("(%s + %s)",A,Bv),B(w,50,1))); break; }
   case O_FADD32I: { char* A=fneg_abs(RF(c,a),B(w,56,1),B(w,54,1)); char* Bv=fneg_abs(imm32f(w),B(w,53,1),B(w,57,1)); setrf(c,d,T("(%s + %s)",A,Bv)); break; }
   case O_FMUL_R: case O_FMUL_C: case O_FMUL_I: {
-    char* Bv=opBf(c,w,id-O_FMUL_R); if(B(w,48,1)) Bv=T("(-%s)",Bv);
+    char* Bv=opBf(c,w,id-O_FMUL_R);
     char* e= B(w,44,2)==2? T("fmz(%s, %s)",RF(c,a),Bv) : T("(%s * %s)",RF(c,a),Bv); u32 sc=B(w,41,3);   /* 0*x=0 only matters for .FMZ */
+    /* the sign goes on the product. Written a * (-b) and stored in a register, the same value came out wrong on NVIDIA (driver 2026-11-08,
+       MEASURED: Prime 4's reflection angle broke at screen centre on floors and rails; -(a*b) and a*(0-b) were both right) */
+    if(B(w,48,1)) e=T("(-%s)",e);
     static const char* scl[8]={"","*0.5","*0.25","*0.125","*8.0","*4.0","*2.0",""}; if(sc) e=T("(%s%s)",e,scl[sc]);
     setrf(c,d,fsat(e,B(w,50,1))); break; }
   case O_FMUL32I: setrf(c,d,fsat(B(w,53,2)==2? T("fmz(%s, %s)",RF(c,a),imm32f(w)) : T("(%s * %s)",RF(c,a),imm32f(w)),B(w,55,1))); break;
@@ -482,6 +485,7 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
   case O_FSET_R: case O_FSET_C: case O_FSET_I: {
     char* A=fneg_abs(RF(c,a),B(w,43,1),B(w,54,1)); char* Bv=fneg_abs(opBf(c,w,id-O_FSET_R),B(w,53,1),B(w,44,1));
     const char* t=bop(B(w,45,2),fcmp_expr(B(w,48,4),A,Bv),PN(c,B(w,39,3),B(w,42,1)));
+    if(B(w,47,1)){ c->uses_cc=1; emitl(c,"{ uint t_ = (%s ? %s : 0u); cc_z = t_==0u; cc_s = int(t_)<0; cc_c = false;",t,B(w,52,1)? "floatBitsToUint(1.0)" : "0xFFFFFFFFu"); c->indent++; setr(c,d,"t_"); c->indent--; emitl(c,"}"); break; }
     setr(c,d,T("(%s ? %s : 0u)",t,B(w,52,1)? "floatBitsToUint(1.0)" : "0xFFFFFFFFu")); break; }
   case O_FCMP_R: case O_FCMP_RC: case O_FCMP_CR: case O_FCMP_I: {
     char *Bv,*Cv;
@@ -527,6 +531,9 @@ static void inst(Ctx* c, u32 idx, u64 w, const Op* op){
     if(B(w,49,1)) v=T("abs(%s)",v); if(B(w,45,1)) v=T("(-%s)",v);
     if(B(w,50,1)){ if(df==0) v= ds? T("clamp(%s,-128,127)",v) : T("clamp(%s,0,255)",v); else if(df==1) v= ds? T("clamp(%s,-32768,32767)",v) : T("clamp(%s,0,65535)",v); }
     else { if(df==0) v= ds? T("bitfieldExtract(%s,0,8)",v) : T("(%s & 255)",v); else if(df==1) v= ds? T("bitfieldExtract(%s,0,16)",v) : T("(%s & 65535)",v); }
+    /* .CC: the game's compiler uses "I2I.CC RZ, rN" to test a register (463 in 776 shaders, before 445 of 484 CSETP/CSET
+       reads). Ignored, those conditions read a stale flag, always "not zero" */
+    if(B(w,47,1)){ c->uses_cc=1; emitl(c,"{ uint t_ = uint(%s); cc_z = t_==0u; cc_s = int(t_)<0; cc_c = false;",v); c->indent++; setr(c,d,"t_"); c->indent--; emitl(c,"}"); break; }
     setr(c,d,T("uint(%s)",v)); break; }
   /* ---------------- moves */
   case O_MOV_R: case O_MOV_C: case O_MOV_I: { u8 tg= id==O_MOV_C? gbuf_tag(c,w) : id==O_MOV_R? c->gtag[B(w,20,8)] : 0; setr(c,d,opB(c,w,id-O_MOV_R)); if(d!=255) c->gtag[d]=tg; break; }
@@ -1199,7 +1206,8 @@ int shader_program_check(const u8* code, u32 max_bytes, u32* out_len, int* type)
 static int brx_targets(const u64* w, u32 i, u32 n, u32* out, int max){
   if(!g_shader_cb_read) return -1;
   u32 ra=B(w[i],8,8); i32 imm=(i32)(B(w[i],20,24)<<8)>>8;
-  for(u32 k=1;k<=8 && k<i;k++){ u32 j=i-k; if(!IDX_OK(j)) continue; const Op* o2=decode(w[j]);
+  /* the table read can be far before the jump: Prime 4's desert terrain loads it about 30 instructions earlier. Looking only 8 back gave "can jump anywhere": a case per instruction, 65,000+ NVIDIA assembly instructions, "too many instructions", and patches of ground that never drew. Past 8, any branch or other write to the register means we can't tell */
+  for(u32 k=1;k<i && i-k>=11;k++){ u32 j=i-k; if(!IDX_OK(j)) continue; const Op* o2=decode(w[j]); if(k>8 && (!o2 || is_term(o2->id) || (o2->id==O_LDC && B(w[j],16,3)!=7 && B(w[j],0,8)==ra) || (o2->id!=O_LDC && B(w[j],0,8)==ra))) return -1;
     if(!o2 || o2->id!=O_LDC || B(w[j],0,8)!=ra) continue;
     u32 cidx=B(w[j],36,5); i32 coff=(i32)(B(w[j],20,16)<<16)>>16; int cnt=0, seen=0;
     for(u32 e=0;e<64 && cnt<max;e++){ u32 v; if(!g_shader_cb_read(cidx,(u32)(coff+(i32)e*4),&v)) break;
@@ -1422,7 +1430,11 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
   /* texelFetch takes guest texel coordinates; render targets are stored at the resolution scale (swr_rs.z), so a
      fetch from one (bit set in swr_rm.x for the pixel stage, .y for the vertex stage, per texture slot) is scaled.
      Prime 4's fog reads the depth buffer this way, and its froxel writer (a vertex shader) the density buffer */
-  if((stage==ST_FS || stage==ST_VS) && si->uses_position_in) sb_f(D,"ivec2 swr_fc(ivec2 c, int u){ return ((swr_rm.%c>>uint(u))&1u)!=0u ? ivec2(vec2(c)*swr_rs.z) : c; }\n",stage==ST_FS?'x':'y');
+  /* vertex stage: scale the texel's centre. Its corner lands on the neighbour at a fractional scale (26 of 64 coordinates at
+     160%), and the froxel writer addresses exact 8x8 tiles of slices: blocky, overbright fog. The pixel stage has the same
+     rounding, but changing it rebuilds 3249 cached shaders: to be done on its own */
+  if(stage==ST_VS && si->uses_position_in) sb_f(D,"ivec2 swr_fc(ivec2 c, int u){ return ((swr_rm.y>>uint(u))&1u)!=0u ? ivec2((vec2(c)+vec2(0.5))*swr_rs.z) : c; }\n");
+  else if(stage==ST_FS && si->uses_position_in) sb_f(D,"ivec2 swr_fc(ivec2 c, int u){ return ((swr_rm.x>>uint(u))&1u)!=0u ? ivec2(vec2(c)*swr_rs.z) : c; }\n");
   /* packed binding numbers, Intel's windows driver has very few: VS 0.., FS 1.., others 2.. */
   int slot= stage==ST_VS? 0 : stage==ST_FS? 1 : 2;
   int base_bind=slot*18;

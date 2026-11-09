@@ -1186,7 +1186,7 @@ static void aw_write(const char* path, const void* d, size_t n, int append);
 
 /* common epilogue stuff: alpha test for FS, Y flip for VS */
 
-#define TR_VER 5187   /* bump when the GLSL output changes, invalidates caches */
+#define TR_VER 5191   /* bump when the GLSL output changes, invalidates caches */
 /* the file is named after the version: the loader stops at the first entry of another version, so a bump with a fixed
    name left every new entry unread behind the old ones (all shaders translated again each launch, the file growing) */
 #define TR_HEX_(v) 0x##v##u
