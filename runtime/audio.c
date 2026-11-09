@@ -243,6 +243,7 @@ static float astereo_sample(const ARenderer*r,int n,int ch,float volume){
   if(source>=24)source=ch;
   return r->samples[(size_t)source*AF+n]*volume;
 }
+static float g_audio_side[2];   /* loudest left and right sample since the last audio log line */
 static float amb(float mb){return powf(10.f,mb/2000.f);}   /* millibels to linear gain */
 static void areverb_setup(AReverb*v,const u8*q){
   if(!memcmp(v->key,q,0x48))return;memcpy(v->key,q,0x48);
@@ -382,7 +383,7 @@ void audio_render(SvcObj*o,const u32*ih,const u8*input,u64 size,const u8*voices,
   if(o->u[3]==0){i16 pcm[AF*2];extern int g_opt_volume;float final_volume=(r->mix[0].valid?r->mix[0].volume:1)*(float)g_opt_volume*0.01f;   /* [Audio] volume, live */float peak=0;
     {static int checked;static FILE*csv;if(!checked){checked=1;const char*e=getenv("SWR_AUDIO_MIX_CSV");if(e&&*e){csv=fopen(e,"w");if(csv)fprintf(csv,"ns,tick,active,sink_count,input,source,rms,peak\n");}}
       if(csv&&r->ticks%40==0){for(u32 ch=0;ch<r->sink_count;ch++){u32 source=r->sink_inputs[ch];if(source>=24)continue;double sum=0;float peak=0;for(int n=0;n<AF;n++){float value=r->samples[(size_t)source*AF+n]*final_volume;sum+=(double)value*value;if(fabsf(value)>peak)peak=fabsf(value);}fprintf(csv,"%llu,%llu,%u,%u,%u,%u,%.8f,%.8f\n",(unsigned long long)plat_ns(),(unsigned long long)r->ticks,active,r->sink_count,ch,source,sqrt(sum/AF),peak);}fflush(csv);}}
-    for(int n=0;n<AF;n++)for(int ch=0;ch<2;ch++){float sample=astereo_sample(r,n,ch,final_volume);if(!isfinite(sample))sample=0;float absolute=fabsf(sample);if(absolute>peak)peak=absolute;if(sample>0.9999695f){sample=0.9999695f;g_audio_clipped++;}if(sample< -1){sample= -1;g_audio_clipped++;}pcm[n*2+ch]=(i16)lrintf(sample*32768);}
-    aoutput(pcm);acapture(pcm);if(r->ticks%1000==0){LOG("audio: %u active voices, final mix volume %.3f, peak %.4f, sink channels %u; since the last line %llu voice blocks ran out of sound early, %llu real gaps (a voice ran dry, then got more sound), %llu samples clipped\n",active,final_volume,peak,r->sink_count,(unsigned long long)g_audio_starved,(unsigned long long)g_audio_gaps,(unsigned long long)g_audio_clipped);g_audio_starved=0;g_audio_clipped=0;g_audio_gaps=0;}
+    for(int n=0;n<AF;n++)for(int ch=0;ch<2;ch++){float sample=astereo_sample(r,n,ch,final_volume);if(!isfinite(sample))sample=0;float absolute=fabsf(sample);if(absolute>peak)peak=absolute;g_audio_side[ch]=absolute>g_audio_side[ch]?absolute:g_audio_side[ch];if(sample>0.9999695f){sample=0.9999695f;g_audio_clipped++;}if(sample< -1){sample= -1;g_audio_clipped++;}pcm[n*2+ch]=(i16)lrintf(sample*32768);}
+    aoutput(pcm);acapture(pcm);if(r->ticks%1000==0){LOG("audio: %u active voices, final mix volume %.3f, peak %.4f, left %.4f right %.4f, sink channels %u; since the last line %llu voice blocks ran out of sound early, %llu real gaps (a voice ran dry, then got more sound), %llu samples clipped\n",active,final_volume,peak,g_audio_side[0],g_audio_side[1],r->sink_count,(unsigned long long)g_audio_starved,(unsigned long long)g_audio_gaps,(unsigned long long)g_audio_clipped);g_audio_starved=0;g_audio_clipped=0;g_audio_gaps=0;g_audio_side[0]=g_audio_side[1]=0;}
   }r->ticks++;
 }

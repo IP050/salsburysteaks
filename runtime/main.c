@@ -905,7 +905,13 @@ int audren_update(SvcObj* o, IpcCtx* c){
      second for half a second during a transition, and one block per call made 50 s of sound for a 160 ms queue (11735
      blocks dropped, the sound out of step afterwards). Audio advances with real time only, as on the console */
   { u64 now=plat_ns(); u32 blocks=1; double owed=0;
-    if(o->u[6]){ memcpy(&owed,&o->u[7],8); owed+=(double)(now-o->u[6])/5000000.0; if(owed>8) owed=8; blocks=(u32)owed; owed-=blocks; memcpy(&o->u[7],&owed,8); }
+    if(o->u[6]){ memcpy(&owed,&o->u[7],8); owed+=(double)(now-o->u[6])/5000000.0;
+      /* Late by more than 40 ms: the rest used to be thrown away (owed>8 -> 8), so sound lost that time for good: 4.2 s in an 18
+         minute session, voices behind the animation after every hitch (the F5 capture alone cost 0.25 s). On the console the
+         audio keeps running through a stall, so it is all caught up now; what doesn't fit the output queue is dropped from the
+         output, not from the clock. Past 2 s (a real freeze) the rest is let go */
+      if(owed>400){ static int said; if(said<8){ said++; LOG("audio: the game was %.1f s late to update the sound: the rest of that time is lost\n",owed*0.005); } owed=400; }
+      blocks=(u32)owed; owed-=blocks; memcpy(&o->u[7],&owed,8); }
     o->u[6]=now;
     { extern int g_audio_status_only; g_audio_status_only= blocks==0; audio_render(o,ih,in,is,voices_in,nvoices,q); g_audio_status_only=0; }
     /* Catching up after a late update (several blocks at once): no further than every playing voice has sound queued.
