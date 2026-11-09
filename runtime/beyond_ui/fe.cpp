@@ -119,7 +119,7 @@ static void apply_env(const IniFile& ini) {
     for (char** p = environ; *p; p++) if (!strncmp(*p, "SWR_", 4) && strncmp(*p, "SWR_RECOMPILER=", 15) && strncmp(*p, "SWR_VIDEO_TIMING=", 17)) { std::string s = *p; drop.push_back(s.substr(0, s.find('='))); }
 #endif
     if (!getenv("SWR_FE_TEST")) for (auto& d : drop) env(d.c_str(), false);
-    env("SWR_SYNC_SHADERS", ini.get("wait_for_shaders", "1") == "1");
+    env("SWR_SYNC_SHADERS", ini.get("wait_for_shaders", "0") == "1");
 }
 
 // ---------------------------------------------------------------- D3D11

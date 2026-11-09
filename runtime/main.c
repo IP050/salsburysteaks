@@ -71,7 +71,7 @@ int g_opt_diag=0;
 #else
 #define VSYNC_DEFAULT 1
 #endif
-int g_opt_docked=0, g_opt_lang=1, g_opt_res=1, g_opt_fps=1, g_opt_vsync=VSYNC_DEFAULT, g_opt_drs=0;
+int g_opt_docked=1, g_opt_lang=1, g_opt_res=1, g_opt_fps=1, g_opt_vsync=VSYNC_DEFAULT, g_opt_drs=0;
 int g_opt_media_turns=1;   /* serialize_media_threads, read by kernel.c core0_member */
 int g_opt_sleep_waits=1;   /* sleep_waits, read by glq.c */
 int g_opt_hdr=0, g_opt_hdr_paper=200, g_opt_hdr_peak=0;   /* HDR output (native Vulkan): on, SDR white in nits, peak (0 = the display's) */
@@ -358,7 +358,7 @@ void ini_load(const char* path){
 typedef struct { const char* key; const char* def; const char* help; } IniOpt;
 typedef struct { const char* title; const IniOpt* o; } IniSec;
 static const IniOpt INI_DISPLAY[]={
-  {"docked","0","1 = TV mode (1920x1080 / 1600x900 games), 0 = handheld mode (1280x720)"},
+  {"docked","1","1 = TV mode (1920x1080 / 1600x900 games), 0 = handheld mode (1280x720)"},
   {"fullscreen","1","1 = start in fullscreen (F11 or Alt+Enter toggles it in game)"},
   {"language","1","Game language: 0 Japanese, 1 English (US), 2 French, 3 German, 4 Italian, 5 Spanish,\n;   6 Chinese, 7 Korean, 8 Dutch, 10 Russian, 11 Taiwanese, 12 English (UK),\n;   13 French (Canada), 14 Spanish (Latin America)"},
   {NULL,NULL,NULL}};
@@ -452,7 +452,7 @@ static const IniOpt INI_AUDIO[]={
   {NULL,NULL,NULL}};
 /* front end (beyond_ui/fe.cpp) and in-game menu (beyond_ui/ov.cpp); the runtime itself only stores them */
 static const IniOpt INI_LAUNCHER[]={
-  {"wait_for_shaders","1","1 = wait for new shaders before drawing (no missing objects, a short stutter the first time);\n;   0 = compile them in the background (no stutter, objects can pop in). Applies on the next start"},
+  {"wait_for_shaders","0","1 = wait for new shaders before drawing (no missing objects, a short stutter the first time);\n;   0 = compile them in the background (no stutter, objects can pop in). Applies on the next start"},
   {"skip_launcher","0","1 = start the game directly, without the Play screen"},
   {"menu_shortcut","home","Controller button that opens the in-game menu (F1 on the keyboard always works):\n;   home = Home / Guide / PS button, minus_plus = - and + together, l3_r3 = both stick clicks held 1 second"},
   {"launcher_nav","1","1 = navigate the Play screen and menus with a controller"},
@@ -506,7 +506,11 @@ volatile int g_ini_dirty;
 
 void ini_set(const char* k, const char* v){ ini_store(k,v); g_ini_dirty=1; }
 
-void ini_open(const char* path){ strncpy(g_ini_path,path,sizeof g_ini_path-1); ini_load(path); ini_write(); }
+/* settings_rev 1, once for an existing .ini (2026-11-09): the old defaults were written into every .ini, so they can't be told
+   from a choice. Handheld mode looked pixelated on a PC, and waiting for shaders turned the background shader loader off */
+static void ini_migrate(void){ if(ini_get("settings_rev",NULL)) return;
+  ini_store("settings_rev","1"); ini_store("docked","1"); ini_apply("docked","1"); ini_store("wait_for_shaders","0"); ini_apply("wait_for_shaders","0"); }
+void ini_open(const char* path){ strncpy(g_ini_path,path,sizeof g_ini_path-1); ini_load(path); ini_migrate(); ini_write(); }
 
 /* ini edited while running: reload and apply what we can live */
 void ini_poll(void){
