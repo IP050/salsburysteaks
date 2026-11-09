@@ -299,7 +299,9 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
         wr = os.path.join(os.path.dirname(cc) if os.path.dirname(cc) else '', 'windres.exe')
         if not os.path.isfile(wr): wr = shutil.which('windres') or ''
         res = os.path.join(HERE, 'bin', 'app_res.o')
-        if wr and subprocess.run([wr, '-i', os.path.join(RT, 'app.rc'), '-o', res, '-O', 'coff', '--include-dir', RT], capture_output=True).returncode == 0:
+        # runtime/local (not in the repository): a private game.ico and game_logo.png replace the neutral ones in runtime/
+        art = ['--include-dir', os.path.join(RT, 'local')] if os.path.isdir(os.path.join(RT, 'local')) else []
+        if wr and subprocess.run([wr, '-i', os.path.join(RT, 'app.rc'), '-o', res, '-O', 'coff'] + art + ['--include-dir', RT], capture_output=True).returncode == 0:
             srcs += [res]
     # NVDEC/VIC video: link OpenH264 (BSD) statically if we have it for this target
     oh = os.path.join(RT, 'oh264', 'win' if target_win else 'lin')

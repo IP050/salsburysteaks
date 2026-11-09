@@ -48,3 +48,4 @@ ExeFS/
 RomFS/
 mods/
 runtime/fsr1_glsl.inc
+runtime/local/
