@@ -602,7 +602,64 @@ static int mm_disp(SvcObj* o, IpcCtx* c){ (void)o; if(c->cmd==4||c->cmd==6) out3
 
 static SvcObj* new_mm(void){ return svcobj_new("mm:u",mm_disp,0); }
 
-static int nfp_user(SvcObj* o, IpcCtx* c){ (void)o; switch(c->cmd){ case 1: out32(c,0); return 0; case 17: case 18: out_copy_h(c,ev_handle(kevent_new("nfp",0))); return 0; case 19: out32(c,1); return 0; } return 0; }
+/* Virtual amiibo (nn::nfp): each time the game looks for a figure it finds the next of the three Metroid Prime 4 figures,
+   so the game gives its own rewards. Only the IDs are used, no figure data; the 216-byte save area each figure holds for
+   the game is kept in save_amiibo_<n>.bin. Command numbers and layouts from public nfp documentation, not yet seen working
+   with this game: every call is logged. amiibo=0 in the ini: no reader, as before */
+int g_opt_amiibo=1;
+static const struct { u8 id[8]; const char* name; } g_ami[]={
+  {{0x05,0xc0,0x00,0x00,0x04,0x3b,0x13,0x02},"Samus (Metroid Prime 4)"},
+  {{0x05,0xc0,0x00,0x00,0x04,0x3a,0x13,0x02},"Samus & Vi-O-La"},
+  {{0x05,0xc5,0x00,0x00,0x04,0x3c,0x13,0x02},"Sylux"},
+  /* the older Metroid figures, which the game answers with sounds */
+  {{0x05,0xc0,0x00,0x00,0x00,0x06,0x00,0x02},"Samus (Super Smash Bros.)"},
+  {{0x05,0xc0,0x01,0x00,0x00,0x1d,0x00,0x02},"Zero Suit Samus"},
+  {{0x05,0xc0,0x00,0x00,0x03,0x65,0x13,0x02},"Samus Aran"},
+  {{0x05,0xc1,0x00,0x00,0x03,0x66,0x13,0x02},"Metroid"},
+  {{0x05,0xc2,0x00,0x00,0x03,0x7f,0x00,0x02},"Ridley"},
+  {{0x05,0xc3,0x00,0x00,0x03,0x80,0x00,0x02},"Dark Samus"},
+  {{0x05,0xc0,0x00,0x00,0x04,0x12,0x13,0x02},"Samus - Metroid Dread"} };
+#define AMI_N 10
+#define AMI_AREA 216
+#define AMI_HANDLE 0x20ull
+static int g_ami_cur=-1; static int g_ami_dev=0;   /* device state: 0 ready, 1 searching, 2 tag found, 3 tag removed, 4 mounted */
+static KEvent* g_ami_on, *g_ami_off;
+static u8 g_ami_area[AMI_AREA]; static int g_ami_has, g_ami_open; static u32 g_ami_access;
+static void ami_path(char* p, size_t n){ snprintf(p,n,"save_amiibo_%d.bin",g_ami_cur); }
+static void ami_load(void){ char p[64]; ami_path(p,sizeof p); g_ami_has=0; g_ami_access=0; memset(g_ami_area,0,AMI_AREA); FILE* f=fopen(p,"rb"); if(!f) return;
+  if(fread(&g_ami_access,4,1,f)==1 && fread(g_ami_area,1,AMI_AREA,f)==AMI_AREA) g_ami_has=1; fclose(f); }
+static void ami_save(void){ char p[64]; ami_path(p,sizeof p); FILE* f=fopen(p,"wb"); if(!f) return; fwrite(&g_ami_access,4,1,f); fwrite(g_ami_area,1,AMI_AREA,f); fclose(f); }
+static void ami_fill(IpcCtx* c, u32 want){ u64 a,s; buf_out(c,0,&a,&s); if(!a) return; (void)want; memset(GP(a),0,s); }
+static int nfp_user(SvcObj* o, IpcCtx* c){ (void)o;
+  { static int n; if(n<400){ n++; LOG("amiibo: game call %u (device state %d)\n",c->cmd,g_ami_dev); } }
+  switch(c->cmd){
+    case 0: g_ami_dev=0; return 0;
+    case 1: g_ami_dev=0; return 0;
+    case 2: { if(!g_opt_amiibo) return RC(115,64); u64 a,s; buf_out(c,0,&a,&s); if(a && s>=8){ u64 h=AMI_HANDLE; memcpy(GP(a),&h,8); } out32(c,1); return 0; }
+    case 3: g_ami_cur=(g_ami_cur+1)%AMI_N; ami_load(); g_ami_dev=2; g_ami_open=0; LOG("amiibo: presenting %s\n",g_ami[g_ami_cur].name); if(g_ami_on) kevent_signal(g_ami_on); return 0;
+    case 4: g_ami_dev=0; if(g_ami_off) kevent_signal(g_ami_off); return 0;
+    case 5: if(g_ami_dev!=2) return RC(115,73); g_ami_dev=4; return 0;
+    case 6: if(g_ami_dev==4) g_ami_dev=2; g_ami_open=0; return 0;
+    case 7: if(g_ami_dev!=4) return RC(115,73); if(!g_ami_has || g_ami_access!=in32(c,8)) return RC(115,152); g_ami_open=1; return 0;
+    case 8: { if(!g_ami_open) return RC(115,128); u64 a,s; buf_out(c,0,&a,&s); u32 n= s<AMI_AREA? (u32)s : AMI_AREA; if(a) memcpy(GP(a),g_ami_area,n); out32(c,n); return 0; }
+    case 9: { if(!g_ami_open) return RC(115,128); u64 a,s; buf_in(c,0,&a,&s); u32 n= s<AMI_AREA? (u32)s : AMI_AREA; memset(g_ami_area,0,AMI_AREA); if(a) memcpy(g_ami_area,GP(a),n); return 0; }
+    case 10: case 11: if(g_ami_dev==4 && g_ami_has) ami_save(); return 0;
+    case 12: case 24: { if(g_ami_dev!=4) return RC(115,73); if(c->cmd==12 && g_ami_has) return RC(115,168); u64 a,s; buf_in(c,0,&a,&s); g_ami_access=in32(c,8); u32 n= s<AMI_AREA? (u32)s : AMI_AREA; memset(g_ami_area,0,AMI_AREA); if(a) memcpy(g_ami_area,GP(a),n); g_ami_has=1; ami_save(); return 0; }
+    case 13: { if(g_ami_dev!=2 && g_ami_dev!=4) return RC(115,73); ami_fill(c,0x58); u64 a,s; buf_out(c,0,&a,&s); if(a && s>=0x58){ u8* p=GP(a); p[0]=0x04; p[1]=0xA0; p[2]=(u8)g_ami_cur; p[3]=0x4D; p[4]=0x50; p[5]=0x34; p[6]=0x21; p[10]=7; u32 pr=1, ty=2; memcpy(p+0x20,&pr,4); memcpy(p+0x24,&ty,4); } return 0; }
+    case 14: if(g_ami_dev!=4) return RC(115,73); ami_fill(c,0x100); return 0;
+    case 15: { if(g_ami_dev!=4) return RC(115,73); ami_fill(c,0x40); u64 a,s; buf_out(c,0,&a,&s); if(a && s>=0x40){ u8* p=GP(a); u16 y=2026; memcpy(p,&y,2); p[2]=11; p[3]=9; u32 sz=AMI_AREA; memcpy(p+8,&sz,4); } return 0; }
+    case 16: { if(g_ami_dev!=4) return RC(115,73); ami_fill(c,0x40); u64 a,s; buf_out(c,0,&a,&s); if(a && s>=8) memcpy(GP(a),g_ami[g_ami_cur<0? 0 : g_ami_cur].id,8); return 0; }
+    /* the game closes these handles after each scan, which frees the event: signalling a kept one on the next scan
+       corrupted the heap (crash on the second figure). A new event per scan, with our own reference */
+    case 17: if(g_ami_on) kobj_unref(&g_ami_on->o); g_ami_on=kevent_new("nfp on",0); kobj_ref(&g_ami_on->o); out_copy_h(c,ev_handle(g_ami_on)); return 0;
+    case 18: if(g_ami_off) kobj_unref(&g_ami_off->o); g_ami_off=kevent_new("nfp off",0); kobj_ref(&g_ami_off->o); out_copy_h(c,ev_handle(g_ami_off)); return 0;
+    case 19: out32(c,1); return 0;
+    case 20: out32(c,(u32)g_ami_dev); return 0;
+    case 21: out32(c,0x20); return 0;
+    case 22: out32(c,AMI_AREA); return 0;
+    case 23: out_copy_h(c,ev_handle(kevent_new("nfp avail",0))); return 0;
+  }
+  return 0; }
 
 static int nfp_disp(SvcObj* o, IpcCtx* c){ if(c->cmd==0){ out_obj(c,svcobj_new("IUser",nfp_user,0)); return 0; } return quiet_ok(o,c); }
 
