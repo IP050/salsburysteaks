@@ -116,6 +116,8 @@ GitHub release.
 
 ## Credits
 
+Copies, forks and builds of this project must keep these credits where users can see them (NOTICE.txt).
+
 ### Source
 
 This repository is a Windows build of **[linuxopt/mp4-recomp](https://github.com/linuxopt/mp4-recomp)**, taken at

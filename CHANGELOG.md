@@ -4,7 +4,26 @@ Fixes and changes per release. Found a problem? Please use the
 [bug report form](../../issues/new?template=bug_report.yml) and attach `Metroid Prime 4 Beyond.log`: it holds the
 timings and errors needed to trace most issues, and one report per problem keeps each one easy to track.
 
-## Next release
+## 2026.11.12
+
+### The game stays at console speed
+Metroid Prime 4 moves forward one step per frame, so the 120, 144 and 240 FPS choices ran the whole game faster
+instead of smoother (2.4 times the speed at 144 on Native Vulkan; OpenGL stayed at 60 regardless). The game now
+runs at 60 on every renderer, a saved 120/144/240 is set back to 60 once, and "Best settings for this PC" picks 60.
+Unlimited is still there and says that it speeds the game up. Smooth output above 60 for high-refresh screens is
+planned as frame generation.
+
+### AMD Radeon crashes: a workaround to try and clearer reports
+Some AMD cards (RX 9070 XT, Ryzen Z1 / Legion Go) crash in AMD's driver about 2 seconds after PLAY on OpenGL, or
+during the opening cutscene on Native Vulkan. This release does not fix that yet, but:
+- `shader_threads=-1` in `Metroid Prime 4 Beyond.ini` makes every shader on the main graphics thread. On OpenGL,
+  try it if the game crashes right after starting.
+- A crash inside a driver now names the thread and the exact game code that called the driver, and crashes that
+  end the game at once now still reach the log. Please attach the log from this version to your report.
+
+### Checksums for every release
+Each release now has `SHA256SUMS.txt` to check downloads against (see SECURITY.md). SECURITY.md also explains how
+to report a security problem privately, and NOTICE.txt now requires keeping the contributors' credits in copies.
 
 ### Updates install themselves
 When the launcher finds a new version it now downloads and installs it straight away, then restarts or rebuilds the

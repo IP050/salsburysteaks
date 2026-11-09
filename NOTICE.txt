@@ -14,6 +14,17 @@ keep this NOTICE file and the copyright line above, and must credit
 "SwitchRecomp by MZ Labs" in a place where users can see it (README, credits
 screen, about box, release page or video description).
 
+Metroid Prime 4 Recomp (this repository)
+----------------------------------------
+Credit to the contributors is required here too. Anyone who redistributes this
+project, a fork, a modified version or a build of it must keep this NOTICE
+file and the "Credits" section of README.md (or an equal list of the same
+people and projects), and must show those credits where users can see them,
+as listed above. For the parts under GPL-3.0 this is an additional term under
+section 7(b) of that license (preservation of author attributions). Removing
+or hiding the credits, or presenting this work as someone else's, is not
+permitted. Contributors who add work are added to the Credits section.
+
 This license covers only the SwitchRecomp code (the recompiler, the runtime,
 the GUI and the scripts). It does not cover the bundled third-party
 components, which keep their own licenses (listed in README.txt), and it does

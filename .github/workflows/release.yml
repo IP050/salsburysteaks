@@ -50,7 +50,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $d = "release/$env:VERSION"
+          $files = "MetroidPrime4Recomp-PC-v$env:VERSION.zip", "update-$env:VERSION.zip", "update.txt"
+          # SHA256SUMS.txt: what players check a download against (SECURITY.md), one "hash  name" line per file
+          $sums = foreach ($n in $files) { "{0}  {1}" -f (Get-FileHash "$d/$n" -Algorithm SHA256).Hash.ToLower(), $n }
+          [IO.File]::WriteAllText("$d/SHA256SUMS.txt", ($sums -join "`n") + "`n")
+          Get-Content "$d/SHA256SUMS.txt"
           gh release create "v$env:VERSION" `
-            "$d/MetroidPrime4Recomp-PC-v$env:VERSION.zip" "$d/update-$env:VERSION.zip" "$d/update.txt" `
+            "$d/MetroidPrime4Recomp-PC-v$env:VERSION.zip" "$d/update-$env:VERSION.zip" "$d/update.txt" "$d/SHA256SUMS.txt" `
             --target "${{ github.sha }}" --title "Metroid Prime 4 Recomp v$env:VERSION (Windows)" `
-            --notes "Windows build. Download MetroidPrime4Recomp-PC-v$env:VERSION.zip, extract it, and run ``Metroid Prime 4 Beyond.exe``. You need your own dumped copy of the game and its update; see the README. What changed: see CHANGELOG.md. Found a problem? Use the bug report form under Issues and attach Metroid Prime 4 Beyond.log from the game folder."
+            --notes "Windows build. Download MetroidPrime4Recomp-PC-v$env:VERSION.zip, extract it, and run ``Metroid Prime 4 Beyond.exe``. You need your own dumped copy of the game and its update; see the README. What changed: see CHANGELOG.md. Check your download against SHA256SUMS.txt (see SECURITY.md). Found a problem? Use the bug report form under Issues and attach Metroid Prime 4 Beyond.log from the game folder."
