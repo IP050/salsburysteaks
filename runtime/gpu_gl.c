@@ -2014,11 +2014,17 @@ static int rt_flush_async(Tex* t, u64 gva){
    (DMA block-linear -> linear, 120x100 pixels) and the CPU picks the target under the reticle from its stencil value.
    Only colour targets were written back, so the CPU read memory the GPU never filled, saw no target and the scan never
    started. Read back as the hardware lays it out: Z24S8 (0x14) depth<<8|stencil as GL packs it, S8Z24 (0x16) stencil
-   in the top byte, ZF32_X24S8 8 bytes. SWR_NO_DEPTH_READBACK=1: off */
+   in the top byte, ZF32_X24S8 8 bytes. SWR_NO_DEPTH_READBACK=1: off
+   Reading the whole target took 8-12 ms a frame for those 120x100 pixels (MEASURED 2026-11-09, intro, 1280x720): only the
+   part the copy reads comes back now. SWR_DEPTH_READBACK_WHOLE=1: the whole target again */
+u32 g_dma_rect[5];   /* x bytes, y, width bytes (0 = no rectangle), lines, surface width bytes: set by dma_method */
 static void rt_flush_depth(Tex* t, u64 gva){
   static int off=-1; if(off<0) off=getenv("SWR_NO_DEPTH_READBACK")!=NULL; if(off || g_gles) return;
   u32 w=t->w, h=t->h, bp=t->f.bpp; if(t->f.fmt!=GL_DEPTH_STENCIL || (bp!=4 && bp!=8) || t->target!=GL_TEXTURE_2D || t->vol) return;
-  u64 t0=plat_ns(); u8* px=malloc((size_t)w*h*bp); if(!px) return;
+  static int whole=-1; if(whole<0) whole=getenv("SWR_DEPTH_READBACK_WHOLE")!=NULL;
+  u32 rx=g_dma_rect[0]/bp, ry=g_dma_rect[1], rw=g_dma_rect[2]/bp, rh=g_dma_rect[3];
+  int sub= !whole && t->bl && g_dma_rect[2] && g_dma_rect[4]==w*bp && !(g_dma_rect[0]%bp) && !(g_dma_rect[2]%bp) && rw && rh && rx+rw<=w && ry+rh<=h;
+  u64 t0=plat_ns(); u8* px=malloc(sub? (size_t)rw*rh*bp : (size_t)w*h*bp); if(!px) return;
   GLuint tmp=0;
   if(g_scale!=1.0f){ glGenTextures(1,&tmp); glBindTexture(GL_TEXTURE_2D,tmp); glTexStorage2D(GL_TEXTURE_2D,1,t->f.ifmt,w,h);
     glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
@@ -2029,13 +2035,18 @@ static void rt_flush_depth(Tex* t, u64 gva){
     glBlitFramebuffer(0,0,(GLint)SC(w),(GLint)SC(h),0,0,(GLint)w,(GLint)h,GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT,GL_NEAREST);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0); glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0); }
   glPixelStorei(GL_PACK_ALIGNMENT,1); glPixelStorei(GL_PACK_ROW_LENGTH,0);
-  glBindTexture(GL_TEXTURE_2D,tmp? tmp : t->id); glGetTexImage(GL_TEXTURE_2D,0,GL_DEPTH_STENCIL,t->f.type,px);
+  if(sub){ glBindFramebuffer(GL_READ_FRAMEBUFFER,g_rfbo); glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,0,0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,tmp? tmp : t->id,0);
+    glReadBuffer(GL_NONE); glReadPixels((GLint)rx,(GLint)ry,(GLsizei)rw,(GLsizei)rh,GL_DEPTH_STENCIL,t->f.type,px); glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER,GL_DEPTH_STENCIL_ATTACHMENT,GL_TEXTURE_2D,0,0); }
+  else { glBindTexture(GL_TEXTURE_2D,tmp? tmp : t->id); glGetTexImage(GL_TEXTURE_2D,0,GL_DEPTH_STENCIL,t->f.type,px); }
   glBindFramebuffer(GL_FRAMEBUFFER,g_fbo); if(tmp) glDeleteTextures(1,&tmp); state_dirty();
-  if((t->fkey&0xFF)==0x16 && bp==4){ u32* q=(u32*)px; for(size_t i=0;i<(size_t)w*h;i++) q[i]=(q[i]>>8)|(q[i]<<24); }
+  if((t->fkey&0xFF)==0x16 && bp==4){ u32* q=(u32*)px; size_t np= sub? (size_t)rw*rh : (size_t)w*h; for(size_t i=0;i<np;i++) q[i]=(q[i]>>8)|(q[i]<<24); }
   u64 sz= t->bl? bl_level_size(w,h,1,&t->f,t->bh,0,0,NULL) : (u64)w*h*bp; u8* dst=gmem_ptr(gva,sz);
-  if(dst){ if(t->bl) swizzle(dst,px,w*bp,w*bp,h,t->bh); else memcpy(dst,px,(size_t)w*h*bp); }
+  if(dst){ if(sub){ for(u32 y=0;y<rh;y++) for(u32 x=0;x<rw;x++){ u64 o=bl_offset((rx+x)*bp,ry+y,0,w*bp,h,t->bh,0); if(o+bp<=sz) memcpy(dst+o,px+((size_t)y*rw+x)*bp,bp); } }
+    else if(t->bl) swizzle(dst,px,w*bp,w*bp,h,t->bh); else memcpy(dst,px,(size_t)w*h*bp); }
   free(px); t->hash=rt_sig(gva);
-  { static int nlog; u64 t1=plat_ns(); if(nlog<6 || (t1-t0)>8000000ull && nlog<30){ nlog++; LOG("gpu: depth-stencil %ux%u (format %x) at %llx copied to memory for a DMA copy (%.1f ms)\n",w,h,t->fkey&0xFF,(unsigned long long)gva,(t1-t0)/1e6); } }
+  { static int nlog; u64 t1=plat_ns(); if(nlog<6 || (t1-t0)>8000000ull && nlog<30){ nlog++; LOG("gpu: depth-stencil %ux%u (format %x) at %llx copied to memory for a DMA copy (%s %ux%u, %.1f ms)\n",w,h,t->fkey&0xFF,(unsigned long long)gva,sub?"part,":"whole,",sub?rw:w,sub?rh:h,(t1-t0)/1e6); } }
   trace_note("  (depth-stencil %llx -> memory, %u bytes/px)\n",(unsigned long long)gva,bp); }
 
 void gpu_gl_rt_flush(u64 gva){
