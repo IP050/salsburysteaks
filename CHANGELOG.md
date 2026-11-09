@@ -6,6 +6,19 @@ timings and errors needed to trace most issues, and one report per problem keeps
 
 ## Next release
 
+### Updates install themselves
+When the launcher finds a new version it now downloads and installs it straight away, then restarts or rebuilds the
+game code if the update needs it, with no UPDATE press. PLAY waits while it downloads. Every file is still checked
+before anything is replaced, and UNDO still goes back a version (that version is then not installed again by
+itself). It can be turned off in the Play screen's Updates section. Players on older versions press UPDATE once more
+to get this.
+
+### Progress bar on the splash screen
+The splash shown after PLAY now has a progress bar and a label ("Preparing shaders", then "Starting the game"). Most
+of the wait is preparing the shaders cached from earlier sessions, and the bar follows that real progress.
+
+## 2026.11.11
+
 ### Scan visor no longer drops to 2 FPS at higher resolutions
 With the resolution setting above or below 1 (for example 2 for 4K), the scan visor ran at about 2 FPS whenever it
 was open. To find what the reticle is over, the game reads a small patch of depth and stencil around it each frame;
