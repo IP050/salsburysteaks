@@ -2816,7 +2816,14 @@ static void bind_textures(GpuChannel* ch, int stage, Sh* s){
         if(hh!=t->hash){ t->hash=hh; tex_upload(t); t->stable=0; t->frame_checked=g_frame; static int said; if(said<4){ said++; LOG("gpu: texture %ux%u at %llx: more mip levels resident (TIC), reloaded\n",t->w,t->h,(unsigned long long)t->gva); } } }
       t->rmin_seen=rm; }
     { static int off=-1; if(off<0) off=getenv("SWR_NO_TIC_MINMIP")!=NULL; u32 rmin=tic[7]&0xF;
-      if(!off && t && rmin && !t->is_rt && rmin<t->levels){ int b= t->apend? t->abase : 0; if((int)rmin>b){ u32 want=(u32)((int)rmin-b)<<8; if((tsc[2]&0xFFF)<want) tsc[2]=(tsc[2]&~0xFFFu)|want; } } }
+      if(!off && t && rmin && !t->is_rt && rmin<t->levels){ int b= t->apend? t->abase : 0; if((int)rmin>b){ u32 want=(u32)((int)rmin-b)<<8; if((tsc[2]&0xFFF)<want) tsc[2]=(tsc[2]&~0xFFFu)|want; } }
+      /* A chain drawn a level at a time reads only the level above: the TIC's resident range says which (Prime 4's 1024x512
+         bloom/exposure pyramid: 0-0, 1-1, 2-2...). Without this the size of the target picked the level being drawn, whose
+         own copy from the last frame was black, so the whole chain stayed black and glass refraction read black from it */
+      if(!off && t && t->is_rt && t->levels>1){ u32 rmax=(tic[7]>>4)&0xF; if(rmin>=t->levels) rmin=t->levels-1; if(rmax>=t->levels) rmax=t->levels-1; if(rmax<rmin) rmax=rmin;
+        u32 lo=rmin<<8, hi=rmax<<8; if((tsc[2]&0xFFF)<lo) tsc[2]=(tsc[2]&~0xFFFu)|lo; if(((tsc[2]>>12)&0xFFF)>hi) tsc[2]=(tsc[2]&~0xFFF000u)|(hi<<12); } }
+    /* experiment (ini dbg_tex bit 4, live): cube samplers read only their blurriest level, which has almost no detail left: a fault that stays isn't in the cube lookup */
+    { extern int g_opt_dbg_tex; if((g_opt_dbg_tex&4) && stage==4 && t && st->type==3 && !st->array && t->levels>1){ u32 lv=(t->levels-1)<<8; tsc[2]=(tsc[2]&~0xFFFFFFu)|lv|(lv<<12); } }
     u64 q2=plat_ns(); st_tb_rest+=q2-q1; if(mb) sids[i]=sampler_get(tsc); else glBindSampler(unit,sampler_get(tsc)); st_tb_samp+=plat_ns()-q2;
     /* TIC swizzle */
     if(t && (t->target==want || (t->view && t->view_target==want))){ static const GLint sw[8]={GL_ZERO,GL_ZERO,GL_RED,GL_GREEN,GL_BLUE,GL_ALPHA,GL_ONE,GL_ONE};
@@ -4487,7 +4494,7 @@ static void gpu_thread(void* arg){ plat_diag_role("GPU-submit"); t_gpu_thread=1;
   { GLuint a=compile(GL_VERTEX_SHADER,g_gles? BLIT_VS_ES : BLIT_VS,NULL,0), b=compile(GL_FRAGMENT_SHADER,g_gles? BLIT_FS_ES : BLIT_FS,NULL,0); g_blit_prog=link2(a,b,0); }
   if(!g_gles){ GLuint a=compile(GL_VERTEX_SHADER,BLIT_VS,NULL,0), b=compile(GL_FRAGMENT_SHADER,DOWN_FS,NULL,0); g_down_prog=link2(a,b,0);
     if(g_down_prog){ g_down_xf=glGetUniformLocation(g_down_prog,"xf"); g_down_px=glGetUniformLocation(g_down_prog,"px"); } }
-  if(!g_gles){ glEnable(GL_FRAMEBUFFER_SRGB); glDisable(GL_FRAMEBUFFER_SRGB); glEnable(0x8642); }   /* GL_PROGRAM_POINT_SIZE, gl_PointSize comes from the shader */
+  if(!g_gles){ glEnable(GL_FRAMEBUFFER_SRGB); glDisable(GL_FRAMEBUFFER_SRGB); glEnable(0x8642); glEnable(0x884F); }   /* GL_PROGRAM_POINT_SIZE, gl_PointSize comes from the shader; GL_TEXTURE_CUBE_MAP_SEAMLESS: the Switch's GPU filters across cube faces, GL by default doesn't (hard lines in the fog, whose light comes from a cube) */
   { extern float g_opt_resf; g_scale=g_opt_resf; if(g_scale!=1.0f) LOG("internal resolution x%.2f\n",g_scale); }
   rs_update();
   worker_start();
