@@ -491,7 +491,10 @@ static void page_gameplay() {
     section("FRAME RATE"); draw_opt("fps_limit"); draw_opt("forced_vsync"); draw_opt("show_fps");
     section("RIDES"); draw_opt("fast_forward"); if (getb("fast_forward")) draw_opt("fast_forward_speed");
     section("CAMERA"); draw_opt("fov");
-    section("CHEATS"); draw_opt("cheats");
+    section("CHEATS"); draw_opt("cheats"); draw_opt("green_energy_10x");
+    section("CHEATS: AMMO"); for (const char* k : {"cheat_missiles", "cheat_super_shot", "cheat_large_shot", "cheat_power_bombs", "cheat_ammo", "cheat_elemental_ammo", "cheat_arm_cannon", "cheat_crystals"}) draw_opt(k);
+    section("CHEATS: SAMUS"); for (const char* k : {"cheat_health", "cheat_jumps", "cheat_speed", "cheat_walls", "cheat_flare_timer"}) draw_opt(k);
+    section("CHEATS: COMBAT"); for (const char* k : {"cheat_one_hit", "cheat_two_hit", "cheat_ally_health", "cheat_ally_dying"}) draw_opt(k);
 }
 
 static void page_audio() {
