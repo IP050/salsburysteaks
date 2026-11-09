@@ -20,9 +20,16 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
+#include <shellapi.h>
 #define fseek64 _fseeki64
 #define ftell64 _ftelli64
-#define nx_mkdir(p) _mkdir(p)
+/* paths are UTF-8 here (from the wide command line): fopen / _mkdir take the ANSI code page, so a file or folder name
+   with a character outside it (a Japanese or accented name, a user folder in another script) could not be opened */
+static int nx_wide(const char* s, wchar_t* w, int n){ return MultiByteToWideChar(CP_UTF8,0,s,-1,w,n); }
+static FILE* nx_fopen(const char* p, const char* m){ wchar_t wp[4096], wm[8]; if(!nx_wide(p,wp,4096) || !nx_wide(m,wm,8)) return NULL; return _wfopen(wp,wm); }
+static int nx_mkdir(const char* p){ wchar_t wp[4096]; if(!nx_wide(p,wp,4096)) return -1; return _wmkdir(wp); }
+#define fopen nx_fopen
 #else
 #define fseek64 fseeko
 #define ftell64 ftello
@@ -221,15 +228,35 @@ static int romfs_extract(const Sec* s, const char* dir){ const u8* iv=s->fsh+8; 
 
 /* ---------------------------------------------------------------- the program NCA of an .xci / .nsp */
 static int find_ncas(const Reg* r, Nca* out, int max){ Entry e[256]; int n=fs0_list(r,e,256), k=0;
-  if(n<0){ u8 h[4]; if(r->size>0x204) reg_read(r,0x100,h,4); if(r->size<=0x204 || memcmp(h,"HEAD",4)) nx_fail("This is neither an .xci nor an .nsp.");
-    u8 x[16]; reg_read(r,0x130,x,16); Reg root={r->f,r->off+rd64(x),r->size-rd64(x)}; Entry p[8]; int np=fs0_list(&root,p,8);
+  if(n<0){ u8 h[4]; u64 ka=0;
+    /* a full card dump (nxdumptool's "keep certificate / key area") has a 0x1000-byte key area before the header */
+    if(r->size>0x204) reg_read(r,0x100,h,4);
+    if((r->size<=0x204 || memcmp(h,"HEAD",4)) && r->size>0x1204){ reg_read(r,0x1100,h,4); if(!memcmp(h,"HEAD",4)) ka=0x1000; }
+    if(r->size<=0x204 || memcmp(h,"HEAD",4)) nx_fail("This is neither an .xci nor an .nsp (no card header found; a compressed .xcz / .nsz must be decompressed first).");
+    u8 x[16]; reg_read(r,ka+0x130,x,16); u64 ro=ka+rd64(x); if(ro>=r->size) nx_fail("The .xci's partition table is past the end of the file: the dump may be incomplete.");
+    Reg root={r->f,r->off+ro,r->size-ro}; Entry p[8]; int np=fs0_list(&root,p,8);
     for(int i=0;i<np;i++) if(!strcmp(p[i].name,"secure")) return find_ncas(&p[i].r,out,max);
     nx_fail("The .xci has no secure partition."); }
   for(int i=0;i<n;i++){ size_t l=strlen(e[i].name); if(l>4 && !strcmp(e[i].name+l-4,".tik")) tik_add(&e[i].r); }
   for(int i=0;i<n && k<max;i++){ size_t l=strlen(e[i].name); if(l>4 && !strcmp(e[i].name+l-4,".nca") && nca_open(&out[k],&e[i].r)) k++; }
   return k; }
 
+/* an update's program NCA: its RomFS section is a BKTR patch (encryption type 4) */
+static int nca_is_patch(const Nca* c){ for(int i=0;i<4;i++){ Sec s; if(nca_section(c,i,&s) && s.fsh[3]==3 && s.enc==4) return 1; } return 0; }
+/* the program NCA for this game: a card can hold the game and an update together, so the one wanted is picked by kind
+   (the update when patch=1) before falling back to the other */
+static const Nca* pick_program(const Nca* c, int n, u64 want, int patch){ const Nca* other=NULL;
+  for(int i=0;i<n;i++){ if(c[i].type!=0 || (want && (c[i].program&~0xFFFull)!=(want&~0xFFFull))) continue;   /* an update's program ID differs in its low bits */
+    if(nca_is_patch(&c[i])==patch) return &c[i]; if(!other) other=&c[i]; }
+  return other; }
+
 int nx_extract_main(int argc, char** argv){
+#ifdef _WIN32
+  { int wc=0; LPWSTR* wa=CommandLineToArgvW(GetCommandLineW(),&wc);   /* argv is in the ANSI code page: take UTF-8 from the wide one */
+    if(wa && wc>=2 && wc-1==argc){ char** u=calloc((size_t)wc,sizeof(char*));
+      for(int i=1;i<wc && u;i++){ int n=WideCharToMultiByte(CP_UTF8,0,wa[i],-1,NULL,0,NULL,NULL); u[i-1]=malloc(n>0? (size_t)n : 1); if(u[i-1]){ u[i-1][0]=0; if(n>0) WideCharToMultiByte(CP_UTF8,0,wa[i],-1,u[i-1],n,NULL,NULL); } }
+      if(u) argv=u; } }
+#endif
   const char *keys=NULL, *tkeys=NULL, *out=NULL, *file=NULL, *basef=NULL; u64 want=0;
   for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"--keys") && i+1<argc) keys=argv[++i]; else if(!strcmp(argv[i],"--title-keys") && i+1<argc) tkeys=argv[++i];
     else if(!strcmp(argv[i],"--out") && i+1<argc) out=argv[++i]; else if(!strcmp(argv[i],"--base") && i+1<argc) basef=argv[++i]; else if(!strcmp(argv[i],"--program") && i+1<argc) want=strtoull(argv[++i],NULL,16);
@@ -238,8 +265,7 @@ int nx_extract_main(int argc, char** argv){
   keys_load(keys,1); if(tkeys) keys_load(tkeys,0);
   FILE* f=fopen(file,"rb"); if(!f) nx_fail("Cannot open %s (%s).",file,strerror(errno));
   fseek64(f,0,SEEK_END); Reg whole={f,0,(u64)ftell64(f)};
-  static Nca ncas[64]; int n=find_ncas(&whole,ncas,64); const Nca* prog=NULL;
-  for(int i=0;i<n;i++) if(ncas[i].type==0 && (!want || (ncas[i].program&~0xFFFull)==(want&~0xFFFull))){   /* an update's program ID differs in its low bits */ prog=&ncas[i]; break; }
+  static Nca ncas[64]; int n=find_ncas(&whole,ncas,64); const Nca* prog=pick_program(ncas,n,want,basef!=NULL);
   if(!prog) nx_fail("%s has no program NCA%s (found %d NCAs). Is it the game or its update?",file,want? " for this game" : "",n);
   printf("program %016llX, key generation %d\n",(unsigned long long)prog->program,prog->hdr[0x220]>prog->hdr[0x206]? prog->hdr[0x220] : prog->hdr[0x206]);
   char ex[4096], ro[4096]; snprintf(ex,sizeof ex,"%s/exefs",out); snprintf(ro,sizeof ro,"%s/romfs",out);
@@ -250,8 +276,9 @@ int nx_extract_main(int argc, char** argv){
       if(s.enc==4){ /* an update: its RomFS is a patch over the base game's, which --base gives */
         if(!basef) nx_fail("This is an update: its RomFS is a patch over the game's, so the game file is needed too (choose both).");
         FILE* bf=fopen(basef,"rb"); if(!bf) nx_fail("Cannot open %s (%s).",basef,strerror(errno)); fseek64(bf,0,SEEK_END); Reg bw={bf,0,(u64)ftell64(bf)};
-        static Nca bn[64]; int nb=find_ncas(&bw,bn,64); const Nca* bp=NULL; for(int j=0;j<nb;j++) if(bn[j].type==0 && (bn[j].program&~0xFFFull)==(prog->program&~0xFFFull)){ bp=&bn[j]; break; }
+        static Nca bn[64]; int nb=find_ncas(&bw,bn,64); const Nca* bp=pick_program(bn,nb,prog->program,0);
         if(!bp) nx_fail("%s is not the game this update is for (no program %016llX in it).",basef,(unsigned long long)(prog->program&~0xFFFull));
+        if(nca_is_patch(bp)) nx_fail("%s holds only an update, not the game itself: choose the game's own .xci or .nsp as the game file.",basef);
         Sec bs; int ok=0; for(int j=0;j<4 && !ok;j++) if(nca_section(bp,j,&bs) && bs.fsh[3]==3) ok=1;
         if(!ok) nx_fail("The game file has no RomFS.");
         static struct Bktr bk; bk_open(&bk,&bs,&s); s.bk=&bk; got_ro=romfs_extract(&s,ro); fclose(bf); }
