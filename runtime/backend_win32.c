@@ -2,7 +2,7 @@
    Licensed under the Apache License 2.0. See LICENSE.txt and NOTICE.txt;
    any copy or derived work must keep the credit to SwitchRecomp by MZ Labs. */
 /* win32 backend: window, WGL, keyboard, XInput.
-   F1 menu  F2 FPS counter  F3 screenshot  F4 fps limit  F11 fullscreen  Esc quit
+   F1 menu  F2 FPS counter  F3 screenshot  F4 fps limit  F11 fullscreen
    The same window first shows the Play screen / setup (beyond_ui/fe.cpp, Direct3D 11, no pixel format), then the game. */
 #include "rt.h"
 #include <math.h>
@@ -260,13 +260,16 @@ static const char* HELP=
   "F11 / Alt+Enter = fullscreen   Esc = quit";
 
 static u64 keymap(WPARAM k){
-  switch(k){ case 'X': case VK_SPACE: return 1ull<<0; case 'Z': return 1ull<<1; case 'C': return 1ull<<2; case 'V': return 1ull<<3;
-    case 'Q': return 1ull<<6; case 'E': return 1ull<<7; case '1': return 1ull<<8; case '3': return 1ull<<9;
-    case VK_RETURN: return 1ull<<10; case VK_BACK: return 1ull<<11;
-    case VK_LEFT: return 1ull<<12; case VK_UP: return 1ull<<13; case VK_RIGHT: return 1ull<<14; case VK_DOWN: return 1ull<<15;
+  /* PC shooter layout for Prime 4's dual stick scheme: bits 0 A, 1 B, 2 X, 3 Y, 7 R, 10 plus, 11 minus, 12-15 D-pad.
+     Jump B, interact A, morph ball Y, visors X, subweapon R, Vi-O-La plus, menu minus; 1-4 pick the shots on the D-pad */
+  switch(k){ case 'E': case VK_RETURN: return 1ull<<0; case VK_SPACE: case VK_BACK: return 1ull<<1;
+    case 'Q': return 1ull<<2; case VK_CONTROL: case 'C': return 1ull<<3; case 'F': return 1ull<<7; case 'R': return 1ull<<4; case 'T': return 1ull<<5; case VK_SHIFT: return 1ull<<6;   /* R stick click, L (Vi-O-La brake, jump) */
+    case 'V': return 1ull<<10; case VK_ESCAPE: case VK_TAB: return 1ull<<11;
+    case VK_LEFT: case '2': return 1ull<<12; case VK_UP: case '1': return 1ull<<13; case VK_RIGHT: case '3': return 1ull<<14; case VK_DOWN: case '4': return 1ull<<15;
     /* stick keys, turned into axes later */
     case 'A': return 1ull<<40; case 'W': return 1ull<<41; case 'D': return 1ull<<42; case 'S': return 1ull<<43;
-    case 'J': return 1ull<<44; case 'I': return 1ull<<45; case 'L': return 1ull<<46; case 'K': return 1ull<<47; }
+    case 'J': return 1ull<<44; case 'I': return 1ull<<45; case 'L': return 1ull<<46; case 'K': return 1ull<<47;
+    case 'G': return 1ull<<48; }   /* lasso pull (video_poll) */
   return 0; }
 
 extern int fe_wndproc(void* h, unsigned m, unsigned long long w, long long l, long long* result);   /* beyond_ui/fe.cpp */
@@ -289,15 +292,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
   case WM_KEYDOWN:
     /* a held key auto-repeats (bit 30): the one-shot actions below only fire on the first press,
        or holding F7 would start and stop the recording every frame */
-    if((l&(1<<30)) && (w==VK_ESCAPE||w==VK_F1||w==VK_F3||w==VK_F4||w==VK_F5||w==VK_F7||w==VK_F8||w==VK_F11)) return 0;
-    if(w==VK_ESCAPE){ g_quit=1; return 0; }
+    if((l&(1<<30)) && (w==VK_F1||w==VK_F3||w==VK_F4||w==VK_F5||w==VK_F7||w==VK_F8||w==VK_F11)) return 0;
     if(w==VK_F11){ set_fullscreen(!g_fullscreen); return 0; }
     if(w==VK_F1){ return 0; }   /* the in-game menu (ov_wndproc) */
     if(0){ MessageBoxA(h,HELP,"Metroid Prime 4 Beyond",MB_OK); }
     if(w==VK_F3){ g_shot_req=1; return 0; }
     if(w==VK_F2){ if(l & (1L<<30)) return 0; extern int g_opt_show_fps; g_opt_show_fps=!g_opt_show_fps; LOG("settings: F2 FPS counter %s\n",g_opt_show_fps? "on" : "off"); return 0; }
     if(w==VK_F7){ g_rec_toggle=1; return 0; }
-    if(w==VK_TAB){ if(!(l & (1L<<30))){ extern volatile int g_ff_presses; g_ff_presses++; } return 0; }   /* fast forward toggle (fast_forward=1) */
+    { extern int g_opt_ff; if(w==VK_TAB && g_opt_ff){ if(!(l & (1L<<30))){ extern volatile int g_ff_presses; g_ff_presses++; } return 0; } }   /* fast forward toggle (fast_forward=1); else Tab is the menu */
     if(w==VK_F8){ extern volatile int g_shot8_req; g_shot8_req=1; return 0; }
     if(w==VK_F5){ capture_hotkey(); return 0; }
     if(w==VK_F4){ if(l & (1L<<30)) return 0; g_opt_fps= g_opt_fps==0? 1 : 0; char t[64]; snprintf(t,sizeof t,"FPS limit: %s",g_opt_fps==0? "unlimited" : "60"); SetWindowTextA(h,t); LOG("settings: F4 fps_limit=%d\n",g_opt_fps); { extern void ini_set(const char*, const char*); char v[8]; snprintf(v,sizeof v,"%d",g_opt_fps); ini_set("fps_limit",v); } return 0; }
@@ -528,10 +530,7 @@ static void test_input_apply(u64*b,i32*lx,i32*ly,i32*rx,i32*ry){
   }
 }
 
-/* Mouse free aim. Free aim follows the left stick while L is held: while the mouse button set to l
-   (right by default) is held, the mouse moves a virtual stick, which turns the aim. It starts centred (the arm points
-   ahead), the mouse pushes it, and it stays where it was pushed (a stick needs no holding): ~150 counts at 100%
-   sensitivity swing it from centre to the edge. The other mouse buttons press their Switch buttons */
+/* Mouse buttons press their Switch buttons (mouse_buttons in the ini) */
 static int g_mb_bit[5]={-2,-2,-2,-2,-2};   /* -2 not parsed yet, -1 none */
 void mouse_map_reset(void){ g_mb_bit[0]=-2; }
 static void mouse_map(void){
@@ -541,7 +540,7 @@ static void mouse_map(void){
   const char* p=g_opt_mouse_buttons;
   for(int i=0;i<5;i++){ char t[16]; int k=0; while(*p==' ') p++; while(*p && *p!=',' && k<15) t[k++]=(char)tolower((unsigned char)*p++); t[k]=0; if(*p==',') p++;
     g_mb_bit[i]=-1; for(size_t j=0;j<sizeof N/sizeof *N;j++) if(!strcmp(t,N[j].n)) g_mb_bit[i]=N[j].bit; } }
-int mouse_aim_button(void){ mouse_map(); int m=0; for(int i=0;i<5;i++) if(g_mb_bit[i]==6) m|=1<<i; return m; }   /* the mouse buttons set to L */
+int mouse_aim_button(void){ return 0; }   /* first person: the mouse always looks, no button to hold (mouse_apply) */
 /* test only: SWR_TEST_MOUSE="FRAME:DX,DY,BUTTONS;..." adds that movement at that guest frame and holds those buttons
    (hex, 1 left 2 right 4 middle) from there to the next entry */
 static void mouse_test(LONG* dx, LONG* dy, LONG* btn){
@@ -551,23 +550,35 @@ static void mouse_test(LONG* dx, LONG* dy, LONG* btn){
     long x=strtol(e+1,&e,10); if(*e==',') e++; long y=strtol(e,&e,10); if(*e==',') e++; long b=strtol(e,&e,16);
     *dx+=x; *dy+=y; held=(int)b; s= *e==';'? e+1 : e; }
   *btn|=held; }
-static void mouse_apply(u64* b, i32* lx, i32* ly){
+/* Mouse look: mouse speed becomes the right stick (the camera in Prime 4's dual stick scheme), the game's own turn speed
+   and acceleration still apply. Full tilt at 3000 counts a second at 100% sensitivity; smoothed over a few polls so the
+   stick doesn't flicker between mouse reports; a small minimum tilt so slow aiming clears the game's stick dead zone */
+static void mouse_apply(u64* b, i32* rx, i32* ry){
   extern int g_opt_mouse_aim, g_opt_mouse_sens;
   LONG dx=InterlockedExchange(&g_mdx,0), dy=InterlockedExchange(&g_mdy,0), btn=g_mbtn;
-  static float vx, vy; static int was;
+  static float vx, vy; static u64 last;
   mouse_test(&dx,&dy,&btn);
-  if(!g_opt_mouse_aim){ was=0; return; }
+  if(!g_opt_mouse_aim){ vx=vy=0; last=0; return; }
   mouse_map();
   for(int i=0;i<5;i++) if((btn>>i&1) && g_mb_bit[i]>=0) *b|=1ull<<g_mb_bit[i];
-  int aiming=(btn & mouse_aim_button())!=0;
-  if(aiming){
-    if(!was) vx=vy=0;
-    float s=(float)g_opt_mouse_sens/100.0f/150.0f;
-    vx+=(float)dx*s; vy-=(float)dy*s;   /* screen y is down, the stick's up */
-    float m=sqrtf(vx*vx+vy*vy); if(m>1.0f){ vx/=m; vy/=m; m=1.0f; }
-    if(m>=0.25f){ *lx=(i32)(vx/m*32767.0f); *ly=(i32)(vy/m*32767.0f); } else *lx=*ly=0;   /* aimed: full tilt that way */
-    { static int said; if(!said){ said=1; LOG("input: mouse free aim in use\n"); } } }
-  was=aiming; }
+  u64 now=plat_ns(); float dt= last? (float)((now-last)/1e9) : 0.016f; last=now; if(dt<0.001f) dt=0.001f; if(dt>0.1f) dt=0.1f;
+  { /* mouse_mode=pointer: the mouse turns the emulated controller instead, for the game's Pointer control scheme (aim with
+       motion): 8000 counts for a full turn at 100%. Same axes as a real gyro: right = yaw negative, up = pitch positive */
+    extern int g_opt_mouse_mode; extern volatile float g_motion_gyro[3], g_motion_acc[3]; extern volatile unsigned long long g_motion_ns;
+    if(g_opt_mouse_mode==1){ float k=(float)g_opt_mouse_sens/100.0f/8000.0f/dt; static int said; if(!said){ said=1; LOG("input: mouse drives the motion sensor (Pointer mode)\n"); }
+      g_motion_gyro[0]=-(float)dy*k; g_motion_gyro[1]=0; g_motion_gyro[2]=-(float)dx*k; if(g_motion_acc[2]==0) g_motion_acc[2]=-1.0f; g_motion_ns=now; vx=vy=0; return; } }
+  float s=(float)g_opt_mouse_sens/100.0f/3000.0f;
+  float tx=(float)dx/dt*s, ty=-(float)dy/dt*s;   /* screen y is down, the stick's up */
+  float a=dt/(dt+0.012f); vx+=(tx-vx)*a; vy+=(ty-vy)*a;
+  float m=sqrtf(vx*vx+vy*vy);
+  if(m<0.01f){ vx=vy=0; return; }   /* stopped: a controller's stick (or none) goes through */
+  if(m>1.0f){ vx/=m; vy/=m; m=1.0f; }
+  { float out=0.16f+0.84f*m; *rx=(i32)(vx/m*out*32767.0f); *ry=(i32)(vy/m*out*32767.0f); }
+  { static int said; if(!said){ said=1; LOG("input: mouse look in use\n"); } } }
+/* mouse look captures the cursor in the window while the game has focus and the menu is closed */
+static void mouse_capture(int want){ static int on; static u64 last; u64 now=plat_ns();
+  if(want){ if(!on || now-last>250000000ull){ RECT c; GetClientRect(g_hwnd,&c); MapWindowPoints(g_hwnd,NULL,(POINT*)&c,2); ClipCursor(&c); on=1; last=now; } }
+  else if(on){ ClipCursor(NULL); on=0; } }
 
 void video_poll(void){
   u64 k=keys_held|keys_tapped, b=0;keys_tapped=0;
@@ -600,7 +611,16 @@ void video_poll(void){
   if(test_replay){ phys=b; plx=lx; ply=ly; }   /* tests drive the menu with the replayed buttons */
   { extern int ov_pad(unsigned long long phys, int lx, int ly);   /* beyond_ui/ov.cpp: 1 = the menu has the controller */
     if(ov_pad(phys,plx,ply)){ b=0; lx=ly=rx=ry=0; } }
-  if(!ov_is_open()) mouse_apply(&b,&lx,&ly);   /* the menu uses the mouse itself while open */
+  { extern int g_opt_mouse_aim; int menu=ov_is_open(); if(!menu) mouse_apply(&b,&rx,&ry);   /* the menu uses the mouse itself while open */
+    mouse_capture(!menu && g_opt_mouse_aim && GetForegroundWindow()==g_hwnd);
+    /* G: the lasso. The lasso is the left stick click and the pull a yank up: press G to click (120 ms), keep holding past
+       300 ms to yank: both sticks up and the controller tilted up, since it isn't known which of those the game reads.
+       R is a plain left stick click (keymap), W and the mouse work for the yank as well */
+    { static u64 g0; int g=!menu && ((k>>48)&1); u64 now=plat_ns();
+      if(!g) g0=0; else { if(!g0) g0=now; u64 held=now-g0;
+        if(held<120000000ull) b|=1ull<<4;
+        else if(held>300000000ull){ extern volatile float g_motion_gyro[3]; extern volatile unsigned long long g_motion_ns; ly=32767; ry=32767; g_motion_gyro[0]=1.0f; g_motion_gyro[1]=0; g_motion_gyro[2]=0; g_motion_ns=now; }
+        static int said; if(!said){ said=1; LOG("input: lasso key used\n"); } } } }
   { /* rumble (svc_hid.c hid_rumble_get) to the pads input comes from: on a change, else refreshed every 100 ms
        (SDL's rumble runs for the duration given, so it stops by itself when the game stops sending) */
     extern void hid_rumble_get(float*,float*); float lo, hi; hid_rumble_get(&lo,&hi);

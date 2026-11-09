@@ -64,7 +64,12 @@ downloaded to a PC.
 
 - Xbox controllers work as they are; SDL2 adds Switch Pro, Joy-Con, DualShock 4, DualSense and 8BitDo over USB or
   Bluetooth (pair Bluetooth controllers in Windows Settings first). **ZL is the left trigger.**
-- Keyboard: WASD to move, **1** = ZL, **3** = ZR.
+- Keyboard and mouse play like a PC shooter: **WASD** to move, **mouse** to look, **left click** shoots, **right click**
+  locks on, **middle click** or **F** fires the subweapon, **Space** jumps, **E** interacts, **Left Ctrl** or **C** is the
+  Morph Ball, **Q** switches visors, **V** is the Vi-O-La, **1-4** pick a shot, **Esc** or **Tab** opens the game's menu.
+  **G** fires the lasso (keep holding to yank up). In the Morph Ball: left click bombs, **F** power bombs, **Space** boosts
+  (hold, release), **Q** springs, right click is the Spider Ball. On the Vi-O-La: left click goes, **Shift** or right click
+  brakes, **Space** boosts, **E** fires.
 - **F1** or the Home / Guide button opens the in-game menu (settings, cheats, FOV, upscaling).
 - **F3** saves a screenshot to `captures\`, **F4** toggles the 60 fps limit, **F5** writes a frame trace for bug
   reports, **F11** toggles fullscreen.

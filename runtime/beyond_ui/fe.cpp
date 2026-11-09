@@ -592,10 +592,12 @@ static void page_controls() {
     if (row_button("##nr", "Reset menu buttons", "RESET")) { for (int i = 0; i < NAV_COUNT; i++) g_nav.bind[i] = NAV_DEFAULT[i]; set("launcher_bindings", bindings_to_string(g_nav.bind)); flash("Menu buttons reset"); }
     help_text("Locked out? Hold + and - together for 3 seconds on any screen, or use the keyboard (arrows, Enter, Esc) or the mouse.");
     section("KEYBOARD (BUILT IN)");
-    const char* kb[][2] = {{"D-pad", "Arrow keys"}, {"Left stick", "W A S D"}, {"Right stick", "I J K L"}, {"A", "X or Space"}, {"B (jump)", "Z"}, {"X", "C"}, {"Y", "V"},
-                           {"L / R", "Q / E"}, {"ZL / ZR", "1 / 3"}, {"+ (pause) / - (map)", "Enter / Backspace"}, {"Menu", "F1"}, {"Screenshot", "F3 (F8 full resolution)"},
-                           {"Record video", "F7"}, {"Fullscreen", "F11 or Alt+Enter"}, {"Fast forward", "Tab"}, {"Quit", "Esc"},
-                           {"Free aim (L)", "Hold right mouse button, move the mouse"}, {"Shoot (Y)", "Left mouse button"}, {"Missiles (R)", "Middle mouse button"}};
+    const char* kb[][2] = {{"Move", "W A S D"}, {"Look", "Mouse (or I J K L)"}, {"Shoot / charge", "Left mouse button"}, {"Lock on", "Right mouse button"},
+                           {"Subweapon", "Middle mouse button or F"}, {"Lasso", "G (keep holding to yank up), or R then W / mouse up"}, {"Jump / dodge (locked on)", "Space"}, {"Interact", "E"}, {"Morph Ball", "Left Ctrl or C"}, {"Switch visors", "Q"},
+                           {"Morph Ball: bomb / power bomb", "Left click / F"}, {"Morph Ball: boost (hold, release)", "Space"}, {"Morph Ball: spring / spider (hold)", "Q / right click"},
+                           {"Vi-O-La: go / brake / boost", "Left click or F / Shift or right click / Space"}, {"Vi-O-La: fire / get off", "E / V"}, {"Right stick click", "T"},
+                           {"Vi-O-La", "V"}, {"Pick shot (Ice, Thunder, Missile, Fire)", "1 2 3 4"}, {"Game menu", "Esc or Tab"}, {"Menus: confirm / back", "Enter / Backspace"},
+                           {"D-pad", "Arrow keys"}, {"Settings menu", "F1"}, {"Screenshot", "F3 (F8 full resolution)"}, {"Record video", "F7"}, {"Fullscreen", "F11 or Alt+Enter"}};
     for (auto& r : kb) row_text(r[0], r[1]);
 }
 

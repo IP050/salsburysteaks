@@ -141,8 +141,10 @@ void tab_content(int t) {
     default: {
         section("KEYS");
         const char* kb[][2] = {{"Menu", "F1"}, {"Screenshot", "F3 (F8: full resolution PNG)"}, {"Record video", "F7"}, {"Fullscreen", "F11 or Alt+Enter"},
-                               {"Fast forward (if on)", "Tab, or L3 + R3"}, {"Quit", "Esc"}, {"Move / aim", "W A S D / I J K L"}, {"A B X Y", "X  Z  C  V"},
-                               {"L R ZL ZR", "Q  E  1  3"}, {"+ / -", "Enter / Backspace"}};
+                               {"Fast forward (if on)", "Tab, or L3 + R3"}, {"Quit", "Alt+F4"}, {"Move / look", "W A S D / mouse"}, {"Shoot / lock on", "Left / right click"},
+                               {"Subweapon", "Middle click or F"}, {"Lasso", "G (hold to yank up), or R"}, {"Jump / interact", "Space / E"}, {"Morph Ball / visors", "Left Ctrl or C / Q"}, {"Ball: bomb / power bomb", "Left click / F"}, {"Ball: boost (hold) / spring / spider", "Space / Q / right click"},
+                               {"Vi-O-La on / off", "V"}, {"Vi-O-La: go / brake / boost / fire", "Left click / Shift / Space / E"},
+                               {"Pick shot", "1 2 3 4"}, {"Game menu", "Esc or Tab"}, {"Menus: confirm / back", "Enter / Backspace"}};
         for (auto& r : kb) row_text(r[0], r[1]);
         section("ABOUT"); help_text("Metroid Prime 4 Recomp: Metroid Prime 4 Beyond recompiled for PC. SwitchRecomp by MZ Labs; Native Vulkan by ScarletNX; Dear ImGui; SDL2. Full credits on the Play screen.");
     } }
