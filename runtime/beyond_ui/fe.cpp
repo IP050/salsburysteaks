@@ -62,6 +62,7 @@ static Nav g_nav; static PadState g_pad; static PromptStyle g_prompts = PROMPT_A
 static std::string g_flash; static double g_flash_t;
 static SetupJob g_job; enum SetupStep { SS_WELCOME, SS_RUNNING, SS_FAILED, SS_DONE } ; static SetupStep g_ss = SS_WELCOME;
 static bool g_restart_after_setup, g_do_restart;   // updates: start the new EXE after the rebuild / now
+static bool g_auto_installing;   // auto_update_tick started an install this session
 static bool g_first_install;   // the game was not compiled when this screen opened: settings are picked after setup
 static std::vector<OldInstall> g_old; static bool g_mig_settings = true, g_mig_saves = true, g_mig_mods = true, g_mig_caches = true;
 static std::string g_mig_report;
@@ -394,7 +395,10 @@ static void page_play() {
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ready ? C_OK : C_WARN));
     ImGui::TextUnformatted(ready ? "READY" : g.summary.c_str()); ImGui::PopStyleColor();
     ImGui::Dummy({1, S(8)});
-    if (big_button("##play", "PLAY", {S(420), S(86)})) { if (ready) g_play = true; else go(PG_SETUP); }
+    if (big_button("##play", "PLAY", {S(420), S(86)})) {
+        UpStage us = update_state().stage;
+        if (g_auto_installing && (us == UP_AVAILABLE || us == UP_DOWNLOADING)) flash("Installing the new version first: PLAY again when it's done.");
+        else if (ready) g_play = true; else go(PG_SETUP); }
     ImGui::Dummy({1, S(14)});
 #ifdef _WIN32
     { UpStage st = update_state().stage; if (st == UP_AVAILABLE || st == UP_DOWNLOADING || st == UP_REBUILD || (st == UP_INSTALLED && update_state().restart)) { update_rows(true); ImGui::Dummy({1, S(10)}); } }
@@ -441,8 +445,9 @@ static void page_play() {
     update_rows(false);
     { UpStage st = update_state().stage; if (st != UP_CHECKING && st != UP_DOWNLOADING && st != UP_AVAILABLE && row_button("##updc", "Check for a new version now", "CHECK")) update_check_async(); }
     { bool v = get("check_updates") != "0"; if (row_bool("##updauto", "Check for a new version when this screen opens", &v)) set("check_updates", v ? "1" : "0"); }
+    { bool v = get("auto_update") != "0"; if (row_bool("##updinst", "Install a new version by itself (no UPDATE press)", &v)) set("auto_update", v ? "1" : "0"); }
     if (dir_exists(join(P.exedir, "update_backup")) && row_button("##updu", "Go back to the version before the last update", "UNDO")) {
-        std::string m; bool rb = false, rs = false;
+        std::string m; bool rb = false, rs = false; set("update_skip", installed_version());   // not installed again by itself
         if (update_rollback(&m, &rb, &rs)) { flash(m); if (rb) start_rebuild(rs); else if (rs) { g_do_restart = true; g_quit = true; } } else flash(m); }
     help_text("Updates come from this project's GitHub releases page and only replace this game's own files.");
 #endif
@@ -821,6 +826,21 @@ static void test_shot() {
     if (f) { fprintf(f, "P6\n%d %d\n255\n", w, h); for (int y = h - 1; y >= 0; y--) fwrite(&px[(size_t)y * w * 3], 1, (size_t)w * 3, f); fclose(f); }
 #endif
 }
+/* updates install themselves: a new version found by the check at launch is downloaded and installed at once, then
+   the game code is rebuilt or the launcher restarted if the update needs it. ini auto_update=0: only the UPDATE
+   button. A version the player went back from with UNDO (update_skip) is not installed again by itself */
+static void auto_update_tick() {
+#ifdef _WIN32
+    if (g_test && !getenv("SWR_FE_AUTO_UPDATE_TEST")) return;   // tests drive the updater themselves
+    if (get("auto_update") == "0") return;
+    UpdateState u = update_state();
+    if (u.stage == UP_AVAILABLE && !g_auto_installing && u.latest != get("update_skip")) { g_auto_installing = true; update_install_async(); return; }
+    if (!g_auto_installing) return;
+    if (u.stage == UP_REBUILD && g_ss != SS_RUNNING && g_ss != SS_DONE && g_ss != SS_FAILED) start_rebuild(u.restart);
+    else if (u.stage == UP_INSTALLED && u.restart) { g_do_restart = true; g_quit = true; }
+    else if (u.stage == UP_ERROR || (u.stage == UP_INSTALLED && !u.restart)) g_auto_installing = false;
+#endif
+}
 static void test_tick() {
     if (!g_test) return;
     static int autostarted; static const char* as = getenv("SWR_FE_AUTOSETUP");
@@ -946,7 +966,7 @@ extern "C" int fe_run(void* hwnd) {
         const float clear[4] = {0.015f, 0.027f, 0.05f, 1};
         g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr); g_ctx->ClearRenderTargetView(g_rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        test_shot(); g_frame_no++; test_tick();
+        test_shot(); g_frame_no++; test_tick(); auto_update_tick();
         g_sc->Present(1, 0);
         if (g_ini_dirty) { g_ini.save(); g_ini_dirty = false; }
     }
