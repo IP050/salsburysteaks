@@ -247,7 +247,9 @@ static u32 pred_read(DirectCtx* c, u32 p, int negative) {
 }
 
 static void pred_write(DirectCtx* c, u32 p, u32 value) {
-    if (p < 7) spv_emit_store(&c->emit, c->pred[p], value);
+    /* a predicate nothing reads has no variable (pred_used): its write is dropped. Storing to it was a store to id 0,
+       SPIR-V that crashed the NVIDIA and AMD drivers when they made the pipeline (the new game's first 3D frame) */
+    if (p < 7 && c->pred[p]) spv_emit_store(&c->emit, c->pred[p], value);
 }
 
 static u32 subgroup_ballot_word(DirectCtx* c, u32 vec4_u32, u32 lane, u32 predicate) {
