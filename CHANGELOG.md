@@ -4,6 +4,20 @@ Fixes and changes per release. Found a problem? Please use the
 [bug report form](../../issues/new?template=bug_report.yml) and attach `Metroid Prime 4 Beyond.log`: it holds the
 timings and errors needed to trace most issues, and one report per problem keeps each one easy to track.
 
+## 2026.11.15
+
+### Native Vulkan: the crash after the opening movie of a new game
+Starting a new game on Native Vulkan ended the game right after the opening movie, at the first 3D scene, on AMD
+and on NVIDIA cards alike. Three of the shaders the game uses there were translated with an instruction that is not
+valid, and the graphics drivers crashed building them. The translation is fixed. This was reproduced and fixed on
+NVIDIA; if you had this crash on AMD, please report whether it is gone. The first start builds its shaders again.
+
+### Languages
+- Brazilian Portuguese is now a language choice ("Portuguese (Brazil), on trial").
+- New "Follow system" choice, the default for a new installation: the game uses your PC's display language, and
+  English when the game has no match. An existing installation keeps its language until you pick "Follow system".
+  If the game's text is missing in your language, choose English and please report it.
+
 ## 2026.11.14
 
 ### AMD Radeon, Native Vulkan: a possible fix for the cutscene crash, and a way to find it if not
