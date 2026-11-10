@@ -71,7 +71,7 @@ int g_opt_diag=0;
 #else
 #define VSYNC_DEFAULT 1
 #endif
-int g_opt_docked=1, g_opt_lang=1, g_opt_res=1, g_opt_fps=1, g_opt_vsync=VSYNC_DEFAULT, g_opt_drs=0;
+int g_opt_docked=1, g_opt_lang=-1 /* -1: the system's (sys_lang) */, g_opt_res=1, g_opt_fps=1, g_opt_vsync=VSYNC_DEFAULT, g_opt_drs=0;
 int g_opt_media_turns=1;   /* serialize_media_threads, read by kernel.c core0_member */
 int g_opt_sleep_waits=1;   /* sleep_waits, read by glq.c */
 int g_opt_hdr=0, g_opt_hdr_paper=200, g_opt_hdr_peak=0;   /* HDR output (native Vulkan): on, SDR white in nits, peak (0 = the display's) */
@@ -257,6 +257,35 @@ void crash_report(void* host_pc, void* fault, int sig){
 }
 
 /* ============================================================ options */
+/* The game language for the PC's own display language (language=auto). English (US) for one the Switch has no code
+   for. Any Portuguese gets Brazilian Portuguese, the one the game has */
+int sys_lang(void){
+  static int got=-1; if(got>=0) return got;
+  char n[32]="";
+#ifdef _WIN32
+  { LANGID id=GetUserDefaultUILanguage(); int p=PRIMARYLANGID(id), s=SUBLANGID(id);
+    snprintf(n,sizeof n,"%s", p==0x11? "ja" : p==0x09? (s==0x01||s==0x04? "en_US" : "en_GB") : p==0x0c? (s==0x03? "fr_CA" : "fr") : p==0x07? "de" :
+      p==0x10? "it" : p==0x0a? (s==0x01||s==0x03? "es_ES" : "es_MX") : p==0x04? (s==0x01||s==0x03||s==0x05||s==0x1f? "zh_TW" : "zh_CN") :
+      p==0x12? "ko" : p==0x13? "nl" : p==0x16? "pt" : p==0x19? "ru" : ""); }
+#else
+  { const char* e=getenv("LC_ALL"); if(!e||!*e) e=getenv("LC_MESSAGES"); if(!e||!*e) e=getenv("LANG"); snprintf(n,sizeof n,"%s",e? e : ""); }
+#endif
+  { int r=1; const char* reg= n[2]=='_'||n[2]=='-'? n+3 : "";
+    if(!strncmp(n,"ja",2)) r=0;
+    else if(!strncmp(n,"en",2)) r= !*reg||!strncmp(reg,"US",2)||!strncmp(reg,"CA",2)? 1 : 12;
+    else if(!strncmp(n,"fr",2)) r= !strncmp(reg,"CA",2)? 13 : 2;
+    else if(!strncmp(n,"de",2)) r=3;
+    else if(!strncmp(n,"it",2)) r=4;
+    else if(!strncmp(n,"es",2)) r= !*reg||!strncmp(reg,"ES",2)? 5 : 14;
+    else if(!strncmp(n,"zh",2)) r= !strncmp(reg,"TW",2)||!strncmp(reg,"HK",2)||!strncmp(reg,"MO",2)||strstr(reg,"Hant")? 11 : 6;
+    else if(!strncmp(n,"ko",2)) r=7;
+    else if(!strncmp(n,"nl",2)) r=8;
+    else if(!strncmp(n,"pt",2)) r=17;
+    else if(!strncmp(n,"ru",2)) r=10;
+    LOG("language: following the system (%s), game language %d\n",*n? n : "unknown",r);
+    return got=r; }
+}
+
 /* legacy (spanish) key names -> current ones */
 static const char* const INI_ALIAS[][2]={
   {"modo_tv","docked"},{"idioma","language"},{"resolucion","resolution"},{"resolucion_dinamica","dynamic_resolution"},
@@ -289,7 +318,7 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"controller_index")){ g_opt_ctrl_index=atoi(v); if(g_opt_ctrl_index<0) g_opt_ctrl_index=0; }
     else if(!strcmp(k,"rumble")){ extern int g_opt_rumble; g_opt_rumble=atoi(v); if(g_opt_rumble<0) g_opt_rumble=0; if(g_opt_rumble>200) g_opt_rumble=200; }   /* svc_hid.c */
     else if(!strcmp(k,"stick_deadzone")){ g_opt_deadzone=atoi(v); if(g_opt_deadzone<0) g_opt_deadzone=0; if(g_opt_deadzone>30000) g_opt_deadzone=30000; }
-    else if(!strcmp(k,"language")) g_opt_lang=atoi(v);
+    else if(!strcmp(k,"language")) g_opt_lang= (*v>='0' && *v<='9')? atoi(v) : -1;   /* auto (or anything not a number): the system's */
     else if(!strcmp(k,"log")) g_verbose=atoi(v);
     else if(!strcmp(k,"diag")) g_opt_diag=atoi(v);
     else if(!strcmp(k,"smooth_recording")) g_opt_rec_smooth=atoi(v);
@@ -362,7 +391,7 @@ typedef struct { const char* title; const IniOpt* o; } IniSec;
 static const IniOpt INI_DISPLAY[]={
   {"docked","1","1 = TV mode (1920x1080 / 1600x900 games), 0 = handheld mode (1280x720)"},
   {"fullscreen","1","1 = start in fullscreen (F11 or Alt+Enter toggles it in game)"},
-  {"language","1","Game language: 0 Japanese, 1 English (US), 2 French, 3 German, 4 Italian, 5 Spanish,\n;   6 Chinese, 7 Korean, 8 Dutch, 10 Russian, 11 Taiwanese, 12 English (UK),\n;   13 French (Canada), 14 Spanish (Latin America)"},
+  {"language","auto","Game language: auto = the PC's display language (English if the game has no match), or 0 Japanese, 1 English (US), 2 French, 3 German, 4 Italian, 5 Spanish,\n;   6 Chinese, 7 Korean, 8 Dutch, 10 Russian, 11 Taiwanese, 12 English (UK),\n;   13 French (Canada), 14 Spanish (Latin America), 17 Portuguese (Brazil, on trial)"},
   {NULL,NULL,NULL}};
 static const IniOpt INI_GRAPHICS[]={
   {"resolution","1","Internal 3D resolution: 1 = native, 2 = double, 0.75 / 0.5 = faster (applies live)"},
