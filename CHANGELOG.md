@@ -4,6 +4,32 @@ Fixes and changes per release. Found a problem? Please use the
 [bug report form](../../issues/new?template=bug_report.yml) and attach `Metroid Prime 4 Beyond.log`: it holds the
 timings and errors needed to trace most issues, and one report per problem keeps each one easy to track.
 
+## 2026.11.16
+
+### Native Vulkan is switched off for now
+2026.11.15 fixed its crash after the opening movie, but the world then renders black with it, on NVIDIA and AMD
+alike: the game's lighting volume is not drawn right yet. Until that is fixed the launcher no longer offers Native
+Vulkan, and a saved choice of it becomes **Vulkan output**, which draws the game correctly. OpenGL is unchanged.
+
+### Title screen music on both sides
+The title music played on one speaker only, with pops on the other, while sound effects were fine. One of the
+music's two halves was being emptied after every piece of sound it was given. Fixed, on every renderer.
+
+### Launcher
+- A new look for the launcher.
+- **Save in use**: other saves to play from, kept apart from your own (for example a fresh game without touching
+  your progress).
+
+### Antivirus warnings
+Windows Defender flagged the 2026.11.15 download for some people (`Trojan:Script/Sabsik.EN.A!ml`, a machine-learning
+guess about a new file, not a match with known malware). [SECURITY.md](SECURITY.md) now explains what that means and
+how to check a release yourself: the checksum, the public build, and a VirusTotal lookup.
+
+### If the game crashes at start on an AMD card (OpenGL or Vulkan output)
+One report shows the crash inside AMD's OpenGL driver while it compiles shaders at startup. Not fixed yet: please try
+`shader_threads=-1` in `Metroid Prime 4 Beyond.ini`, then `prebuild_shaders=0` as well if it still crashes, and
+report which one gets you in.
+
 ## 2026.11.15
 
 ### Native Vulkan: the crash after the opening movie of a new game
