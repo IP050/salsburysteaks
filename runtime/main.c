@@ -369,8 +369,6 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"worker_finish")){ extern int g_opt_worker_finish; g_opt_worker_finish=atoi(v); }   /* gpu_gl.c shader_worker, an experiment, live */
     else if(!strcmp(k,"dbg_patch")){ extern int g_opt_dbg_patch; g_opt_dbg_patch=atoi(v); }   /* gpu_gl.c sh_view, debug views, restart */
     else if(!strcmp(k,"dbg_view")){ extern int g_opt_dbg_view; g_opt_dbg_view=atoi(v); }   /* gpu_gl.c sh_view, debug views, live */
-    else if(!strcmp(k,"aspect")){ extern float g_opt_aspect; int aw=0,ah=0;   /* cheats.c aspect_tick, live */
-      g_opt_aspect= !strcmp(v,"auto")? -1.0f : sscanf(v,"%d:%d",&aw,&ah)==2 && aw>0 && ah>0 && !(aw==16 && ah==9)? (float)aw/(float)ah : 0.0f; }
     else if(!strcmp(k,"fov")){ extern int g_opt_fov; g_opt_fov=atoi(v); if(g_opt_fov<60) g_opt_fov=60; if(g_opt_fov>160) g_opt_fov=160; }   /* cheats.c FOV hook, live */
     else if(!strcmp(k,"anisotropy")){ g_opt_aniso=atoi(v); if(g_opt_aniso<0) g_opt_aniso=0; if(g_opt_aniso>16) g_opt_aniso=16; }
     else if(!strcmp(k,"dlss")){ extern int snxvk_dlss_mode; snxvk_dlss_mode=atoi(v); }   /* native Vulkan: snxvk dlss.c; OpenGL: dlss_gl.c + gpu_gl.c dlg_* */
@@ -441,7 +439,6 @@ static const IniOpt INI_PERF[]={
   {"cheat_one_hit","0","1 = cheat: One-hit kills, bosses too (a hook of the GBAtemp code for this game build)"},
   {"cheat_two_hit","0","1 = cheat: Two-hit kills, not bosses (a hook of the GBAtemp code for this game build)"},
   {"green_energy_10x","0","1 = Green Energy awards are worth 10 times as much (after the mod by melos444)"},
-  {"aspect","16:9","Picture shape: 16:9 (the game's own), 21:9, 32:9, 16:10, any W:H, or auto = the window's shape.\n;   Wider shapes show more to the sides; the HUD and menus are stretched with the picture for now. Applies live"},
   {"fov","100","Field of view in percent of the game's own (60-160, applies live). Needs a FOV hook for this game\n;   build (beyond/fov_hooks.txt)"},
   {"fps_limit","1","1 = 60 FPS (the speed of a Switch), 0 = unlimited (the game runs faster). Other values are treated as 60: the game advances one step per image, so 30 meant half speed and 144 2.4 times the speed. F4 changes it in game"},
   {"video_async_retire","0","1 = retire obsolete video pictures on a bounded worker (experimental; restart required)"},

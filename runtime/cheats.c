@@ -244,29 +244,6 @@ static void fov_load(void){
   if(g_fov.have) LOG("fov: hook for build %s from %s\n",g_bid,g_fov_path);
   else LOG("fov: no FOV hook for build %s yet (beyond/fov_hooks.txt): the FOV setting has no effect\n",g_bid); }
 
-/* ------------------------------------------------------------------ aspect ratio (ultrawide)
-   [Display] aspect: the game's own 16:9 constant (one float in main's read-only data, per build) is replaced with
-   the ratio asked for, so its cameras draw a wider view into the same 16:9 picture, and the window pass then shows
-   that picture at the wider shape (gpu_gl.c screen_quad, through aspect_stretch). Without a known place for the
-   build nothing changes and the picture stays 16:9. g_opt_aspect: 0 = 16:9, -1 = the window's shape, else w/h */
-float g_opt_aspect=0;
-static float g_aspect_now=1;   /* what the picture is widened by on screen: the ratio in force / (16/9) */
-float aspect_stretch(void){ return g_aspect_now; }
-static void aspect_tick(void){
-  static const struct { const char* bid; u64 off; } known[]={ {"8275FBE1EC5191C2",0x13d5730} };
-  static int said; u64 off=0; int have=0;
-  for(u32 k=0;k<sizeof known/sizeof known[0];k++) if(!strcmp(g_bid,known[k].bid)){ off=known[k].off; have=1; }
-  float want=g_opt_aspect;
-  if(want<0){ extern void backend_window_size(int*,int*); int w=0,h=0; backend_window_size(&w,&h); want= w>0&&h>0? (float)w/(float)h : 0; }
-  if(want<=0) want=16.0f/9.0f;
-  if(want<1.25f) want=1.25f; if(want>4.0f) want=4.0f;
-  if(!have){ if(!said && g_opt_aspect!=0){ said=1; LOG("aspect: no known place for build %s: the picture stays 16:9\n",g_bid); } g_aspect_now=1; return; }
-  u64 cur=0; if(!rd(g_main_base+off,4,&cur)) return;
-  float f; u32 c32=(u32)cur; memcpy(&f,&c32,4);
-  if(f<1.2f || f>4.1f){ if(!said){ said=1; LOG("aspect: the value at main+%llx is %g, not an aspect ratio: left alone\n",(unsigned long long)off,f); } g_aspect_now=1; return; }
-  if(f!=want){ u32 o32; memcpy(&o32,&want,4); wr(g_main_base+off,4,o32); LOG("aspect: %g (was %g)\n",want,f); }
-  g_aspect_now=want/(16.0f/9.0f); }
-
 int fov_available(void){ lock(); ids(); if(!g_fov_loaded) fov_load(); int r=g_fov.have; unlock(); return r; }
 
 static void fov_tick(void){
@@ -291,7 +268,6 @@ void cheats_tick(void){
     if(g_pl_base && !pl_valid(g_pl_base)){ g_pl_base=0; LOG("cheats: player table gone, looking again\n"); }   /* a level load can move it */
     for(u32 i=0;i<g_nch;i++) if(g_ch[i].on && g_ch[i].n){ memset(g_reg,0,sizeof g_reg); run(g_words+g_ch[i].off,g_ch[i].n); } }
   fov_tick();
-  aspect_tick();
   unlock(); }
 
 int cheats_count(void){ lock(); ids(); if(!g_mt_txt && !g_nch) load(); int n=(int)g_nch; unlock(); return n; }
