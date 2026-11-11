@@ -116,7 +116,7 @@ void opt_row(const char* key) {
 void tab_content(int t) {
     switch (t) {
     case 0: section("PICTURE"); opt_row("resolution"); opt_row("fullscreen"); opt_row("dynamic_resolution"); if (val("dynamic_resolution") == "1") opt_row("dynamic_resolution_min");
-            opt_row("game_dynamic_resolution"); section("CONSOLE"); opt_row("docked"); opt_row("language"); break;
+            opt_row("game_dynamic_resolution"); section("CONSOLE"); opt_row("docked"); opt_row("aspect"); opt_row("language"); break;
     case 1: section("UPSCALING"); opt_row("resolution"); opt_row("upscaler"); if (val("upscaler") == "fsr") opt_row("fsr_sharpness");
             section("QUALITY"); opt_row("antialiasing"); opt_row("sharpening"); opt_row("shadows"); opt_row("anisotropy"); section("RENDERER"); opt_row("renderer"); opt_row("hdr"); break;
     case 2: section("FRAME RATE"); opt_row("fps_limit"); opt_row("forced_vsync"); opt_row("show_fps");

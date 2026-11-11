@@ -526,6 +526,7 @@ static void page_display() {
     section("WINDOW");
     bool fs = getb("fullscreen");
     if (draw_opt("fullscreen")) backend_fe_fullscreen(getb("fullscreen") ? 1 : 0); (void)fs;
+    section("PICTURE SHAPE"); draw_opt("aspect", get("aspect") != "16:9" ? "ON TRIAL" : nullptr);
     section("LANGUAGE"); draw_opt("language");
 }
 

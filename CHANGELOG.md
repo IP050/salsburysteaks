@@ -4,6 +4,14 @@ Fixes and changes per release. Found a problem? Please use the
 [bug report form](../../issues/new?template=bug_report.yml) and attach `Metroid Prime 4 Beyond.log`: it holds the
 timings and errors needed to trace most issues, and one report per problem keeps each one easy to track.
 
+## 2026.11.17
+
+### Ultrawide: Picture shape (on trial)
+New setting under **Display > Picture shape** in the launcher and the in-game menu: 16:9 (the game's own), 21:9,
+32:9, 16:10, or **Fill the window**. Wider shapes show more of the world to the sides instead of black bars. It
+applies while playing. The HUD and menus are stretched along with the picture for now; keeping them at their own
+shape is the next step. For the v1.1.0 update of the game only: other versions stay 16:9.
+
 ## 2026.11.16
 
 ### Native Vulkan is switched off for now

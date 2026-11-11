@@ -3844,7 +3844,8 @@ static void rec_capture(GLuint tex, const float* xf, int tw, int th){
   g_rec_last=now;
   rec_drain(0);
   u32 i=g_rec_k%REC_N; if(g_rec_sync[i]){ if(!g_vt_on) return; rec_drain(1); }   /* smooth mode never drops */
-  int dw=g_rec_w, dh=g_rec_w*th/(tw?tw:1); if(dh>g_rec_h){ dh=g_rec_h; dw=g_rec_h*tw/(th?th:1); } dw&=~1; dh&=~1;
+  extern float aspect_stretch(void); int fw=(int)((float)tw*aspect_stretch()+0.5f); if(fw<1) fw=1;   /* as screen_quad */
+  int dw=g_rec_w, dh=g_rec_w*th/fw; if(dh>g_rec_h){ dh=g_rec_h; dw=g_rec_h*fw/(th?th:1); } dw&=~1; dh&=~1;
   int ox=((g_rec_w-dw)/2)&~1, oy=((g_rec_h-dh)/2)&~1;
   glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_FRAMEBUFFER_SRGB);
   glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,tex); glBindSampler(0,0);
@@ -4014,7 +4015,9 @@ static void screen_quad(GLuint tex, const float* xf, int tw, int th){
   glBindTexture(GL_TEXTURE_2D,tex); glTexParameteri(GL_TEXTURE_2D,0x8A48,0x8A4A);   /* TEXTURE_SRGB_DECODE = SKIP_DECODE */
   glColorMaski(0,1,1,1,1);
   glViewport(0,0,ww,wh); glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
-  int dw=ww, dh=ww*th/(tw?tw:1); if(dh>wh){ dh=wh; dw=wh*tw/(th?th:1); }
+  /* the picture's shape on screen: its own, or wider when the game draws a wider view into it ([Display] aspect) */
+  extern float aspect_stretch(void); int fw=(int)((float)tw*aspect_stretch()+0.5f); if(fw<1) fw=1;
+  int dw=ww, dh=ww*th/fw; if(dh>wh){ dh=wh; dw=wh*fw/(th?th:1); }
   glViewport((ww-dw)/2,(wh-dh)/2,dw,dh);
   glUseProgram(g_down_prog? g_down_prog : g_blit_prog); g_pipe_on=0; glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,tex); glBindSampler(0,0);
   glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
