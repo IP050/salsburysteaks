@@ -422,12 +422,14 @@ static u32* sh_spirv(VkSh* s, const u8* code, u64 h, int stage, const u32 mask[2
             image_slots = g_vk.props.limits.maxDescriptorSetStorageImages;
         int needs_unformatted = 0;
         for (int i = 0; i < s->si.nimg; i++) needs_unformatted |= s->si.img[i].kind == 0;
-        if (stage != ST_FS || (u32)s->si.nimg > image_slots ||
+        if ((stage != ST_FS && stage != ST_VS) || (u32)s->si.nimg > image_slots ||
+            (stage == ST_VS && !g_vk.feat.vertexPipelineStoresAndAtomics) ||
+            (stage == ST_FS && !g_vk.feat.fragmentStoresAndAtomics) ||
             (needs_unformatted && !g_vk.feat.shaderStorageImageWriteWithoutFormat)) {
             free(spv);
             spv = NULL;
             snprintf(s->si.first_unsupported, sizeof s->si.first_unsupported,
-                     "fragment storage image feature or descriptor limit");
+                     "draw storage image feature or descriptor limit");
         }
     }
     return spv;

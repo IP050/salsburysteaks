@@ -1065,11 +1065,33 @@ static int direct_track_const(const u64* insn, u32 n, u32 index, u32 reg, u32* v
     return 0;
 }
 
-/* Resolve a register supplied image handle to the constant buffer word read in this basic block. */
+/* The one instruction in the whole program that writes reg, when there is exactly one, it writes only reg and has no
+   condition: -1 otherwise. Such a write reaches every later read of reg whatever the control flow between them (a
+   handle loaded at the top of a program and used inside its loops, as Metroid Prime 4's volume-filling vertex program
+   does 417 instructions later) */
+static int direct_single_def(const u64* insn, u32 n, u32 index, u32 reg) {
+    int found = -1;
+    u32 k;
+    if (reg == 255) return -1;
+    for (k = 11; k < n; k++) {
+        const Op* op;
+        if (!IDX_OK(k)) continue;
+        op = decode(insn[k]);
+        if (!op) return -1;
+        if (!shader_writes_reg(insn[k], op->id, reg)) continue;
+        if (found >= 0 || B(insn[k], 0, 8) != reg || B(insn[k], 16, 4) != 7 || k >= index) return -1;
+        found = (int)k;
+    }
+    return found;
+}
+
+/* Resolve a register supplied image handle to the constant buffer word read in this basic block, or by the
+   register's only write in the program (direct_single_def). */
 static int direct_track_image_handle(const u64* insn, u32 n, u32 index, u32 reg, u32* bank, u32* off, int depth) {
     int j = depth > 6 ? -1 : direct_reaching_def(insn, n, index, reg);
     u64 w;
     int op;
+    if (j < 0 && depth <= 6) j = direct_single_def(insn, n, index, reg);
     if (j < 0) return 0;
     w = insn[j];
     op = decode(w)->id;
@@ -1534,8 +1556,10 @@ static int supported(u64 w, int op) {
         case O_SULD:
             return (B(w, 33, 3) == 3 && (!B(w, 52, 1) || B(w, 20, 4) == 4)) ||
                    (B(w, 33, 3) == 1 && B(w, 52, 1) && B(w, 20, 4) == 4);
-        /* stores and atomics also reach 2D array surfaces (4), the layer in the coordinates' third register */
-        case O_SUST: return !B(w, 52, 1) && (B(w, 33, 3) == 3 || B(w, 33, 3) == 4 || B(w, 33, 3) == 1);
+        /* stores and atomics also reach 2D array surfaces (4), the layer in the coordinates' third register; stores
+           reach 3D surfaces (5) too, their depth in that register */
+        case O_SUST:
+            return !B(w, 52, 1) && (B(w, 33, 3) == 3 || B(w, 33, 3) == 4 || B(w, 33, 3) == 1 || B(w, 33, 3) == 5);
         /* 32-bit atomics other than INC and DEC, which wrap at the operand. Bindless is bit 54 here. */
         case O_SUATOM:
             return (B(w, 33, 3) == 3 || B(w, 33, 3) == 4 || B(w, 33, 3) == 1) &&
@@ -2618,16 +2642,37 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
             if (buffer && stage != ST_CS) return direct_reject(si, "buffer surface outside compute");
             /* a fragment program's 2D loads are texel fetches, as a compute program's are: render.c binds the raw
                view their slot asks for */
-            if (stage != ST_CS && stage != ST_FS) return direct_reject(si, "surface operation outside supported stage");
+            /* a vertex program's stores too (Metroid Prime 4 fills a 3D volume from one, once a frame) */
+            if (stage != ST_CS && stage != ST_FS && !(stage == ST_VS && op->id == O_SUST))
+                return direct_reject(si, "surface operation outside supported stage");
+            if (dim == 5 && op->id != O_SUST) return direct_reject(si, "3D surface load or atomic");
             bank = 0;
             off = B(insn[i], 36, 13);
             handle = B(insn[i], 39, 8);
             bindless = op->id == O_SUATOM ? (int)B(insn[i], 54, 1) : !B(insn[i], 51, 1);
-            if (bindless && !direct_track_image_handle(insn, n, i, handle, &bank, &off, 0))
-                return direct_reject(si, "untracked surface handle");
+            if (bindless && !direct_track_image_handle(insn, n, i, handle, &bank, &off, 0)) {
+                /* the log names what last wrote the handle's register, and how far back */
+                u32 q = i;
+                u64 writer = 0;
+                int def = direct_reaching_def(insn, n, i, handle);
+                while (q-- > 11) {
+                    const Op* wo;
+                    if (!IDX_OK(q)) continue;
+                    wo = decode(insn[q]);
+                    if (wo && shader_writes_reg(insn[q], wo->id, handle)) {
+                        writer = insn[q];
+                        break;
+                    }
+                }
+                direct_reject(si, "untracked surface handle");
+                snprintf(si->first_unsupported, sizeof si->first_unsupported,
+                         "untracked surface handle r%u: %016llx at -%u, def %d, of %016llx", handle,
+                         (unsigned long long)writer, i - q, def, (unsigned long long)insn[i]);
+                return NULL;
+            }
             if (a < 255) used[a] = 1;
             if (!buffer && a + 1 < 255) used[a + 1] = 1;
-            if (dim == 4 && a + 2 < 255) used[a + 2] = 1;
+            if ((dim == 4 || dim == 5) && a + 2 < 255) used[a + 2] = 1;
             if (bindless && handle < 255) used[handle] = 1;
             int raw = op->id == O_SULD && B(insn[i], 52, 1);
             u32 mask = raw ? 1u : B(insn[i], 20, 4), target = d;
@@ -3540,7 +3585,8 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
         int integer = image_info.img[i].kind != 0, buffer = image_info.img[i].type == 1;
         c->image[i] = spv_emit_storage_image(
             &c->emit, integer ? c->u32_type : c->f32_type, shader_vk_set(stage),
-            (buffer ? SNX_VKB_IMGBUF : SNX_VKB_IMG) + (u32)i, buffer ? 5 : 1, image_info.img[i].type == 4,
+            (buffer ? SNX_VKB_IMGBUF : SNX_VKB_IMG) + (u32)i, buffer ? 5 : image_info.img[i].type == 5 ? 2 : 1,
+            image_info.img[i].type == 4,
             integer && (!buffer || image_info.img[i].kind == 1) ? 33 : 0, &c->image_type[i]);
         interfaces[count++] = c->image[i];
     }
@@ -6109,7 +6155,9 @@ static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, 
                 u32 y = spv_emit_bitcast(&c->emit, i32_type, reg_read(c, a + 1));
                 /* a 2D array's layer is the low 16 bits of the third register, as TLD's is (Eden's MakeCoords in
                    surface_load_store.cpp reads it the same way) */
-                coord = dim == 4 ? spv_emit_vec3_construct(
+                coord = dim == 5 ? spv_emit_vec3_construct(&c->emit, vec3_i32, x, y,
+                                                           spv_emit_bitcast(&c->emit, i32_type, reg_read(c, a + 2)))
+                        : dim == 4 ? spv_emit_vec3_construct(
                                        &c->emit, vec3_i32, x, y,
                                        spv_emit_bitcast(&c->emit, i32_type,
                                                         spv_emit_bitwise_and_u32(

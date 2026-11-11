@@ -364,6 +364,7 @@ typedef struct Surf {
     u64 rt_size;           /* a render target's guest bytes, all layers (its shape is fixed when it is made) */
     int is_rt;
     int storage_capable;  /* image was created with VK_IMAGE_USAGE_STORAGE_BIT */
+    int gpu_volume;       /* a 3D texture a draw's program stores into: its texels are the GPU's, not memory's */
     int volume;           /* render target layers use 3D block-linear memory rather than array strides */
     VkImageViewType type; /* what it was created as */
     VkImage img;

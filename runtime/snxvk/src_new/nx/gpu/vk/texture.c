@@ -340,6 +340,12 @@ void vk_tex_stats(u64* uploads, u64* bytes) {
 /* 1 when every subresource was copied; 0 when memory or staging ran out, and upload_valid keeps it for a retry */
 static int tex_upload(Surf* t) {
     const VkFmt* f = &t->f;
+    /* a volume a draw's program fills keeps its texels: memory has none of them (no write-back), and an upload
+       would put memory's stale ones over the GPU's */
+    if (t->gpu_volume && t->upload_valid) {
+        LOG_LIMIT(4, "vulkan: 3D texture %p stored to by a draw: an upload from memory left out\n", (void*)t);
+        return 1;
+    }
     g_tex_uploads++;
     g_tex_upload_bytes += t->size;
     t->upload_valid = 0;
