@@ -365,6 +365,10 @@ bool make_report(const std::string& info, std::string* out, std::string* err) {
 }
 
 // ---------------------------------------------------------------- mods
+std::vector<std::string> list_dirs(const std::string& d) {
+    std::vector<std::string> out;
+    if (DIR* dd = opendir(d.c_str())) { while (dirent* e = readdir(dd)) { std::string n = e->d_name; if (n != "." && n != ".." && dir_exists(join(d, n))) out.push_back(n); } closedir(dd); }
+    std::sort(out.begin(), out.end()); return out; }
 std::string mods_dir() { return join(P.data, "mods"); }
 std::vector<Mod> mods_list() {
     std::vector<Mod> out; std::string d = mods_dir(); if (!dir_exists(d)) return out;

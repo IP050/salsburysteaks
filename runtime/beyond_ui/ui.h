@@ -91,6 +91,7 @@ bool big_button(const char* id, const char* label, ImVec2 size, bool primary = t
 void chamfer_rect(ImDrawList* dl, ImVec2 a, ImVec2 b, float cut, ImU32 fill, ImU32 border, float thick = 1.0f);
 void background(ImDrawList* dl, ImVec2 a, ImVec2 b, float t, bool translucent);
 void logo(ImDrawList* dl, ImVec2 pos, float size, bool with_tag);
+void artifact(ImDrawList* dl, ImVec2 c, float r, float t, float speed = 1.0f);   // the turning crystal with its rings (our own drawing)
 void progress_bar(float frac, ImVec2 size, const char* text);
 
 // helpers

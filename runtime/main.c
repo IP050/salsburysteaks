@@ -11,6 +11,7 @@ const SwrModule* g_mod;
 GuestFn* g_disp;
 GuestFn swr_interp_entry;
 char g_datadir[1024], g_exename[256], g_exedir[1024];
+char g_opt_save_set[64];   /* ini save_set: svc_fs.c */
 volatile int g_quit;
 int g_frames;
 int g_opt_video_async_retire=0,g_opt_video_avx2=1,g_opt_video_block_copy=1;   /* both checked byte for byte against the plain versions */
@@ -256,7 +257,6 @@ void crash_report(void* host_pc, void* fault, int sig){
   fatal("The game crashed (invalid memory access). See the .log.");
 }
 
-/* ============================================================ options */
 /* The game language for the PC's own display language (language=auto). English (US) for one the Switch has no code
    for. Any Portuguese gets Brazilian Portuguese, the one the game has */
 int sys_lang(void){
@@ -286,6 +286,7 @@ int sys_lang(void){
     return got=r; }
 }
 
+/* ============================================================ options */
 /* legacy (spanish) key names -> current ones */
 static const char* const INI_ALIAS[][2]={
   {"modo_tv","docked"},{"idioma","language"},{"resolucion","resolution"},{"resolucion_dinamica","dynamic_resolution"},
@@ -331,6 +332,8 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"audio_surround_downmix")) g_opt_audio_surround_downmix=atoi(v)!=0;
     else if(!strcmp(k,"resolution")){ g_opt_resf=(float)atof(v); if(g_opt_resf<0.25f) g_opt_resf=0.25f; if(g_opt_resf>4) g_opt_resf=4; }
     else if(!strcmp(k,"shadows")) g_opt_shadows=atoi(v);
+    else if(!strcmp(k,"save_set")){   /* a folder name only: nothing that leaves save/sets */
+      if(strlen(v)<sizeof g_opt_save_set && !strpbrk(v,"/\\:*?\"<>|") && !strstr(v,"..")) strcpy(g_opt_save_set,v); else g_opt_save_set[0]=0; }
     else if(!strcmp(k,"profile")) g_opt_prof=atoi(v);
     else if(!strcmp(k,"low_priority_shader_compiler")) g_opt_cmp_low=atoi(v);
 #if !defined(__ANDROID__)
@@ -409,7 +412,8 @@ static const IniOpt INI_GRAPHICS[]={
   {"hdr_peak","0","HDR output: brightest highlight in nits; 0 = what the display reports"},
   {"prebuild_shaders","1","1 = build every shader before the game draws with it: the shaders it ships in romfs/system/shd, and the ones\n;   it unpacks into GPU memory (Metroid Prime 4 at boot), compiled in the background and kept ready. 0 = at first use"},
   {"shadows","1","0 = disable shadow maps (more FPS)"},
-  {"renderer","opengl","opengl, or vulkan = the game still renders with OpenGL but Vulkan puts the frames on screen\n;   (falls back to OpenGL output if the GPU driver can't share images between the two; restart required),\n;   or vulkan_native = EXPERIMENTAL native Vulkan renderer from ScarletNX (GPL-3.0; falls back to OpenGL if it can't start)"},
+  {"save_set","","Save in use: empty = your own game, or the name of a folder in <game>_data/save/sets (the launcher's\n;   \"Save in use\" choice): another save to play from, kept apart from your own"},
+  {"renderer","opengl","opengl, or vulkan = the game still renders with OpenGL but Vulkan puts the frames on screen\n;   (falls back to OpenGL output if the GPU driver can't share images between the two; restart required).\n;   vulkan_native (the experimental native Vulkan renderer) is switched off in this version: it is read as vulkan"},
 #ifdef SWR_HAVE_DLSS   /* the public release: no DLSS (GPL); build.bat dlss makes a personal build with it */
   {"dlss","0","1 = NVIDIA DLAA anti-aliasing (renderer=opengl or vulkan_native, RTX GPU, nvngx_dlss.dll in the game folder):\n;   DLSS at the internal resolution with the game's own motion vectors; the HUD is untouched. 0 = off"},
 #endif

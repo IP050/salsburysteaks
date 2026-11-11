@@ -423,6 +423,12 @@ static int fsp_disp(SvcObj* o, IpcCtx* c){
       /* System 0, Account 1, Bcat 2, Device 3, Temporary 4, Cache 5, SystemBcat 6 */
       const char* kind= type==1? "user" : (type==2||type==6)? "bcat" : type==3? "device" : type==5? "cache" : type==0? "system" : "temp";
       snprintf(p,sizeof p,"%ssave/%s",g_datadir,kind);
+      /* ini save_set=NAME: the account save of another set, save/sets/NAME/user (the launcher's "Save in use"):
+         a finished game to walk anywhere in, or a spot kept to come back to. The player's own game stays in save/user */
+      { extern char g_opt_save_set[64];
+        if(type==1 && g_opt_save_set[0]){ char s[1200]; snprintf(s,sizeof s,"%ssave/sets/%s/user",g_datadir,g_opt_save_set);
+          if(plat_is_dir(s)){ LOG("fs: save set \"%s\" in use (%s)\n",g_opt_save_set,s); out_obj(c,hostfs_new(s)); return 0; }
+          WARN("fs: save set \"%s\" has no folder %s: using the main save\n",g_opt_save_set,s); } }
       /* older builds read the type from the wrong offset and kept every save in save/system:
          the first time an account or device save is opened, start it from a copy of that folder */
       if((type==1 || type==3) && !plat_is_dir(p)){ char old[1200]; snprintf(old,sizeof old,"%ssave/system",g_datadir);

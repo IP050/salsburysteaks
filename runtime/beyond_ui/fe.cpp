@@ -386,20 +386,77 @@ static void report_problem() {
     flash("Logs packed: " + zip + ". Drag it into the bug report.");
 }
 
+// how fast the artifact turns: quicker while the launcher is compiling or downloading
+static float art_speed() { UpStage s = update_state().stage; return g_job.running || s == UP_DOWNLOADING || s == UP_CHECKING ? 3.2f : 1.0f; }
+
 static void page_play() {
     ImDrawList* dl = ImGui::GetWindowDrawList(); ImVec2 p = ImGui::GetCursorScreenPos();
-    logo(dl, {p.x, p.y + S(10)}, S(70), true);
-    ImGui::Dummy({1, S(250)});
+    float t = (float)ImGui::GetTime(), fsz = ImGui::GetFontSize(); ImFont* font = ImGui::GetFont();
     GameCheck g = check_installed();
     bool ready = g.code_ok && g.data_ok;
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ready ? C_OK : C_WARN));
-    ImGui::TextUnformatted(ready ? "READY" : g.summary.c_str()); ImGui::PopStyleColor();
-    ImGui::Dummy({1, S(8)});
-    if (big_button("##play", "PLAY", {S(420), S(86)})) {
+    // save sets: other saves to play from (ini save_set, svc_fs.c), each a folder in save/sets with its own user/save.bin
+    bool have = dir_exists(join(P.data, "save"));
+    std::string sets_dir = join(join(P.data, "save"), "sets");
+    static std::vector<std::string> sets; static std::vector<long long> set_bytes; static long long own_bytes; static int listed = -1000;
+    if (g_frame_no - listed > 120 || g_frame_no < listed) { sets = list_dirs(sets_dir); listed = g_frame_no; set_bytes.clear();
+        for (auto& s : sets) set_bytes.push_back(file_size(join(join(join(sets_dir, s), "user"), "save.bin")));
+        own_bytes = file_size(join(join(join(P.data, "save"), "user"), "save.bin")); }
+    std::vector<std::string> items = {"My game"}; std::string cur = get("save_set"); int idx = 0;
+    for (size_t i = 0; i < sets.size(); i++) { items.push_back(sets[i]); if (sets[i] == cur) idx = (int)i + 1; }
+    if (!cur.empty() && !idx) set("save_set", "");   // its folder is gone
+    // the hero panel: the logo, the state, PLAY, and the artifact turning on the right
+    float W = ImGui::GetContentRegionAvail().x, hh = S(336); ImVec2 hb(p.x + W, p.y + hh);
+    chamfer_rect(dl, p, hb, S(26), IM_COL32(7, 12, 24, 205), C_LINE, 1);
+    dl->PushClipRect(p, hb, true);
+    dl->AddRectFilledMultiColor({p.x + W * 0.35f, p.y + 1}, {hb.x - 1, hb.y - S(26)}, IM_COL32(150, 112, 255, 0), IM_COL32(150, 112, 255, 34), IM_COL32(64, 214, 255, 22), IM_COL32(64, 214, 255, 0));
+    artifact(dl, {hb.x - std::min(W * 0.26f, hh * 0.78f), p.y + hh * 0.50f}, hh * 0.30f, t, art_speed());
+    dl->PopClipRect();
+    dl->AddLine({p.x + S(26), p.y}, {p.x + S(150), p.y}, C_CYAN, S(2)); dl->AddLine({hb.x - S(150), hb.y}, {hb.x - S(26), hb.y}, C_RED, S(2));   // accents on the cut corners
+    logo(dl, {p.x + S(36), p.y + S(30)}, S(56), true);
+    { float sy = p.y + S(190), sx = p.x + S(38); ImU32 sc = ready ? C_OK : C_WARN; float pu = 0.5f + 0.5f * sinf(t * 3.0f);
+      dl->AddCircleFilled({sx + S(6), sy + fsz * 0.5f}, S(9), (sc & ~IM_COL32_A_MASK) | ((ImU32)(30 + 50 * pu) << IM_COL32_A_SHIFT)); dl->AddCircleFilled({sx + S(6), sy + fsz * 0.5f}, S(4.5f), sc);
+      const char* st = ready ? "READY" : g.summary.c_str(); dl->AddText({sx + S(22), sy}, sc, st);
+      if (ready) { float x = sx + S(22) + ImGui::CalcTextSize(st).x + S(18); dl->AddText({x, sy}, C_DIM, "Save in use:"); dl->AddText({x + ImGui::CalcTextSize("Save in use: ").x, sy}, idx ? C_RED_HI : C_TEXT, items[idx].c_str()); } }
+    ImGui::SetCursorScreenPos({p.x + S(36), hb.y - S(86) - S(28)});
+    if (big_button("##play", "PLAY", {S(400), S(86)})) {
         UpStage us = update_state().stage;
         if (g_auto_installing && (us == UP_AVAILABLE || us == UP_DOWNLOADING)) flash("Installing the new version first: PLAY again when it's done.");
         else if (ready) g_play = true; else go(PG_SETUP); }
-    ImGui::Dummy({1, S(14)});
+    ImGui::SetCursorScreenPos({p.x, hb.y}); ImGui::Dummy({1, S(16)});
+    // the saves as cards: your own game, each set, and a card that keeps the save in use as a new set
+    {
+        int n = (int)items.size() + (have ? 1 : 0); const int per = 4; float gap = S(12), cw = (W - gap * (per - 1)) / per, ch = S(104);
+        for (int i = 0; i < n; i++) {
+            if (i % per) ImGui::SameLine(0, gap);
+            bool keep = i == (int)items.size(), sel = !keep && i == idx;
+            ImVec2 q = ImGui::GetCursorScreenPos(), qb(q.x + cw, q.y + ch);
+            bool c = ImGui::InvisibleButton(fmt("##sv%d", i).c_str(), {cw, ch}); nav_item(); bool f = ImGui::IsItemFocused(), h = ImGui::IsItemHovered();
+            chamfer_rect(dl, q, qb, S(12), sel ? IM_COL32(150, 112, 255, f || h ? 64 : 44) : (f || h ? C_PANEL_HI : keep ? IM_COL32(9, 15, 27, 110) : C_PANEL), f ? C_CYAN : sel ? C_RED : C_LINE, f || sel ? S(2) : 1);
+            dl->PushClipRect(q, {qb.x - S(10), qb.y}, true);
+            if (keep) {
+                float cx = q.x + S(30), cy = q.y + ch / 2; dl->AddCircle({cx, cy}, S(13), f || h ? C_CYAN : C_DIM, 24, S(1.5f));
+                dl->AddLine({cx - S(6), cy}, {cx + S(6), cy}, f || h ? C_CYAN : C_DIM, S(2)); dl->AddLine({cx, cy - S(6)}, {cx, cy + S(6)}, f || h ? C_CYAN : C_DIM, S(2));
+                dl->AddText(font, fsz, {q.x + S(54), cy - fsz * 1.0f}, f || h ? C_TEXT : C_DIM, "Keep this spot");
+                dl->AddText(font, fsz * 0.7f, {q.x + S(54), cy + fsz * 0.15f}, C_DIM, "Copy the save in use to a new set");
+            } else {
+                dl->AddText(font, fsz * 0.68f, {q.x + S(16), q.y + S(12)}, sel ? C_RED_HI : C_DIM, i ? "SAVE SET" : "YOUR SAVE");
+                dl->AddText(font, fsz * 1.08f, {q.x + S(16), q.y + S(36)}, C_TEXT, items[i].c_str());
+                long long by = i ? set_bytes[i - 1] : own_bytes;
+                dl->AddText(font, fsz * 0.7f, {q.x + S(16), qb.y - S(28)}, C_DIM, by > 0 ? fmt("%.0f KB", by / 1024.0).c_str() : (i ? "No save file inside" : "No save yet"));
+            }
+            dl->PopClipRect();
+            if (sel) { const char* b = "IN USE"; ImVec2 ts = font->CalcTextSizeA(fsz * 0.66f, FLT_MAX, 0, b); ImVec2 ba(qb.x - ts.x - S(30), qb.y - S(30));
+                chamfer_rect(dl, ba, {qb.x - S(14), qb.y - S(10)}, S(5), C_RED, 0); dl->AddText(font, fsz * 0.66f, {ba.x + S(8), ba.y + (S(20) - ts.y) / 2}, IM_COL32(10, 8, 30, 255), b); }
+            if (c || (f && g_row.confirm)) {
+                if (!keep) set("save_set", i ? items[i] : "");
+                else { std::string src = idx ? join(join(sets_dir, items[idx]), "user") : join(join(P.data, "save"), "user");
+                    std::string name = "Kept " + now_stamp(), e;
+                    if (copy_tree(src, join(join(sets_dir, name), "user"), &e, false)) { flash("Kept as \"" + name + "\". Rename its folder to name the spot."); listed = -1000; }
+                    else flash("Could not keep it: " + e); }
+            }
+        }
+        ImGui::Dummy({1, S(4)});
+    }
 #ifdef _WIN32
     { UpStage st = update_state().stage; if (st == UP_AVAILABLE || st == UP_DOWNLOADING || st == UP_REBUILD || (st == UP_INSTALLED && update_state().restart)) { update_rows(true); ImGui::Dummy({1, S(10)}); } }
 #endif
@@ -431,8 +488,8 @@ static void page_play() {
     }
     controller_status_card();
     section("SAVES");
-    bool have = dir_exists(join(P.data, "save"));
     row_text("Save data", have ? "Every slot is backed up together. Close the game first." : "No saves yet.");
+    help_text("The cards at the top pick the save to play from. A set is another save, kept apart from your own game: a finished game, or a spot to come back to. Sets are folders in save\\sets. Close the game before changing it.");
     if (row_button("##bk", "Back up saves now", "BACK UP")) { std::string z, e; if (backup_saves(&z, &e)) flash("Saves backed up: " + z); else flash("Backup failed: " + e); }
     if (row_button("##ob", "Open backups folder", "OPEN")) { make_dirs(backups_dir()); open_in_explorer(backups_dir()); }
     if (row_button("##os", "Open saves folder", "OPEN")) { if (have) open_in_explorer(join(P.data, "save")); else flash("No saves yet."); }
@@ -564,7 +621,7 @@ static void page_controls() {
           dl->AddText({b0.x + S(2), q.y + h - S(30)}, C_DIM, i ? "ZR" : "ZL"); }
       PromptStyle st = prompt_resolve(g_prompts, s.name.c_str()); float x = q.x + S(450), y = q.y + S(36);
       for (int b : {0, 1, 2, 3, 6, 7, 4, 5, 10, 11, 12, 13, 14, 15}) { bool on = (s.phys >> b) & 1;
-          if (on) dl->AddCircleFilled({x, y}, S(19), IM_COL32(226, 30, 44, 120));
+          if (on) dl->AddCircleFilled({x, y}, S(19), IM_COL32(150, 112, 255, 120));
           draw_prompt(dl, {x, y}, S(15), b, st); x += S(50); if (x > q.x + w - S(40)) { x = q.x + S(450); y += S(50); } }
       if (s.phys >> 30 & 1) dl->AddText({q.x + S(450), q.y + h - S(30)}, C_CYAN, "HOME / GUIDE pressed");
     }
@@ -712,14 +769,22 @@ static void sidebar(ImVec2 a, ImVec2 b) {
         ImVec2 r0(a.x, y), r1(b.x, y + S(52));
         ImGui::SetCursorScreenPos(r0); bool c = ImGui::InvisibleButton(fmt("##nav%d", p).c_str(), {b.x - a.x, S(52)}); bool h = ImGui::IsItemHovered();
         bool sel = g_page == p;
-        if (sel) { dl->AddRectFilledMultiColor(r0, r1, IM_COL32(226, 30, 44, 70), IM_COL32(226, 30, 44, 0), IM_COL32(226, 30, 44, 0), IM_COL32(226, 30, 44, 70)); dl->AddRectFilled(r0, {r0.x + S(5), r1.y}, C_RED); }
-        else if (h) dl->AddRectFilled(r0, r1, IM_COL32(64, 214, 255, 18));
-        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.95f, {a.x + S(34), y + S(14)}, sel ? IM_COL32(255, 255, 255, 255) : C_DIM, PAGE_NAMES[p]);
+        float my = y + S(26), mx = a.x + S(30), md = S(5);   // a diamond marks each page; the open one is filled
+        if (sel) { dl->AddRectFilledMultiColor(r0, r1, IM_COL32(150, 112, 255, 80), IM_COL32(150, 112, 255, 0), IM_COL32(150, 112, 255, 0), IM_COL32(150, 112, 255, 80));
+            dl->AddRectFilled(r0, {r0.x + S(4), r1.y}, C_RED); dl->AddLine({r0.x, r1.y - 1}, {r1.x - S(40), r1.y - 1}, IM_COL32(150, 112, 255, 90));
+            dl->AddQuadFilled({mx - md, my}, {mx, my - md}, {mx + md, my}, {mx, my + md}, C_CYAN); }
+        else { if (h) dl->AddRectFilledMultiColor(r0, r1, IM_COL32(64, 214, 255, 30), IM_COL32(64, 214, 255, 0), IM_COL32(64, 214, 255, 0), IM_COL32(64, 214, 255, 30));
+            dl->AddQuad({mx - md, my}, {mx, my - md}, {mx + md, my}, {mx, my + md}, h ? C_CYAN : IM_COL32(90, 110, 140, 200), 1); }
+        dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.95f, {a.x + S(50), y + S(14)}, sel ? IM_COL32(255, 255, 255, 255) : h ? C_TEXT : C_DIM, PAGE_NAMES[p]);
         if (c) go((Page)p);
         y += S(54);
     }
-    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.62f, {a.x + S(30), b.y - S(56)}, C_DIM, "SwitchRecomp by MZ Labs  \xC2\xB7  ImGui");
-    dl->AddText(ImGui::GetFont(), ImGui::GetFontSize() * 0.62f, {a.x + S(30), b.y - S(36)}, C_DIM, "Game build RS15 (8275FBE1)");
+    float cf = ImGui::GetFontSize() * 0.62f; ImFont* fo = ImGui::GetFont();
+    dl->AddLine({a.x + S(30), b.y - S(104)}, {b.x - S(30), b.y - S(104)}, C_LINE);
+    dl->AddText(fo, cf, {a.x + S(30), b.y - S(94)}, C_CYAN, ("Version " + installed_version()).c_str());
+    dl->AddText(fo, cf, {a.x + S(30), b.y - S(74)}, C_DIM, "Launcher design: PlagueDrRiess");
+    dl->AddText(fo, cf, {a.x + S(30), b.y - S(54)}, C_DIM, "Built on SwitchRecomp by MZ Labs  \xC2\xB7  ImGui");
+    dl->AddText(fo, cf, {a.x + S(30), b.y - S(34)}, C_DIM, "Game build RS15 (8275FBE1)");
     ImGui::End();
 }
 
@@ -728,6 +793,7 @@ static void frame() {
     float sc = std::max(0.55f, std::min(2.2f, std::min(H / 1080.0f, W / 1700.0f)));
     if (fabsf(sc - g_scale) > 0.01f) apply_style(sc);
     ImDrawList* bg = ImGui::GetBackgroundDrawList(); background(bg, {0, 0}, {W, H}, (float)ImGui::GetTime(), false);
+    if (g_page != PG_PLAY) artifact(bg, {W - S(84), H - S(70) - S(84)}, S(34), (float)ImGui::GetTime(), art_speed());   // bottom right, as while the game loads (Play has the big one)
     if (g_page == PG_SETUP) { if (g_page_changed) { g_focus_first = true; g_page_changed = false; } setup_screen({0, 0}, {W, H - S(70)}); }
     else {
         float sw = S(300);
@@ -750,6 +816,7 @@ static void frame() {
     ImGui::SetNextWindowPos({0, H - S(70)}); ImGui::SetNextWindowSize({W, S(70)});
     ImGui::Begin("##foot", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing);
     ImDrawList* dl = ImGui::GetWindowDrawList(); dl->AddRectFilled({0, H - S(70)}, {W, H}, IM_COL32(2, 4, 9, 230)); dl->AddLine({0, H - S(70)}, {W, H - S(70)}, C_LINE);
+    dl->AddRectFilledMultiColor({0, H - S(70)}, {W * 0.45f, H - S(70) + S(2)}, C_CYAN, IM_COL32(150, 112, 255, 0), IM_COL32(150, 112, 255, 0), C_CYAN);
     float x = S(30);
     if (g_nav.any_pad && g_nav.enabled) {
         PromptStyle st = prompt_resolve(g_prompts, g_pad.name.c_str());
@@ -893,6 +960,8 @@ static void fe_prepare() {
     if (g_test && getenv("SWR_FE_NO_OLD")) g_old.clear();   // tests: a PC with no earlier installation
     g_base = g_ini.get("setup_base", ""); g_update = g_ini.get("setup_update", "");
     // Portuguese of Portugal (9) is not offered: the game is given English then (svc_core.c game_lang), and the menu shows that
+    // Native Vulkan is not offered for now: a saved choice of it becomes Vulkan output (backend_win32.c does the same)
+    if (!getenv("SWR_NATIVE_VULKAN") && g_ini.get("renderer", "") == "vulkan_native") { set("renderer", "vulkan"); g_ini.save(); g_ini_dirty = false; }
     { std::string l = g_ini.get("language", ""); if (l == "9") { set("language", "1"); g_ini.save(); g_ini_dirty = false; } }
     bindings_from_string(g_ini.get("launcher_bindings", "1,0,6,7,10").c_str(), g_nav.bind); memcpy(g_old_bind, g_nav.bind, sizeof g_old_bind);
     g_nav.enabled = g_ini.get("launcher_nav", "1") != "0"; g_prompts = prompt_style_from(g_ini.get("launcher_prompts", "auto").c_str());

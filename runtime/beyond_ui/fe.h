@@ -47,6 +47,7 @@ long long dir_size(const std::string& p, int* files = nullptr);
 bool copy_tree(const std::string& src, const std::string& dst, std::string* err, bool overwrite);
 bool trees_equal(const std::string& a, const std::string& b);
 bool recycle(const std::string& p);
+std::vector<std::string> list_dirs(const std::string& p);   // the folders in p, sorted
 std::string now_stamp();
 
 // ---------------------------------------------------------------- game files

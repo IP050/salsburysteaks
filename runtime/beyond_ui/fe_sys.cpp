@@ -357,6 +357,10 @@ bool make_report(const std::string& info, std::string* out, std::string* err) {
 }
 
 // ---------------------------------------------------------------- mods
+std::vector<std::string> list_dirs(const std::string& d) {
+    std::vector<std::string> out; WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(wide(join(d, "*")).c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) { do { std::string n = utf8(fd.cFileName); if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && n != "." && n != "..") out.push_back(n); } while (FindNextFileW(h, &fd)); FindClose(h); }
+    std::sort(out.begin(), out.end()); return out; }
 std::string mods_dir() { return join(P.data, "mods"); }
 std::vector<Mod> mods_list() {
     std::vector<Mod> out; std::string d = mods_dir(); if (!dir_exists(d)) return out;

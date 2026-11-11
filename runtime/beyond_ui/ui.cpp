@@ -18,7 +18,7 @@ namespace ui {
 
 const ImU32 C_BG0 = IM_COL32(4, 7, 13, 255), C_BG1 = IM_COL32(10, 17, 30, 255), C_PANEL = IM_COL32(9, 15, 27, 215),
             C_PANEL_HI = IM_COL32(18, 32, 52, 235), C_LINE = IM_COL32(52, 96, 128, 140), C_CYAN = IM_COL32(64, 214, 255, 255),
-            C_CYAN_DIM = IM_COL32(64, 214, 255, 70), C_RED = IM_COL32(226, 30, 44, 255), C_RED_HI = IM_COL32(240, 52, 60, 255),
+            C_CYAN_DIM = IM_COL32(64, 214, 255, 70), C_RED = IM_COL32(150, 112, 255, 255), C_RED_HI = IM_COL32(186, 160, 255, 255),
             C_TEXT = IM_COL32(232, 238, 246, 255), C_DIM = IM_COL32(140, 156, 180, 255), C_OK = IM_COL32(80, 220, 150, 255),
             C_WARN = IM_COL32(250, 196, 80, 255), C_BAD = IM_COL32(255, 84, 84, 255);
 Fonts g_fonts; float g_scale = 1.0f; RowCtx g_row; bool g_focus_first;
@@ -76,7 +76,7 @@ void apply_style(float scale) {
     c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.25f, 0.84f, 1, 0.5f); c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.25f, 0.84f, 1, 0.7f);
     c[ImGuiCol_NavCursor] = ImVec4(0, 0, 0, 0);   // our rows draw their own focus
     c[ImGuiCol_Button] = ImVec4(0.07f, 0.13f, 0.22f, 1); c[ImGuiCol_ButtonHovered] = ImVec4(0.12f, 0.22f, 0.36f, 1);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.886f, 0.118f, 0.173f, 1); c[ImGuiCol_PopupBg] = ImVec4(0.03f, 0.06f, 0.1f, 0.97f);
+    c[ImGuiCol_ButtonActive] = ImVec4(0.588f, 0.439f, 1.0f, 1); c[ImGuiCol_PopupBg] = ImVec4(0.03f, 0.06f, 0.1f, 0.97f);
     c[ImGuiCol_Border] = ImGui::ColorConvertU32ToFloat4(C_LINE); c[ImGuiCol_InputTextCursor] = ImGui::ColorConvertU32ToFloat4(C_CYAN);
     st.ScaleAllSizes(scale);
     st.FontScaleDpi = scale;
@@ -230,13 +230,86 @@ void background(ImDrawList* dl, ImVec2 a, ImVec2 b, float t, bool translucent) {
     for (int i = 0; i < 3; i++) {
         float r = R * (0.55f + 0.22f * i), s = t * (0.10f + 0.05f * i) * (i & 1 ? -1 : 1);
         dl->PathArcTo(rc, r, s, s + 4.2f, 64); dl->PathStroke(IM_COL32(64, 214, 255, 26 + 8 * i), 0, S(1.5f));
-        dl->PathArcTo(rc, r, s + 4.6f, s + 5.6f, 24); dl->PathStroke(IM_COL32(226, 30, 44, 46), 0, S(2.0f));
+        dl->PathArcTo(rc, r, s + 4.6f, s + 5.6f, 24); dl->PathStroke(IM_COL32(150, 112, 255, 46), 0, S(2.0f));
+    }
+    // motes drifting up, each with its own pace and twinkle
+    for (int i = 0; i < 70; i++) {
+        unsigned s = (unsigned)i * 2654435761u; float fx = ((s >> 8) & 1023) / 1023.0f, fy = ((s >> 18) & 1023) / 1023.0f, fz = ((s >> 3) & 31) / 31.0f;
+        float y = fmodf(fy + 1.0f - fmodf(t * (0.006f + 0.014f * fz), 1.0f), 1.0f), x = fx + 0.012f * sinf(t * 0.3f + i);
+        float tw = 0.5f + 0.5f * sinf(t * (0.7f + fz) + i * 1.7f);
+        dl->AddCircleFilled({a.x + x * w, a.y + y * h}, S(0.8f + 1.4f * fz), (i & 3) ? IM_COL32(120, 226, 255, (int)(18 + 60 * tw * fz)) : IM_COL32(170, 136, 255, (int)(24 + 70 * tw * fz)), 8);
     }
     // a light streak and a vignette
-    dl->AddRectFilledMultiColor({a.x, a.y + h * 0.70f}, {b.x, a.y + h * 0.70f + S(2)}, IM_COL32(226, 30, 44, 0), IM_COL32(226, 30, 44, 60),
-                                IM_COL32(226, 30, 44, 60), IM_COL32(226, 30, 44, 0));
+    dl->AddRectFilledMultiColor({a.x, a.y + h * 0.70f}, {b.x, a.y + h * 0.70f + S(2)}, IM_COL32(150, 112, 255, 0), IM_COL32(150, 112, 255, 60),
+                                IM_COL32(150, 112, 255, 60), IM_COL32(150, 112, 255, 0));
     dl->AddRectFilledMultiColor(a, {b.x, a.y + h * 0.18f}, IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
     dl->AddRectFilledMultiColor({a.x, b.y - h * 0.2f}, b, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
+}
+
+/* The turning artifact: our own drawing (no game art). A six-sided crystal lit from the upper left, a bright core,
+   two broken orbit rings that pass behind and in front of it, and a ring of ticks turning the other way. speed is 1
+   at rest and higher while the launcher is working */
+void artifact(ImDrawList* dl, ImVec2 c, float r, float t, float speed) {
+    const float PI = 3.14159265f;
+    static float phase; static double last_t; double now = t; if (now < last_t || now - last_t > 0.25) last_t = now;
+    phase += (float)(now - last_t) * speed; last_t = now;   // the spin eases in and out with the speed, never jumps
+    float ay = phase * 0.9f, tilt = 0.40f + 0.10f * sinf(t * 0.55f), pulse = 0.5f + 0.5f * sinf(t * 2.2f);
+    for (int i = 7; i >= 1; i--) dl->AddCircleFilled(c, r * (0.35f + 0.17f * i), IM_COL32(140, 104, 255, 5 + (i == 1 ? 10 : 0)), 48);
+    struct V { float x, y, z; };
+    auto rotx = [](V p, float a) { float cs = cosf(a), sn = sinf(a); return V{p.x, p.y * cs - p.z * sn, p.y * sn + p.z * cs}; };
+    auto rotz = [](V p, float a) { float cs = cosf(a), sn = sinf(a); return V{p.x * cs - p.y * sn, p.x * sn + p.y * cs, p.z}; };
+    auto proj = [&](V p) { float k = r / (1.0f - p.z * 0.22f); return ImVec2(c.x + p.x * k, c.y + p.y * k); };
+    // the outer tick ring, flat on the screen
+    for (int i = 0; i < 48; i++) {
+        float an = -phase * 0.35f + i * PI / 24; bool big = i % 4 == 0; float r0 = r * 1.30f, r1 = r * (big ? 1.40f : 1.345f);
+        dl->AddLine({c.x + cosf(an) * r0, c.y + sinf(an) * r0}, {c.x + cosf(an) * r1, c.y + sinf(an) * r1}, IM_COL32(110, 226, 255, big ? 150 : 60), S(big ? 1.6f : 1.0f));
+    }
+    dl->PathArcTo(c, r * 1.47f, phase * 0.22f, phase * 0.22f + 1.9f, 40); dl->PathStroke(IM_COL32(170, 136, 255, 150), 0, S(2.0f));
+    dl->PathArcTo(c, r * 1.47f, phase * 0.22f + PI, phase * 0.22f + PI + 0.9f, 24); dl->PathStroke(IM_COL32(110, 226, 255, 110), 0, S(2.0f));
+    // the orbit rings: front = the half nearer the viewer
+    auto ring = [&](float rad, float tx, float tz, float spin, ImU32 col, bool front) {
+        const int N = 72; V prev{};
+        for (int i = 0; i <= N; i++) {
+            float an = spin + i * 2 * PI / N; V p = rotz(rotx(V{cosf(an) * rad, 0, sinf(an) * rad}, tx), tz);
+            if (i && ((p.z + prev.z) > 0) == front && (i % 18) < 15) {
+                int al = (int)((col >> IM_COL32_A_SHIFT) & 255); al = front ? al : al * 2 / 5;
+                dl->AddLine(proj(prev), proj(p), (col & ~IM_COL32_A_MASK) | ((ImU32)al << IM_COL32_A_SHIFT), S(front ? 2.0f : 1.4f));
+            }
+            prev = p;
+        }
+        V d = rotz(rotx(V{cosf(spin * 2.3f) * rad, 0, sinf(spin * 2.3f) * rad}, tx), tz);   // a spark riding the ring
+        if ((d.z > 0) == front) { ImVec2 q = proj(d); dl->AddCircleFilled(q, r * 0.075f, (col & ~IM_COL32_A_MASK) | (60u << IM_COL32_A_SHIFT), 16); dl->AddCircleFilled(q, r * 0.035f, IM_COL32(255, 255, 255, 235), 12); }
+    };
+    ring(1.08f, 1.25f, 0.45f, phase * 0.6f, IM_COL32(110, 226, 255, 220), false);
+    ring(0.92f, 1.10f, -0.70f, -phase * 0.8f, IM_COL32(170, 136, 255, 230), false);
+    // the crystal
+    V v[8]; v[0] = {0, -1.0f, 0}; v[1] = {0, 1.0f, 0};
+    for (int k = 0; k < 6; k++) { float an = ay + k * PI / 3; v[2 + k] = {cosf(an) * 0.50f, (k & 1) ? 0.10f : -0.10f, sinf(an) * 0.50f}; }
+    for (auto& p : v) p = rotz(rotx(p, tilt), 0.16f);
+    struct F { int a, b, c; float z; } f[12];
+    for (int k = 0; k < 6; k++) { f[k * 2] = {0, 2 + k, 2 + (k + 1) % 6, 0}; f[k * 2 + 1] = {1, 2 + (k + 1) % 6, 2 + k, 0}; }
+    for (auto& q : f) q.z = v[q.a].z + v[q.b].z + v[q.c].z;
+    std::sort(f, f + 12, [](const F& x, const F& y) { return x.z < y.z; });
+    bool core_drawn = false;
+    for (auto& q : f) {
+        V A = v[q.a], B = v[q.b], C = v[q.c];
+        V n{(B.y - A.y) * (C.z - A.z) - (B.z - A.z) * (C.y - A.y), (B.z - A.z) * (C.x - A.x) - (B.x - A.x) * (C.z - A.z), (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x)};
+        float nl = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z); if (nl < 1e-6f) continue; n = {n.x / nl, n.y / nl, n.z / nl};
+        if (n.x * (A.x + B.x + C.x) + n.y * (A.y + B.y + C.y) + n.z * (A.z + B.z + C.z) < 0) n = {-n.x, -n.y, -n.z};   // outward
+        bool front = n.z > 0;
+        if (front && !core_drawn) { core_drawn = true;   // the core glows between the far and the near faces
+            dl->AddCircleFilled(c, r * (0.30f + 0.05f * pulse), IM_COL32(150, 120, 255, 60), 32);
+            dl->AddCircleFilled(c, r * (0.16f + 0.03f * pulse), IM_COL32(190, 236, 255, 150), 24);
+            dl->AddCircleFilled(c, r * 0.07f, IM_COL32(255, 255, 255, 240), 16); }
+        float lum = n.x * -0.45f + n.y * -0.62f + n.z * 0.64f; if (lum < 0) lum = 0; if (lum > 1) lum = 1;
+        float spec = lum > 0.86f ? (lum - 0.86f) / 0.14f : 0;
+        int R = (int)(96 + 40 * lum + 110 * spec), G = (int)(70 + 150 * lum + 30 * spec), Bc = 255, Al = front ? (int)(54 + 130 * lum) : 40;
+        ImVec2 pa = proj(A), pb = proj(B), pc = proj(C);
+        dl->AddTriangleFilled(pa, pb, pc, IM_COL32(R > 255 ? 255 : R, G > 255 ? 255 : G, Bc, Al));
+        dl->AddTriangle(pa, pb, pc, front ? IM_COL32(200, 244, 255, 215) : IM_COL32(150, 130, 255, 70), S(front ? 1.3f : 1.0f));
+    }
+    ring(1.08f, 1.25f, 0.45f, phase * 0.6f, IM_COL32(110, 226, 255, 220), true);
+    ring(0.92f, 1.10f, -0.70f, -phase * 0.8f, IM_COL32(170, 136, 255, 230), true);
 }
 
 static void spaced_text(ImDrawList* dl, ImVec2 p, float size, ImU32 col, const char* s, float spacing, bool bold) {
@@ -364,7 +437,7 @@ bool row_bool(const char* id, const char* label, bool* v, const char* tag) {
     if (c || (f && (g_row.pad_left || g_row.pad_right || g_row.confirm))) { *v = !*v; ch = true; }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float h = r.GetHeight(), sw = S(52), sh = S(24); ImVec2 a(r.Max.x - S(16) - sw, r.Min.y + (h - sh) / 2);
-    dl->AddRectFilled(a, {a.x + sw, a.y + sh}, *v ? IM_COL32(226, 30, 44, 200) : IM_COL32(30, 44, 66, 255), sh / 2);
+    dl->AddRectFilled(a, {a.x + sw, a.y + sh}, *v ? IM_COL32(150, 112, 255, 200) : IM_COL32(30, 44, 66, 255), sh / 2);
     dl->AddRect(a, {a.x + sw, a.y + sh}, *v ? C_RED_HI : C_LINE, sh / 2, 0, 1);
     float kx = *v ? a.x + sw - sh / 2 : a.x + sh / 2;
     dl->AddCircleFilled({kx, a.y + sh / 2}, sh / 2 - S(3), *v ? IM_COL32(255, 255, 255, 255) : C_DIM);
@@ -403,7 +476,7 @@ bool row_slider(const char* id, const char* label, float* v, float lo, float hi,
     float t = (*v - lo) / (hi - lo);
     chamfer_rect(dl, a, b, S(6), IM_COL32(12, 22, 38, 255), f ? C_CYAN : C_LINE, 1);
     ImVec2 fb(a.x + (b.x - a.x) * t, b.y);
-    dl->PushClipRect(a, fb, true); chamfer_rect(dl, a, b, S(6), f ? IM_COL32(226, 30, 44, 190) : IM_COL32(226, 30, 44, 120), 0); dl->PopClipRect();
+    dl->PushClipRect(a, fb, true); chamfer_rect(dl, a, b, S(6), f ? IM_COL32(150, 112, 255, 190) : IM_COL32(150, 112, 255, 120), 0); dl->PopClipRect();
     dl->AddRectFilled({fb.x - S(1.5f), a.y - S(3)}, {fb.x + S(1.5f), b.y + S(3)}, IM_COL32(255, 255, 255, 230));
     ImVec2 ts = ImGui::CalcTextSize(text);
     dl->AddText({(a.x + b.x) / 2 - ts.x / 2 + 1, (a.y + b.y) / 2 - ts.y / 2 + 1}, IM_COL32(0, 0, 0, 200), text);
@@ -416,7 +489,7 @@ bool row_button(const char* id, const char* label, const char* value, bool prima
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const char* t = value ? value : "SELECT"; ImVec2 ts = ImGui::CalcTextSize(t);
     ImVec2 a(r.Max.x - S(16) - ts.x - S(28), r.Min.y + S(9)), b(r.Max.x - S(16), r.Max.y - S(9));
-    chamfer_rect(dl, a, b, S(5), primary ? IM_COL32(226, 30, 44, f ? 255 : 200) : IM_COL32(20, 36, 58, 255), f ? C_CYAN : C_LINE, 1);
+    chamfer_rect(dl, a, b, S(5), primary ? IM_COL32(150, 112, 255, f ? 255 : 200) : IM_COL32(20, 36, 58, 255), f ? C_CYAN : C_LINE, 1);
     dl->AddText({a.x + S(14), (a.y + b.y) / 2 - ts.y / 2}, IM_COL32(255, 255, 255, 255), t);
     return c || (f && g_row.confirm);
 }
@@ -434,11 +507,22 @@ bool big_button(const char* id, const char* label, ImVec2 size, bool primary) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool c = ImGui::InvisibleButton(id, size); take_focus_if_first(); nav_item(); bool f = ImGui::IsItemFocused(), h = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList(); ImVec2 b(p.x + size.x, p.y + size.y);
-    ImU32 fill = primary ? (f || h ? C_RED_HI : C_RED) : (f || h ? IM_COL32(28, 52, 84, 255) : IM_COL32(16, 30, 50, 255));
-    chamfer_rect(dl, p, b, size.y * 0.28f, fill, f ? IM_COL32(255, 255, 255, 255) : (primary ? 0 : C_LINE), f ? S(2) : 1);
-    if (f) chamfer_rect(dl, {p.x - S(4), p.y - S(4)}, {b.x + S(4), b.y + S(4)}, size.y * 0.3f, 0, C_CYAN_DIM, S(1.5f));
-    float fs = std::min(size.y * 0.42f, S(30)); ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0, label);
-    dl->AddText(ImGui::GetFont(), fs, {p.x + size.x / 2 - ts.x / 2, p.y + size.y / 2 - ts.y / 2}, IM_COL32(255, 255, 255, 255), label);
+    ImU32 fill = primary ? (f || h ? IM_COL32(150, 240, 255, 255) : IM_COL32(88, 220, 246, 255)) : (f || h ? IM_COL32(28, 52, 84, 255) : IM_COL32(16, 30, 50, 255));
+    float cut = size.y * 0.28f;
+    if (primary) for (int i = 3; i >= 1; i--)   // a soft glow under the main button
+        chamfer_rect(dl, {p.x - S(3) * i, p.y - S(3) * i}, {b.x + S(3) * i, b.y + S(3) * i}, cut + S(2) * i, IM_COL32(88, 220, 246, f || h ? 20 : 11), 0);
+    chamfer_rect(dl, p, b, cut, fill, f ? IM_COL32(255, 255, 255, 255) : (primary ? 0 : C_LINE), f ? S(2) : 1);
+    if (primary) {   // a sheen crossing it every few seconds, slanted like the cut corners so it stays inside them
+        float sw = size.y * 0.55f, x0min = p.x + cut - size.y, x0max = b.x - cut - sw, k = fmodf((float)ImGui::GetTime(), 3.2f) / 1.1f;
+        if (k < 1 && x0max > x0min) { float x0 = x0min + (x0max - x0min) * k;
+            dl->AddQuadFilled({x0, b.y}, {x0 + size.y, p.y}, {x0 + size.y + sw, p.y}, {x0 + sw, b.y}, IM_COL32(255, 255, 255, 70)); }
+        dl->AddLine({p.x + cut, p.y + S(1)}, {b.x - S(1), p.y + S(1)}, IM_COL32(255, 255, 255, 130), S(1));
+    }
+    if (f) chamfer_rect(dl, {p.x - S(4), p.y - S(4)}, {b.x + S(4), b.y + S(4)}, size.y * 0.3f, 0, primary ? C_RED_HI : C_CYAN_DIM, S(1.5f));
+    float fs = std::min(size.y * 0.42f, S(34)); ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0, label);
+    ImU32 tc = primary ? IM_COL32(3, 14, 24, 255) : IM_COL32(255, 255, 255, 255); ImVec2 tp(p.x + size.x / 2 - ts.x / 2, p.y + size.y / 2 - ts.y / 2);
+    dl->AddText(ImGui::GetFont(), fs, tp, tc, label);
+    if (primary) dl->AddText(ImGui::GetFont(), fs, {tp.x + fs * 0.03f, tp.y}, tc, label);
     return c || (f && g_row.confirm);
 }
 
@@ -449,7 +533,7 @@ void progress_bar(float frac, ImVec2 size, const char* text) {
     chamfer_rect(dl, p, b, S(8), IM_COL32(8, 16, 28, 255), C_LINE, 1);
     ImVec2 fb(p.x + size.x * frac, b.y);
     dl->PushClipRect(p, fb, true);
-    dl->AddRectFilledMultiColor(p, b, IM_COL32(226, 30, 44, 255), IM_COL32(240, 52, 60, 255), IM_COL32(240, 52, 60, 255), IM_COL32(226, 30, 44, 255));
+    dl->AddRectFilledMultiColor(p, b, IM_COL32(126, 92, 240, 255), IM_COL32(64, 200, 240, 255), IM_COL32(64, 200, 240, 255), IM_COL32(126, 92, 240, 255));
     float t = (float)ImGui::GetTime();
     for (float x = p.x - size.y + fmodf(t * 60, size.y * 2); x < fb.x; x += size.y * 2)   // moving stripes
         dl->AddQuadFilled({x, b.y}, {x + size.y, p.y}, {x + size.y * 1.6f, p.y}, {x + size.y * 0.6f, b.y}, IM_COL32(255, 255, 255, 28));
@@ -491,8 +575,13 @@ static std::vector<Opt> build_options() {
     // Graphics
     F("resolution", "Graphics", "Graphics", "Internal resolution", LIVE_GL, "1", 0.25f, 4.0f, 0.05f,
       "The game's 3D resolution. Above your screen's size it is averaged down (smoother edges, no shimmer).");
-    C("renderer", "Graphics", "Graphics", "Renderer", LIVE_RESTART, "opengl", {{"opengl", "OpenGL"}, {"vulkan", "Vulkan output"}, {"vulkan_native", "Native Vulkan (experimental)"}},
-      "OpenGL is the most tested. Vulkan output: OpenGL draws, Vulkan presents. Native Vulkan: ScarletNX's Vulkan renderer draws everything.");
+    // Native Vulkan is not offered for now (the world renders black with it); SWR_NATIVE_VULKAN=1 shows it for work on it
+    if (getenv("SWR_NATIVE_VULKAN"))
+        C("renderer", "Graphics", "Graphics", "Renderer", LIVE_RESTART, "opengl", {{"opengl", "OpenGL"}, {"vulkan", "Vulkan output"}, {"vulkan_native", "Native Vulkan (experimental)"}},
+          "OpenGL is the most tested. Vulkan output: OpenGL draws, Vulkan presents. Native Vulkan: ScarletNX's Vulkan renderer draws everything.");
+    else
+        C("renderer", "Graphics", "Graphics", "Renderer", LIVE_RESTART, "opengl", {{"opengl", "OpenGL"}, {"vulkan", "Vulkan output"}},
+          "OpenGL is the most tested. Vulkan output: OpenGL draws, Vulkan presents.");
     C("upscaler", "Graphics", "Graphics", "Upscaling", LIVE_YES, "bilinear", {{"bilinear", "Bilinear"}, {"fsr", "AMD FSR 1"}},
       "How a picture rendered below your screen's size is enlarged. FSR 1 rebuilds edges and sharpens (set Internal resolution below 1, e.g. 0.67 or 0.75).");
     I("fsr_sharpness", "Graphics", "Graphics", "FSR sharpness", LIVE_YES, "80", 0, 100, 5, "FSR 1's sharpening pass (RCAS): 0 = none, 100 = strongest.");
