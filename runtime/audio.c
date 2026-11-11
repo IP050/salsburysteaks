@@ -337,7 +337,10 @@ void audio_render(SvcObj*o,const u32*ih,const u8*input,u64 size,const u8*voices,
   ARenderer*r=(ARenderer*)(size_t)o->u[4];aroutes(r,ih,input,size);aroute_trace(r,ih,input,size,voices,count);memset(r->samples,0,AM*24*AF*sizeof(float));u32 active=0;
   for(u32 i=0;i<count;i++){const u8*vi=voices+i*0x170;u32 id=au32(vi)&(AV-1);AVoice*v=&r->voices[id];u8 in_use=vi[9],play=vi[0xA];
     if(vi[8]){atrace_voice("new",id,v,vi,NULL);aclear(v,1);memset(v,0,sizeof *v);}
-    if(!in_use){if(v->nq){atrace_voice("unused",id,v,vi,NULL);aclear(v,1);}v->was_playing=0;}
+    /* an entry not in use is all zeroes, its id too: it is not voice 0's, and clearing by that id emptied voice 0
+       after every buffer it was given (Metroid Prime 4's title music: its left half is voice 0, so only the right
+       half played). Only the entry at a voice's own place ends it */
+    if(!in_use){if(id!=i)continue;if(v->nq){atrace_voice("unused",id,v,vi,NULL);aclear(v,1);}v->was_playing=0;}
     else{
       u32 head=au32(vi+0x40)&3;
       for(u32 x=0;x<4;x++){int slot=(head+x)&3;const u8*wb=vi+0x60+slot*0x38;
