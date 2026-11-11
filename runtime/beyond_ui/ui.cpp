@@ -569,6 +569,8 @@ static std::vector<Opt> build_options() {
     // Display
     B("docked", "Display", "Display", "Docked (TV) mode", LIVE_RESTART, "1", "Docked: the game renders 1600\xC3\x97" "900. Handheld: 1280\xC3\x97" "720.");
     B("fullscreen", "Display", "Display", "Fullscreen", LIVE_YES, "1", "F11 or Alt+Enter also switches it.");
+    C("aspect", "Display", "Display", "Picture shape", LIVE_YES, "16:9", {{"16:9", "16:9 (the game's own)"}, {"21:9", "21:9 ultrawide"}, {"32:9", "32:9 super ultrawide"},
+      {"16:10", "16:10"}, {"auto", "Fill the window"}}, "Wider shapes show more to the sides. On trial: the HUD and menus are stretched with the picture for now.");
     C("language", "Display", "Display", "Language", LIVE_RESTART, "auto", {{"auto", "Follow system"}, {"0", "Japanese"}, {"1", "English (US)"}, {"2", "French"}, {"3", "German"},
       {"4", "Italian"}, {"5", "Spanish"}, {"6", "Chinese"}, {"7", "Korean"}, {"8", "Dutch"}, {"10", "Russian"},
       {"11", "Taiwanese"}, {"12", "English (UK)"}, {"13", "French (Canada)"}, {"14", "Spanish (Latin America)"}, {"17", "Portuguese (Brazil), on trial"}}, "");
